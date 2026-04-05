@@ -1,0 +1,53 @@
+# Graph KB API Dockerfile
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for caching
+COPY requirements.api.txt .
+
+# GPU support: build with --build-arg DEVICE=gpu for CUDA-enabled PyTorch
+#   CPU (default): docker build -t graph-kb-api .
+#   GPU:           docker build --build-arg DEVICE=gpu -t graph-kb-api:gpu .
+#                  docker run --gpus all graph-kb-api:gpu
+ARG DEVICE=cpu
+RUN if [ "$DEVICE" = "gpu" ]; then \
+      pip install --no-cache-dir --timeout=300 torch --index-url https://download.pytorch.org/whl/cu121; \
+    else \
+      pip install --no-cache-dir --timeout=300 torch --index-url https://download.pytorch.org/whl/cpu; \
+    fi
+# Then install the rest of the requirements
+RUN pip install --no-cache-dir --timeout=300 -r requirements.api.txt
+
+# Pre-download and validate the embedding model.
+# This layer is cached and only re-runs if EMBEDDING_MODEL or requirements change.
+# Must come BEFORE code copy so code changes don't trigger a re-download.
+ENV HF_HOME=/root/.cache/huggingface
+ARG EMBEDDING_MODEL=jinaai/jina-embeddings-v3
+RUN python -c "\
+from sentence_transformers import SentenceTransformer; \
+m = SentenceTransformer('${EMBEDDING_MODEL}', trust_remote_code=True); \
+print(f'Model pre-loaded: {m.get_sentence_embedding_dimension()} dims')"
+
+# Copy API code (changes here won't invalidate the model cache layer above)
+COPY graph_kb_api/ ./graph_kb_api/
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Expose port
+EXPOSE 8000
+
+# Health check (use python instead of curl — curl not installed in slim image)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+# Run the API
+CMD ["uvicorn", "graph_kb_api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,12 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies (cached in image layer)
+COPY package*.json ./
+RUN npm install
+
+EXPOSE 3000
+
+# Source code is bind-mounted via docker-compose; node_modules preserved via anonymous volume
+CMD ["npm", "run", "dev"]

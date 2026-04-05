@@ -1,0 +1,122 @@
+vector_db_path: "./chroma_db"
+storage_path: "./output_docs"
+openai_model: "gpt-5.2"
+
+# LLM Configuration
+llm_temperature: 0.0  # Low temperature for consistent, thorough analysis
+
+# Embedding Configuration
+# Supported models:
+#   - "all-MiniLM-L6-v2": Fast, lightweight, 384-dim embeddings
+#   - "nomic-ai/nomic-embed-code": State-of-the-art code embeddings (7B params)
+#     Note: nomic-embed-code requires ~14GB GPU memory (or runs slower on CPU)
+#   - "jinaai/jina-embeddings-v3": Multilingual, task LoRA (0.6B params, 1024-dim)
+#     Note: Smaller than Nomic (~1.2GB), supports Matryoshka dims (32-1024)
+#     License: CC BY-NC 4.0 (non-commercial, contact Jina AI for commercial)
+# Local embedding models (requires clearing chroma_db if switching from OpenAI):
+# embedding_model: "all-MiniLM-L6-v2"  # Fast, lightweight (~90MB), 384 dims
+# embedding_model: "jinaai/jina-embeddings-v3"  # ~1.2GB, 1024 dims
+# embedding_model: "nomic-ai/nomic-embed-code"  # Code-specialized, 768 dims
+
+# OpenAI embedding model - text-embedding-3-large (3072 dims)
+# Note: If switching from a different model, you may need to clear chroma_db
+embedding_model: "jinaai/jina-embeddings-v3" # 1024 dims - local model
+dimensions: 1024
+# Device for embedding model: "cpu", "cuda" (NVIDIA), "mps" (Apple Silicon), or unset for auto
+# Note: MPS not available in Docker containers, will auto-fallback to CPU
+embedding_device: "cpu" # Use CPU in Docker (MPS not available in containers)
+
+chunk_size: 1000
+chunk_overlap: 200
+
+# Graph Traversal Configuration
+# Maximum depth for recursive graph traversal (default: 25)
+# Higher values provide more comprehensive context but may increase memory usage
+max_depth: 25
+
+# Agent Configuration
+# Show agent tool calls in Chainlit UI (default: true)
+# When enabled, displays each tool call as a step in the UI with input/output
+show_agent_tool_calls: true
+
+# Maximum iterations for deep agent analysis (default: 50)
+# Higher values allow more thorough analysis but may increase execution time
+deep_agent_max_iterations: 50
+
+# Retrieval Configuration Defaults
+# Default values for retrieval operations
+retrieval_defaults:
+  max_context_tokens: 100000
+  top_k_vector: 2000  # Increased from 1000 for more comprehensive initial retrieval
+  graph_expansion_hops: 10
+  max_expansion_nodes: 2000  # Increased from 500 to allow more graph expansion
+  max_symbols_per_chunk: 3
+  max_resolved_ids_per_symbol: 3
+  max_entry_points_traced: 20
+  max_context_items_for_flow: 10
+  same_file_bonus: 0.1
+  same_directory_bonus: 0.05
+  tokens_per_line: 10.0
+  max_depth: 50  # Increased from 25 for deeper traversal in deep agent
+  similarity_threshold: 0.7
+  similarity_function: "cosine"
+  include_visualization: true
+  include_related_symbols: true
+  enable_ranking: true
+
+# Chat UI Slider Configurations
+# These settings control the min/max/step values for the Chainlit chat settings sliders
+chat_ui_sliders:
+  max_context_tokens:
+    min: 1000
+    max: 200000
+    step: 1000
+    description: "Maximum tokens in context"
+
+  top_k:
+    min: 10
+    max: 5000  # Increased from 1000 to allow more comprehensive retrieval
+    step: 10
+    description: "Number of top results to return"
+
+  max_expansion_nodes:
+    min: 100
+    max: 5000  # New slider for controlling graph expansion
+    step: 100
+    description: "Maximum nodes to explore during graph expansion"
+
+  expansion_hops:
+    min: 1
+    max: 10
+    step: 1
+    description: "Number of hops for graph expansion"
+
+  max_depth:
+    min: 1
+    max: 25
+    step: 1
+    description: "Maximum depth for graph traversal"
+
+  max_expansion_nodes:
+    min: 100
+    max: 2000
+    step: 100
+    description: "Maximum nodes per symbol expansion"
+
+  max_entry_points_traced:
+    min: 1
+    max: 20
+    step: 1
+    description: "Maximum entry points to trace for flows"
+
+  same_file_bonus:
+    min: 0.0
+    max: 0.5
+    step: 0.05
+    description: "Bonus for results in same file"
+
+  same_directory_bonus:
+    min: 0.0
+    max: 0.3
+    step: 0.01
+    description: "Bonus for results in same directory"

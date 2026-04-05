@@ -1,0 +1,19 @@
+{
+  "name": "graphkb-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "npx playwright test",
+    "test:headed": "npx playwright test --headed",
+    "test:debug": "npx playwright test --debug",
+    "test:ui": "npx playwright test --ui",
+    "test:mock": "npx playwright test --config=playwright.mock.config.ts",
+    "test:mock:headed": "npx playwright test --config=playwright.mock.config.ts --headed",
+    "test:record": "echo 'Set LLM_RECORDING_MODE=record on the API service, then run: npm test'",
+    "report": "npx playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0",
+    "@types/node": "^25.5.0"
+  }
+}

@@ -1,0 +1,158 @@
+# Claude/Kiro IDE artifacts
+.claude/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+PIPFILE.lock
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# TypeScript
+*.tsbuildinfo
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Ruff
+.ruff_cache/
+
+# IDEs
+.kiro/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.omc/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+AGENTS.md
+graph_kb_api/agents/
+*.db
+*.sqlite
+chroma_db/
+.chainlit/
+.files/
+
+# Neo4j
+neo4j_data/
+
+# Logs
+*.log
+.logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Test artifacts
+test-results/
+playwright-report/
+e2e/node_modules/
+e2e/playwright-report/
+e2e/test-results/
+e2e/tests/fixtures/llm-responses/
+
+# Next.js / Dashboard
+graph_kb_dashboard/.next/
+graph_kb_dashboard/node_modules/
+graph_kb_dashboard/out/
+graph_kb_dashboard/build/
+graph_kb_dashboard/coverage/
+graph_kb_dashboard/playwright-report/
+graph_kb_dashboard/test-results/
+
+# Spec artifacts
+spec_artifacts/

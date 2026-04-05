@@ -1,0 +1,1351 @@
+openapi: 3.1.0
+info:
+  title: FedEx Carrier Adapter API
+  description: |
+    Platform carrier adapter wrapping FedEx RESTful APIs into a unified
+    shipping interface. Supports shipment creation, cancellation, tracking,
+    rate quoting, pickup scheduling, location search, hazardous materials,
+    returns, and address validation.
+  version: 1.0.0
+  contact:
+    name: Platform Engineering
+    email: platform@example.com
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8000/api/v1/carriers/fedex
+    description: Local development
+  - url: https://api.platform.com/v1/carriers/fedex
+    description: Production
+
+tags:
+  - name: auth
+    description: FedEx OAuth token management
+  - name: address
+    description: Address validation and correction
+  - name: rates
+    description: Rate quoting and transit times
+  - name: shipments
+    description: Shipment creation, cancellation, and label generation
+  - name: tracking
+    description: Shipment tracking and status
+  - name: pickup
+    description: Pickup scheduling and cancellation
+  - name: locations
+    description: FedEx drop-off and hold-at location search
+  - name: returns
+    description: Return label generation and refund processing
+  - name: hazmat
+    description: Hazardous materials validation and compliance
+
+paths:
+  /auth/token:
+    post:
+      tags: [auth]
+      operationId: getToken
+      summary: Get or refresh FedEx OAuth token
+      description: Returns a cached token or requests a new one from FedEx OAuth endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+      responses:
+        '200':
+          description: Valid OAuth token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /address/validate:
+    post:
+      tags: [address]
+      operationId: validateAddress
+      summary: Validate and correct a shipping address
+      description: |
+        Validates up to 100 addresses against FedEx reference data.
+        Returns corrected addresses with business/residential classification.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressValidationRequest'
+      responses:
+        '200':
+          description: Validated addresses
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddressValidationResponse'
+
+  /rates/quote:
+    post:
+      tags: [rates]
+      operationId: getRates
+      summary: Get rate quotes and transit times
+      description: |
+        Returns rate quotes for all available FedEx services between origin
+        and destination. Includes account-specific and list rates, surcharges,
+        and estimated delivery dates.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RateQuoteRequest'
+      responses:
+        '200':
+          description: Rate quotes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RateQuoteResponse'
+
+  /rates/services:
+    post:
+      tags: [rates]
+      operationId: getAvailableServices
+      summary: Get available FedEx services for a lane
+      description: |
+        Returns available services, packaging types, and special service
+        options for a given origin-destination pair.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceAvailabilityRequest'
+      responses:
+        '200':
+          description: Available services
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceAvailabilityResponse'
+
+  /shipments:
+    post:
+      tags: [shipments]
+      operationId: createShipment
+      summary: Create a shipment and generate label
+      description: |
+        Creates a FedEx shipment, generates a shipping label, and returns
+        tracking numbers. Supports domestic, international, multi-piece,
+        hazardous materials, and special service shipments.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShipmentRequest'
+      responses:
+        '201':
+          description: Shipment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateShipmentResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /shipments/{trackingNumber}/cancel:
+    put:
+      tags: [shipments]
+      operationId: cancelShipment
+      summary: Cancel a shipment before tender
+      description: |
+        Cancels a shipment that has not yet been tendered to FedEx.
+        Voids the tracking number and label.
+      parameters:
+        - name: trackingNumber
+          in: path
+          required: true
+          schema:
+            type: string
+          description: FedEx tracking number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelShipmentRequest'
+      responses:
+        '200':
+          description: Shipment cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelShipmentResponse'
+        '409':
+          description: Shipment already tendered — cannot cancel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /shipments/{trackingNumber}/label:
+    get:
+      tags: [shipments]
+      operationId: getLabel
+      summary: Retrieve a shipping label
+      description: Returns the label for a previously created shipment.
+      parameters:
+        - name: trackingNumber
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [PDF, PNG, ZPLII]
+            default: PDF
+      responses:
+        '200':
+          description: Label document
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+
+  /tracking:
+    post:
+      tags: [tracking]
+      operationId: trackShipments
+      summary: Track one or more shipments
+      description: |
+        Returns tracking status and scan events for up to 30 tracking
+        numbers. Supports tracking by number, door tag, reference, or
+        FedEx Office order number.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrackingRequest'
+      responses:
+        '200':
+          description: Tracking results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackingResponse'
+
+  /tracking/{trackingNumber}:
+    get:
+      tags: [tracking]
+      operationId: trackSingleShipment
+      summary: Track a single shipment by tracking number
+      parameters:
+        - name: trackingNumber
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: includeDetailedScans
+          in: query
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Tracking result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SingleTrackingResponse'
+
+  /pickup/availability:
+    post:
+      tags: [pickup]
+      operationId: checkPickupAvailability
+      summary: Check pickup availability for an address
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PickupAvailabilityRequest'
+      responses:
+        '200':
+          description: Pickup availability
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PickupAvailabilityResponse'
+
+  /pickup:
+    post:
+      tags: [pickup]
+      operationId: createPickup
+      summary: Schedule a FedEx pickup
+      description: |
+        Schedules a courier pickup for Express or Ground shipments.
+        Returns a pickup confirmation code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePickupRequest'
+      responses:
+        '201':
+          description: Pickup scheduled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePickupResponse'
+
+  /pickup/{confirmationCode}/cancel:
+    put:
+      tags: [pickup]
+      operationId: cancelPickup
+      summary: Cancel a scheduled pickup
+      parameters:
+        - name: confirmationCode
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelPickupRequest'
+      responses:
+        '200':
+          description: Pickup cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelPickupResponse'
+
+  /locations/search:
+    post:
+      tags: [locations]
+      operationId: searchLocations
+      summary: Find nearby FedEx drop-off and service locations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LocationSearchRequest'
+      responses:
+        '200':
+          description: Matching locations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocationSearchResponse'
+
+  /returns:
+    post:
+      tags: [returns]
+      operationId: createReturnLabel
+      summary: Create a return shipping label
+      description: |
+        Generates a return label linked to the original outbound shipment.
+        Supports print-return, email-return, and call-tag return types.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReturnRequest'
+      responses:
+        '201':
+          description: Return label created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateReturnResponse'
+
+  /returns/{returnTrackingNumber}/refund:
+    post:
+      tags: [returns]
+      operationId: processRefund
+      summary: Process a refund for a returned shipment
+      description: |
+        Triggers the platform refund workflow after a return shipment
+        is confirmed delivered to the warehouse.
+      parameters:
+        - name: returnTrackingNumber
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundRequest'
+      responses:
+        '200':
+          description: Refund processed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefundResponse'
+
+  /hazmat/validate:
+    post:
+      tags: [hazmat]
+      operationId: validateHazmat
+      summary: Validate hazardous materials compliance
+      description: |
+        Validates that a hazardous materials shipment meets FedEx and
+        regulatory requirements before shipment creation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HazmatValidationRequest'
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HazmatValidationResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: FedEx OAuth 2.0 bearer token
+
+  schemas:
+    # ── Common ──────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      properties:
+        error_code:
+          type: string
+        message:
+          type: string
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+
+    Address:
+      type: object
+      required: [streetLines, city, postalCode, countryCode]
+      properties:
+        streetLines:
+          type: array
+          items:
+            type: string
+          maxItems: 3
+        city:
+          type: string
+        stateOrProvinceCode:
+          type: string
+        postalCode:
+          type: string
+        countryCode:
+          type: string
+          minLength: 2
+          maxLength: 2
+        residential:
+          type: boolean
+
+    Contact:
+      type: object
+      properties:
+        personName:
+          type: string
+        companyName:
+          type: string
+        phoneNumber:
+          type: string
+        emailAddress:
+          type: string
+          format: email
+
+    Weight:
+      type: object
+      required: [units, value]
+      properties:
+        units:
+          type: string
+          enum: [LB, KG]
+        value:
+          type: number
+          minimum: 0.01
+
+    Dimensions:
+      type: object
+      required: [length, width, height, units]
+      properties:
+        length:
+          type: number
+        width:
+          type: number
+        height:
+          type: number
+        units:
+          type: string
+          enum: [IN, CM]
+
+    Money:
+      type: object
+      properties:
+        currency:
+          type: string
+          default: USD
+        amount:
+          type: number
+
+    # ── Auth ────────────────────────────────────────────────
+    TokenRequest:
+      type: object
+      required: [merchant_id]
+      properties:
+        merchant_id:
+          type: string
+        force_refresh:
+          type: boolean
+          default: false
+
+    TokenResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+        expires_in:
+          type: integer
+        cached:
+          type: boolean
+
+    # ── Address Validation ──────────────────────────────────
+    AddressValidationRequest:
+      type: object
+      required: [addresses]
+      properties:
+        addresses:
+          type: array
+          items:
+            $ref: '#/components/schemas/Address'
+          maxItems: 100
+
+    AddressValidationResponse:
+      type: object
+      properties:
+        resolved_addresses:
+          type: array
+          items:
+            type: object
+            properties:
+              input_index:
+                type: integer
+              resolved_address:
+                $ref: '#/components/schemas/Address'
+              classification:
+                type: string
+                enum: [BUSINESS, RESIDENTIAL, MIXED, UNKNOWN]
+              is_valid:
+                type: boolean
+              changes_applied:
+                type: array
+                items:
+                  type: string
+
+    # ── Rates ───────────────────────────────────────────────
+    RateQuoteRequest:
+      type: object
+      required: [origin, destination, packages]
+      properties:
+        merchant_id:
+          type: string
+        origin:
+          $ref: '#/components/schemas/Address'
+        destination:
+          $ref: '#/components/schemas/Address'
+        ship_date:
+          type: string
+          format: date
+        pickup_type:
+          type: string
+          enum: [DROPOFF_AT_FEDEX_LOCATION, CONTACT_FEDEX_TO_SCHEDULE, USE_SCHEDULED_PICKUP]
+          default: DROPOFF_AT_FEDEX_LOCATION
+        packages:
+          type: array
+          items:
+            type: object
+            required: [weight]
+            properties:
+              weight:
+                $ref: '#/components/schemas/Weight'
+              dimensions:
+                $ref: '#/components/schemas/Dimensions'
+              is_hazmat:
+                type: boolean
+                default: false
+        rate_types:
+          type: array
+          items:
+            type: string
+            enum: [ACCOUNT, LIST, PREFERRED]
+          default: [ACCOUNT, LIST]
+        include_transit_times:
+          type: boolean
+          default: true
+
+    RateQuoteResponse:
+      type: object
+      properties:
+        rates:
+          type: array
+          items:
+            type: object
+            properties:
+              service_type:
+                type: string
+              service_name:
+                type: string
+              packaging_type:
+                type: string
+              delivery_date:
+                type: string
+                format: date-time
+              transit_days:
+                type: integer
+              account_rate:
+                $ref: '#/components/schemas/Money'
+              list_rate:
+                $ref: '#/components/schemas/Money'
+              surcharges:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                    description:
+                      type: string
+                    amount:
+                      $ref: '#/components/schemas/Money'
+
+    ServiceAvailabilityRequest:
+      type: object
+      required: [origin, destination]
+      properties:
+        origin:
+          $ref: '#/components/schemas/Address'
+        destination:
+          $ref: '#/components/schemas/Address'
+        ship_date:
+          type: string
+          format: date
+
+    ServiceAvailabilityResponse:
+      type: object
+      properties:
+        services:
+          type: array
+          items:
+            type: object
+            properties:
+              service_type:
+                type: string
+              service_name:
+                type: string
+              packaging_options:
+                type: array
+                items:
+                  type: string
+              special_services:
+                type: array
+                items:
+                  type: string
+              transit_days:
+                type: integer
+              delivery_date:
+                type: string
+                format: date-time
+
+    # ── Shipments ───────────────────────────────────────────
+    CreateShipmentRequest:
+      type: object
+      required: [merchant_id, origin, destination, packages, service_type]
+      properties:
+        merchant_id:
+          type: string
+        origin:
+          type: object
+          required: [contact, address]
+          properties:
+            contact:
+              $ref: '#/components/schemas/Contact'
+            address:
+              $ref: '#/components/schemas/Address'
+        destination:
+          type: object
+          required: [contact, address]
+          properties:
+            contact:
+              $ref: '#/components/schemas/Contact'
+            address:
+              $ref: '#/components/schemas/Address'
+        service_type:
+          type: string
+          enum:
+            - FEDEX_GROUND
+            - FEDEX_HOME_DELIVERY
+            - FEDEX_EXPRESS_SAVER
+            - FEDEX_2_DAY
+            - FEDEX_2_DAY_AM
+            - STANDARD_OVERNIGHT
+            - PRIORITY_OVERNIGHT
+            - FIRST_OVERNIGHT
+            - FEDEX_INTERNATIONAL_PRIORITY
+            - FEDEX_INTERNATIONAL_ECONOMY
+            - FEDEX_GROUND_ECONOMY
+        packaging_type:
+          type: string
+          enum: [YOUR_PACKAGING, FEDEX_ENVELOPE, FEDEX_PAK, FEDEX_BOX, FEDEX_TUBE, FEDEX_SMALL_BOX, FEDEX_MEDIUM_BOX, FEDEX_LARGE_BOX]
+          default: YOUR_PACKAGING
+        pickup_type:
+          type: string
+          enum: [DROPOFF_AT_FEDEX_LOCATION, CONTACT_FEDEX_TO_SCHEDULE, USE_SCHEDULED_PICKUP]
+          default: DROPOFF_AT_FEDEX_LOCATION
+        packages:
+          type: array
+          items:
+            type: object
+            required: [weight]
+            properties:
+              weight:
+                $ref: '#/components/schemas/Weight'
+              dimensions:
+                $ref: '#/components/schemas/Dimensions'
+              customer_references:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [CUSTOMER_REFERENCE, PO_NUMBER, INVOICE_NUMBER]
+                    value:
+                      type: string
+              hazmat:
+                $ref: '#/components/schemas/HazmatDetail'
+        label_format:
+          type: string
+          enum: [PDF, PNG, ZPLII]
+          default: PDF
+        label_size:
+          type: string
+          enum: [PAPER_4X6, PAPER_4X675, PAPER_85X11_TOP_HALF_LABEL, STOCK_4X6]
+          default: PAPER_4X6
+        payment:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [SENDER, RECIPIENT, THIRD_PARTY]
+              default: SENDER
+        special_services:
+          type: array
+          items:
+            type: string
+            enum:
+              - SIGNATURE_REQUIRED
+              - ADULT_SIGNATURE_REQUIRED
+              - DIRECT_SIGNATURE_REQUIRED
+              - SATURDAY_DELIVERY
+              - HOLD_AT_LOCATION
+              - COD
+              - DANGEROUS_GOODS
+              - DRY_ICE
+        international_detail:
+          type: object
+          properties:
+            customs_value:
+              $ref: '#/components/schemas/Money'
+            commodities:
+              type: array
+              items:
+                type: object
+                properties:
+                  description:
+                    type: string
+                  quantity:
+                    type: integer
+                  unit_price:
+                    $ref: '#/components/schemas/Money'
+                  weight:
+                    $ref: '#/components/schemas/Weight'
+                  harmonized_code:
+                    type: string
+                  country_of_manufacture:
+                    type: string
+
+    CreateShipmentResponse:
+      type: object
+      properties:
+        shipment_id:
+          type: string
+          description: Platform internal shipment ID
+        master_tracking_number:
+          type: string
+        tracking_numbers:
+          type: array
+          items:
+            type: string
+        label_url:
+          type: string
+          format: uri
+        labels:
+          type: array
+          items:
+            type: object
+            properties:
+              tracking_number:
+                type: string
+              encoded_label:
+                type: string
+                description: Base64-encoded label
+              format:
+                type: string
+        total_charge:
+          $ref: '#/components/schemas/Money'
+        surcharges:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+              amount:
+                $ref: '#/components/schemas/Money'
+        estimated_delivery:
+          type: string
+          format: date-time
+
+    CancelShipmentRequest:
+      type: object
+      required: [merchant_id]
+      properties:
+        merchant_id:
+          type: string
+        reason:
+          type: string
+
+    CancelShipmentResponse:
+      type: object
+      properties:
+        cancelled:
+          type: boolean
+        tracking_number:
+          type: string
+        message:
+          type: string
+
+    # ── Tracking ────────────────────────────────────────────
+    TrackingRequest:
+      type: object
+      required: [tracking_numbers]
+      properties:
+        tracking_numbers:
+          type: array
+          items:
+            type: string
+          maxItems: 30
+        include_detailed_scans:
+          type: boolean
+          default: true
+
+    TrackingResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SingleTrackingResponse'
+
+    SingleTrackingResponse:
+      type: object
+      properties:
+        tracking_number:
+          type: string
+        status:
+          type: string
+          enum: [LABEL_CREATED, PICKED_UP, IN_TRANSIT, OUT_FOR_DELIVERY, DELIVERED, EXCEPTION, CANCELLED, RETURNED]
+        status_description:
+          type: string
+        estimated_delivery:
+          type: string
+          format: date-time
+        actual_delivery:
+          type: string
+          format: date-time
+        ship_date:
+          type: string
+          format: date-time
+        service_type:
+          type: string
+        current_location:
+          type: object
+          properties:
+            city:
+              type: string
+            state:
+              type: string
+            country:
+              type: string
+        signature:
+          type: object
+          properties:
+            name:
+              type: string
+            image_url:
+              type: string
+              format: uri
+        scan_events:
+          type: array
+          items:
+            type: object
+            properties:
+              timestamp:
+                type: string
+                format: date-time
+              event_type:
+                type: string
+              description:
+                type: string
+              location:
+                type: object
+                properties:
+                  city:
+                    type: string
+                  state:
+                    type: string
+                  country:
+                    type: string
+        package_details:
+          type: object
+          properties:
+            weight:
+              $ref: '#/components/schemas/Weight'
+            dimensions:
+              $ref: '#/components/schemas/Dimensions'
+            package_count:
+              type: integer
+
+    # ── Pickup ──────────────────────────────────────────────
+    PickupAvailabilityRequest:
+      type: object
+      required: [address]
+      properties:
+        address:
+          $ref: '#/components/schemas/Address'
+        pickup_date:
+          type: string
+          format: date
+        carriers:
+          type: array
+          items:
+            type: string
+            enum: [FDXE, FDXG]
+
+    PickupAvailabilityResponse:
+      type: object
+      properties:
+        available:
+          type: boolean
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              carrier:
+                type: string
+              pickup_date:
+                type: string
+                format: date
+              cutoff_time:
+                type: string
+                format: time
+              access_time_minutes:
+                type: integer
+              residential_available:
+                type: boolean
+
+    CreatePickupRequest:
+      type: object
+      required: [merchant_id, address, contact, ready_time, close_time, carrier, package_count, total_weight]
+      properties:
+        merchant_id:
+          type: string
+        address:
+          $ref: '#/components/schemas/Address'
+        contact:
+          $ref: '#/components/schemas/Contact'
+        ready_time:
+          type: string
+          format: date-time
+        close_time:
+          type: string
+          format: time
+        carrier:
+          type: string
+          enum: [FDXE, FDXG]
+        package_count:
+          type: integer
+          minimum: 1
+        total_weight:
+          $ref: '#/components/schemas/Weight'
+        package_location:
+          type: string
+          enum: [FRONT, REAR, SIDE, LOBBY, MAILROOM, OFFICE, RECEPTION, OTHER]
+        special_instructions:
+          type: string
+
+    CreatePickupResponse:
+      type: object
+      properties:
+        confirmation_code:
+          type: string
+        pickup_date:
+          type: string
+          format: date
+        location_code:
+          type: string
+        message:
+          type: string
+
+    CancelPickupRequest:
+      type: object
+      required: [merchant_id, scheduled_date]
+      properties:
+        merchant_id:
+          type: string
+        scheduled_date:
+          type: string
+          format: date
+        location_code:
+          type: string
+        reason:
+          type: string
+
+    CancelPickupResponse:
+      type: object
+      properties:
+        cancelled:
+          type: boolean
+        message:
+          type: string
+
+    # ── Locations ───────────────────────────────────────────
+    LocationSearchRequest:
+      type: object
+      properties:
+        address:
+          $ref: '#/components/schemas/Address'
+        coordinates:
+          type: object
+          properties:
+            latitude:
+              type: number
+            longitude:
+              type: number
+        radius:
+          type: object
+          properties:
+            value:
+              type: number
+              default: 10
+            unit:
+              type: string
+              enum: [MI, KM]
+              default: MI
+        location_types:
+          type: array
+          items:
+            type: string
+            enum: [FEDEX_OFFICE, FEDEX_SHIP_CENTER, DROP_BOX, FEDEX_AUTHORIZED_SHIP_CENTER, FEDEX_ONSITE, RETAIL_PARTNER]
+        capabilities:
+          type: array
+          items:
+            type: string
+            enum: [DROPOFF, HOLD_AT_LOCATION, PICKUP, PACKING, PRINTING, SHIPPING]
+        max_results:
+          type: integer
+          default: 10
+          maximum: 50
+
+    LocationSearchResponse:
+      type: object
+      properties:
+        locations:
+          type: array
+          items:
+            type: object
+            properties:
+              location_id:
+                type: string
+              name:
+                type: string
+              type:
+                type: string
+              address:
+                $ref: '#/components/schemas/Address'
+              coordinates:
+                type: object
+                properties:
+                  latitude:
+                    type: number
+                  longitude:
+                    type: number
+              distance:
+                type: object
+                properties:
+                  value:
+                    type: number
+                  unit:
+                    type: string
+              hours:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    day:
+                      type: string
+                    open:
+                      type: string
+                    close:
+                      type: string
+              capabilities:
+                type: array
+                items:
+                  type: string
+              phone:
+                type: string
+
+    # ── Returns & Refunds ───────────────────────────────────
+    CreateReturnRequest:
+      type: object
+      required: [merchant_id, original_tracking_number, return_from, return_to]
+      properties:
+        merchant_id:
+          type: string
+        original_tracking_number:
+          type: string
+        return_type:
+          type: string
+          enum: [PRINT_RETURN_LABEL, EMAIL_RETURN_LABEL, CALL_TAG]
+          default: PRINT_RETURN_LABEL
+        return_from:
+          type: object
+          required: [contact, address]
+          properties:
+            contact:
+              $ref: '#/components/schemas/Contact'
+            address:
+              $ref: '#/components/schemas/Address'
+        return_to:
+          type: object
+          required: [contact, address]
+          properties:
+            contact:
+              $ref: '#/components/schemas/Contact'
+            address:
+              $ref: '#/components/schemas/Address'
+        service_type:
+          type: string
+          default: FEDEX_GROUND
+        packages:
+          type: array
+          items:
+            type: object
+            properties:
+              weight:
+                $ref: '#/components/schemas/Weight'
+        label_format:
+          type: string
+          enum: [PDF, PNG, ZPLII]
+          default: PDF
+        email_label_to:
+          type: string
+          format: email
+          description: Required when return_type is EMAIL_RETURN_LABEL
+
+    CreateReturnResponse:
+      type: object
+      properties:
+        return_tracking_number:
+          type: string
+        label_url:
+          type: string
+          format: uri
+        encoded_label:
+          type: string
+        return_type:
+          type: string
+        message:
+          type: string
+
+    RefundRequest:
+      type: object
+      required: [order_id, refund_type]
+      properties:
+        order_id:
+          type: string
+        refund_type:
+          type: string
+          enum: [FULL, PARTIAL, SHIPPING_ONLY, STORE_CREDIT]
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Required for PARTIAL refund type
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              item_id:
+                type: string
+              quantity:
+                type: integer
+              reason:
+                type: string
+        reason:
+          type: string
+        refund_shipping:
+          type: boolean
+          default: false
+
+    RefundResponse:
+      type: object
+      properties:
+        refund_id:
+          type: string
+        status:
+          type: string
+          enum: [PENDING, PROCESSED, FAILED]
+        amount:
+          $ref: '#/components/schemas/Money'
+        payment_method:
+          type: string
+        estimated_completion:
+          type: string
+          format: date
+
+    # ── Hazmat ──────────────────────────────────────────────
+    HazmatDetail:
+      type: object
+      properties:
+        un_number:
+          type: string
+          pattern: '^UN\d{4}$'
+          description: UN identification number (e.g., UN3481)
+        hazard_class:
+          type: string
+          enum: ['1', '2', '3', '4', '5', '6', '7', '8', '9']
+        packing_group:
+          type: string
+          enum: [I, II, III]
+        proper_shipping_name:
+          type: string
+        technical_name:
+          type: string
+        quantity:
+          type: number
+        quantity_units:
+          type: string
+          enum: [KG, LB, L, GAL, PCS]
+        packing_instructions:
+          type: string
+          description: IATA packing instruction code (e.g., PI966)
+        accessibility:
+          type: string
+          enum: [ACCESSIBLE, INACCESSIBLE]
+        cargo_aircraft_only:
+          type: boolean
+          default: false
+        emergency_contact:
+          type: string
+        offeror:
+          type: string
+          description: Company name of the DG offeror
+
+    HazmatValidationRequest:
+      type: object
+      required: [items, service_type, origin, destination]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/HazmatDetail'
+        service_type:
+          type: string
+        origin:
+          $ref: '#/components/schemas/Address'
+        destination:
+          $ref: '#/components/schemas/Address'
+
+    HazmatValidationResponse:
+      type: object
+      properties:
+        valid:
+          type: boolean
+        violations:
+          type: array
+          items:
+            type: object
+            properties:
+              item_index:
+                type: integer
+              code:
+                type: string
+              message:
+                type: string
+              severity:
+                type: string
+                enum: [ERROR, WARNING]
+        required_documents:
+          type: array
+          items:
+            type: string
+        special_handling:
+          type: array
+          items:
+            type: string
+
+security:
+  - bearerAuth: []

@@ -1,0 +1,72 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv/
+ENV/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Node.js / Dashboard
+node_modules/
+graph_kb_dashboard/node_modules/
+graph_kb_dashboard/.next/
+graph_kb_dashboard/out/
+graph_kb_dashboard/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.docker/
+
+# Documentation
+*.md
+docs/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.whl
+*.tar.gz
+
+# Claude Code
+.claude/
+.omc/
+
+# Chainlit (deprecated)
+chainlit_app/

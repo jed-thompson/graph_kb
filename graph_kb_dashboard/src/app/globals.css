@@ -1,0 +1,232 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Modern Light Theme - Clean & Professional */
+    --background: 0 0% 98%;
+    --foreground: 222 47% 11%;
+
+    /* Cards with subtle elevation */
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    /* Popovers */
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    /* Primary - Modern Blue with depth */
+    --primary: 221 83% 53%;
+    --primary-foreground: 210 40% 98%;
+
+    /* Secondary - Soft Slate */
+    --secondary: 215 16% 47%;
+    --secondary-foreground: 0 0% 100%;
+
+    /* Muted - Subtle backgrounds */
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+
+    /* Accent - Vibrant but refined */
+    --accent: 210 100% 97%;
+    --accent-foreground: 221 83% 53%;
+
+    /* Destructive - Modern Red */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Success - Modern Green */
+    --success: 142 76% 36%;
+    --success-foreground: 0 0% 100%;
+
+    /* Warning - Modern Amber */
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    /* Info - Modern Cyan */
+    --info: 188 94% 43%;
+    --info-foreground: 0 0% 100%;
+
+    /* Borders & Inputs */
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 221 83% 53%;
+
+    /* Radius - Modern rounded corners */
+    --radius: 0.75rem;
+
+    /* Chart colors */
+    --chart-1: 221 83% 53%;
+    --chart-2: 142 76% 36%;
+    --chart-3: 38 92% 50%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 82% 52%;
+  }
+
+  .dark {
+    /* Modern Dark Theme - Deep & Elegant */
+    --background: 222 47% 6%;
+    --foreground: 210 40% 98%;
+
+    /* Cards with glassmorphism effect */
+    --card: 222 47% 10%;
+    --card-foreground: 210 40% 98%;
+
+    /* Popovers */
+    --popover: 222 47% 10%;
+    --popover-foreground: 210 40% 98%;
+
+    /* Primary - Brighter for dark mode */
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 11%;
+
+    /* Secondary - Soft Slate for dark */
+    --secondary: 215 20% 65%;
+    --secondary-foreground: 222 47% 11%;
+
+    /* Muted - Subtle dark backgrounds */
+    --muted: 217 33% 17%;
+    --muted-foreground: 215 20% 65%;
+
+    /* Accent - Subtle highlight */
+    --accent: 217 33% 17%;
+    --accent-foreground: 210 40% 98%;
+
+    /* Destructive - Brighter for dark mode */
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Success - Brighter for dark mode */
+    --success: 142 69% 58%;
+    --success-foreground: 0 0% 100%;
+
+    /* Warning - Brighter for dark mode */
+    --warning: 38 92% 50%;
+    --warning-foreground: 222 47% 11%;
+
+    /* Info - Brighter for dark mode */
+    --info: 188 94% 43%;
+    --info-foreground: 0 0% 100%;
+
+    /* Borders & Inputs - Subtle contrast */
+    --border: 217 33% 20%;
+    --input: 217 33% 20%;
+    --ring: 217 91% 60%;
+
+    /* Chart colors for dark mode */
+    --chart-1: 217 91% 60%;
+    --chart-2: 142 69% 58%;
+    --chart-3: 48 96% 53%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 82% 52%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Modern scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-muted/50;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-muted-foreground/30 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-muted-foreground/50;
+  }
+}
+
+@layer components {
+  /* Glass effect for cards */
+  .glass-card {
+    @apply bg-card/80 backdrop-blur-sm border border-border/50;
+  }
+
+  /* Gradient text effect */
+  .gradient-text {
+    @apply bg-gradient-to-r from-primary to-info bg-clip-text text-transparent;
+  }
+
+  /* Subtle hover lift effect */
+  .hover-lift {
+    @apply transition-all duration-300 hover:-translate-y-1 hover:shadow-lg;
+  }
+
+  /* Focus ring with modern styling */
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background;
+  }
+
+  /* Status indicator dots */
+  .status-dot {
+    @apply w-2 h-2 rounded-full;
+  }
+
+  .status-dot-ready {
+    @apply bg-success animate-pulse;
+  }
+
+  .status-dot-indexing {
+    @apply bg-warning animate-pulse;
+  }
+
+  .status-dot-error {
+    @apply bg-destructive;
+  }
+
+  .status-dot-pending {
+    @apply bg-muted-foreground;
+  }
+
+  /* Modern card hover effect */
+  .card-hover {
+    @apply transition-all duration-200 hover:shadow-md hover:border-primary/20;
+  }
+
+  /* Shimmer loading effect */
+  .shimmer {
+    @apply animate-pulse bg-gradient-to-r from-muted via-muted/50 to-muted bg-[length:200%_100%];
+    animation: shimmer 1.5s infinite;
+  }
+
+  @keyframes shimmer {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Hide scrollbar but keep functionality */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}

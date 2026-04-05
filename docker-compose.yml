@@ -1,0 +1,209 @@
+# Graph KB API Docker Compose
+# This compose file is for running ONLY the API service
+# It uses separate volumes from the main docker-compose.yml to avoid conflicts
+#
+# CPU (default): docker compose up --build
+# GPU:           $env:DEVICE="gpu"; docker compose up --build
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: graphkb-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: graphkb
+      POSTGRES_USER: graphkb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-graphkb_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U graphkb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - api_network
+
+  # Fast API Service exposing websocket service for lang graph dag workflows
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api.optimized
+      args:
+        - DEVICE=${DEVICE:-cpu}
+    ports:
+      - "8000:8000"
+    environment:
+      # Neo4j — must match validation_alias in settings.py
+      - NEO4J_URI=bolt://neo4j-api:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=password
+      # ChromaDB — use Docker service name, not localhost
+      - CHROMA_SERVER_HOST=chromadb
+      - CHROMA_SERVER_PORT=8000
+      # PostgreSQL
+      - DATABASE_URL=postgresql+asyncpg://graphkb:${POSTGRES_PASSWORD:-graphkb_password}@postgres:5432/graphkb
+      - DATABASE_POOL_SIZE=10
+      - DATABASE_MAX_OVERFLOW=20
+      # Storage paths
+      - REPO_STORAGE_PATH=/data/repos
+      - SPEC_STORAGE_PATH=/data/spec_artifacts
+      # API keys
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      # HuggingFace
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_HOME=/root/.cache/huggingface
+      # Embedding model — must match what was used to index data
+      - EMBEDDING_MODEL=jinaai/jina-embeddings-v3
+      - EMBEDDING_DIMENSIONS=1024
+      # EMBEDDING_DEVICE is unset so auto-detection picks cuda > mps > cpu
+      # Suppress noisy flash_attn advisory warnings from transformers
+      - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+      # LLM
+      - OPENAI_MODEL=gpt-5.2
+      - LLM_TEMPERATURE=0.0
+      # Tuning (transposed from Chainlit settings.yaml)
+      - MAX_DEPTH=25
+      - DEEP_AGENT_MAX_ITERATIONS=50
+      # LangGraph v3
+      - LANGGRAPH_V3_ENABLED=${LANGGRAPH_V3_ENABLED:-false}
+      - LANGGRAPH_CHECKPOINTER_TYPE=postgres
+      # LLM Recording (set LLM_RECORDING_MODE=record to capture responses)
+      - LLM_RECORDING_MODE=${LLM_RECORDING_MODE:-off}
+      - LLM_RECORDING_DIR=/llm-recordings
+      - LLM_MOCK_DIR=/llm-recordings
+    volumes:
+      - api_data:/data
+      - hf_cache:/root/.cache/huggingface
+      - ./e2e/tests/fixtures/llm-responses:/llm-recordings
+      - ./graph_kb_api:/app/graph_kb_api
+    command: ["uvicorn", "graph_kb_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/graph_kb_api"]
+    depends_on:
+      neo4j-api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - api_network
+    # GPU: when DEVICE=gpu, the CUDA-enabled torch is baked into the image at build time.
+    # The deploy block below grants container access to NVIDIA GPUs at runtime.
+    # On hosts without nvidia-container-toolkit this is safely ignored (Compose v2.20+).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # Graph Database use to store nodes, edges and vector embeddings
+  neo4j-api:
+    image: neo4j:5.15.0
+    hostname: neo4j-api
+    container_name: graphkb-neo4j-api-1
+    ports:
+      - "7475:7474" # HTTP (different port to avoid conflict with main compose)
+      - "7688:7687" # Bolt (different port to avoid conflict with main compose)
+    environment:
+      - NEO4J_AUTH=neo4j/password
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_connector_http_advertised__address=:7474
+      - NEO4J_dbms_connector_bolt_advertised__address=:7687
+    volumes:
+      - neo4j_api_data:/data
+      - neo4j_api_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO - http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - api_network
+
+  # Vector database
+  chromadb:
+    image: chromadb/chroma:latest
+    volumes:
+      - chromadb_data:/data
+    ports:
+      - "8091:8000" # Map to 8091 on host
+    environment:
+      - IS_PERSISTENT=TRUE
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/localhost/8000 && echo -e \"GET /api/v2/heartbeat HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && grep -q 200 <&3'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - api_network
+
+  # Next.js Dashboard (dev mode — source mounted from host)
+  dashboard:
+    build:
+      context: ./graph_kb_dashboard
+      dockerfile: Dockerfile.dashboard.dev
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api/v1
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws
+      - NODE_ENV=development
+    volumes:
+      - ./graph_kb_dashboard:/app
+      - /app/node_modules
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - api_network
+
+  # S3-compatible storage (MinIO for dev, swap env vars for AWS S3 in prod)
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9010:9000" # S3 API port
+      - "9011:9001" # MinIO Console UI
+    volumes:
+      - minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=${S3_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${S3_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - api_network
+
+networks:
+  api_network:
+    driver: bridge
+
+volumes:
+  api_data:
+  neo4j_api_data:
+  neo4j_api_logs:
+  postgres_data:
+  minio_data:
+  chromadb_data:
+  hf_cache:

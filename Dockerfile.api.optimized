@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1.4
+# Graph KB API Dockerfile - Optimized for faster builds
+# Build with: DOCKER_BUILDKIT=1 docker compose up --build
+
+# =============================================================================
+# Stage 1: Base image with PyTorch pre-installed
+# Using official PyTorch images eliminates ~2.5GB download on every build
+# =============================================================================
+
+# CPU option (smaller image, no CUDA support):
+# FROM pytorch/pytorch:2.5.1-cpu-runtime AS base
+
+# GPU option (CUDA 12.1 + cuDNN 9, includes PyTorch 2.5.1) - ENABLED:
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime AS base
+
+WORKDIR /app
+
+# Install system dependencies (rarely change, so this layer caches well)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# Stage 2: Install Python dependencies with cache mounts
+# =============================================================================
+FROM base AS deps
+
+# Copy requirements first (Docker caches this layer)
+COPY requirements.api.txt .
+
+# Install remaining requirements with BuildKit cache mount
+# The cache mount persists across builds, dramatically speeding up rebuilds
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --timeout=300 -r requirements.api.txt
+
+# =============================================================================
+# Stage 3: Pre-download embedding model (cached separately)
+# =============================================================================
+FROM deps AS model-cache
+
+ENV HF_HOME=/root/.cache/huggingface
+ARG EMBEDDING_MODEL=jinaai/jina-embeddings-v3
+
+# Pre-download model - this layer only rebuilds if EMBEDDING_MODEL changes.
+# NOTE: Do NOT use --mount=type=cache here — cache mounts are not part of the
+# image layer, so COPY --from=model-cache would find nothing.
+RUN python -c "\
+from sentence_transformers import SentenceTransformer; \
+m = SentenceTransformer('${EMBEDDING_MODEL}', trust_remote_code=True); \
+print(f'Model pre-loaded: {m.get_sentence_embedding_dimension()} dims')"
+
+# =============================================================================
+# Stage 4: Final runtime image
+# =============================================================================
+FROM base AS runtime
+
+# Copy installed packages and CLI entry-points (uvicorn, etc.) from deps stage
+COPY --from=deps /opt/conda/lib/python3.11/site-packages /opt/conda/lib/python3.11/site-packages
+COPY --from=deps /opt/conda/bin /opt/conda/bin
+
+# Copy model cache
+COPY --from=model-cache /root/.cache/huggingface /root/.cache/huggingface
+
+# Copy application code (changes most frequently, so last)
+# NOTE: In dev mode, docker-compose.yml bind-mounts ./graph_kb_api over this
+#       directory, so code changes are picked up immediately with uvicorn --reload.
+#       The COPY layer still allows the image to run standalone outside of compose.
+COPY graph_kb_api/ ./graph_kb_api/
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV HF_HOME=/root/.cache/huggingface
+
+EXPOSE 8000
+
+# Health check (use python instead of curl — curl may not be on PATH in multi-stage builds)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+# Run the API
+CMD ["uvicorn", "graph_kb_api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,68 @@
+# Graph KB API Dependencies
+# Core Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-multipart>=0.0.6
+
+# WebSocket
+websockets>=12.0
+
+# Database
+neo4j>=5.0.0
+neo4j-graphrag>=0.3.0
+chromadb>=1.0.0
+sqlalchemy>=2.0.0
+sqlalchemy[asyncio]>=2.0.0
+asyncpg>=0.29.0
+alembic>=1.12.0
+tree-sitter>=0.20.0
+tree-sitter-languages>=1.9.0
+tree-sitter-python>=0.20.0
+tree-sitter-javascript>=0.20.0
+tree-sitter-typescript>=0.20.0
+
+# PyTorch is included in the base Docker image (pytorch/pytorch:2.5.1-*)
+# If running outside Docker, install: pip install torch
+# See requirements.gpu.txt for CUDA version
+
+# LLM & Embeddings
+langchain>=0.1.0
+langchain-core>=0.1.0
+langchain-openai>=0.0.2
+langchain-community>=0.0.10
+langgraph>=0.0.40
+langgraph-checkpoint-postgres>=2.0.0
+psycopg[binary]>=3.2.0
+psycopg_pool>=3.2.0
+langchain-mcp-adapters>=0.2.1
+mcp>=1.0.0  # Model Context Protocol SDK for tool integration
+fastmcp>=3.0.0  # FastMCP framework for MCP server/client management
+openai>=1.0.0
+tiktoken>=0.5.0
+sentence-transformers>=2.2.0
+einops>=0.7.0  # Required for Jina v3 embeddings
+transformers>=4.41.0,<4.47.0  # Pinned: jina-embeddings-v3 needs create_position_ids_from_input_ids removed in 4.47+
+tenacity>=8.2.0  # Retry logic with exponential backoff
+jinja2>=3.1.6
+typing-extensions>=4.5.0
+deepagents>=0.3.6
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0
+aiofiles>=23.0.0
+pyvis>=0.3.0
+gitpython>=3.1.0
+pathspec>=0.11.0
+markdownify>=0.14.1
+beautifulsoup4>=4.12.0
+aioboto3>=12.0.0
+azure-storage-blob[aio]>=12.0.0
+duckduckgo-search>=4.0.0
+
+# Development & Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0  # For async API testing
