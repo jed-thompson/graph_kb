@@ -12,7 +12,19 @@ from typing import Optional
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from psycopg_pool import AsyncConnectionPool
+
+# Custom types stored in checkpoints that must be registered with the
+# LangGraph serializer to avoid "unregistered type" deserialization warnings.
+_CHECKPOINT_ALLOWED_MODULES = [
+    ("graph_kb_api.graph_kb.querying.models", "ContextPacket"),
+    ("graph_kb_api.graph_kb.querying.models", "GraphRAGResult"),
+    ("graph_kb_api.graph_kb.models.enums", "GraphNodeType"),
+    ("graph_kb_api.graph_kb.models.visualization", "VisNode"),
+    ("graph_kb_api.graph_kb.models.visualization", "VisEdge"),
+    ("graph_kb_api.graph_kb.models.visualization", "VisGraph"),
+]
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +86,8 @@ class CheckpointerFactory:
                 logger.error(f"Failed to open Postgres checkpointer pool: {e}")
                 raise
 
-            saver = AsyncPostgresSaver(cls._pool)
+            serde = JsonPlusSerializer(allowed_msgpack_modules=_CHECKPOINT_ALLOWED_MODULES)
+            saver = AsyncPostgresSaver(cls._pool, serde=serde)
             logger.info("Running Postgres checkpointer setup (migrations)")
             await saver.setup()
             cls._instance = saver

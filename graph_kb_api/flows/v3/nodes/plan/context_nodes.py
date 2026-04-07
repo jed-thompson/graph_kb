@@ -312,7 +312,7 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                             notes=f"Scraped from {url}",
                         )
 
-                        summary = content[:200].strip()
+                        summary = content.strip()
                         url_meta_list.append(
                             {
                                 "url": url,
@@ -379,7 +379,7 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
 
         all_doc_entries: List[Dict[str, str]] = []
 
-        # Load primary document content (8K token budget).
+        # Load primary document content.
         if primary_id:
             try:
                 primary_docs = await load_uploaded_document_contents(
@@ -393,6 +393,47 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                     primary_id,
                     len(primary_docs),
                 )
+
+                # Fallback: doc exists in ChromaDB (global docs) but not in the plan
+                # document store. Fetch content directly from the vector store and
+                # inject it so it's available to the LLM without requiring a DB write.
+                if not primary_docs:
+                    workflow_context = configurable.get("context")
+                    vector_store = getattr(workflow_context, "vector_store", None) if workflow_context else None
+                    if vector_store is not None:
+                        try:
+                            chunk = vector_store.get(primary_id)
+                            if chunk and chunk.content:
+                                filename = (chunk.metadata or {}).get("filename") or primary_id
+                                all_doc_entries.append(
+                                    {
+                                        "doc_id": primary_id,
+                                        "filename": filename,
+                                        "content": chunk.content,
+                                        "role": "primary",
+                                    }
+                                )
+                                logger.info(
+                                    "CollectContextNode: primary doc %s loaded from ChromaDB fallback (%d chars)",
+                                    primary_id,
+                                    len(chunk.content),
+                                )
+                            else:
+                                logger.warning(
+                                    "CollectContextNode: primary doc %s not found in ChromaDB fallback",
+                                    primary_id,
+                                )
+                        except Exception as fallback_exc:
+                            logger.warning(
+                                "CollectContextNode: ChromaDB fallback failed for primary doc %s: %s",
+                                primary_id,
+                                fallback_exc,
+                            )
+                    else:
+                        logger.warning(
+                            "CollectContextNode: primary doc %s missing from plan store and no vector_store available",
+                            primary_id,
+                        )
             except Exception as e:
                 logger.warning("CollectContextNode: failed to load primary doc %s: %s", primary_id, e)
 
@@ -456,7 +497,8 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                                         "Full primary spec for per-task section loading",
                                     )
                                     logger.info(
-                                        "CollectContextNode: stored full primary spec (%d chars) at context/primary_spec_full.md",
+                                        "CollectContextNode: stored full primary spec (%d chars)"
+                                        " at context/primary_spec_full.md",
                                         len(full_content),
                                     )
                 except Exception as e:
@@ -520,7 +562,7 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                     elif "text/plain" in content_type or "text/markdown" in content_type:
                         text = resp.text
                     else:
-                        text = resp.text[:5000]  # Truncate non-text responses
+                        text = resp.text
 
                     logger.info(
                         "CollectContextNode: fetched url=%s status=%d content_type=%s text_len=%d",
@@ -529,7 +571,7 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                         content_type,
                         len(text),
                     )
-                    results.append({"url": url, "content": text[:20000]})
+                    results.append({"url": url, "content": text})
                 except Exception as e:
                     logger.warning(f"Failed to fetch reference URL {url}: {e}")
         return results

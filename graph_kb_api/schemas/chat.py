@@ -11,10 +11,12 @@ class AskCodeRequest(BaseModel):
     """Request body for code Q&A."""
 
     repo_id: Optional[str] = None
+    repo_ids: Optional[List[str]] = None  # Multi-repo: overrides repo_id when 2+ entries
     query: str = Field(min_length=1, max_length=10000)
     top_k: int = Field(default=10, ge=1, le=100)
     max_depth: int = Field(default=3, ge=1, le=10)
     use_deep_agent: bool = False
+    conversation_id: Optional[str] = None
 
 
 class SourceItem(BaseModel):

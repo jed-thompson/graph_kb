@@ -147,7 +147,7 @@ async def websearch_with_content(
                         'title': r.get('title', ''),
                         'url': url,
                         'snippet': r.get('snippet', ''),
-                        'content': content[:5000] if content else ''  # Limit content size
+                        'content': content if content else ''
                     })
                 except Exception as e:
                     logger.warning(f"Failed to fetch content for {url}: {e}")

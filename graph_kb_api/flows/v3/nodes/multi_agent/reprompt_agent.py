@@ -212,7 +212,7 @@ class RePromptAgent(BaseWorkflowNodeV3):
         ])
 
         outputs_summary = "\n".join([
-            f"- {agent}: {str(output)[:100]}..."
+            f"- {agent}: {str(output)}"
             for agent, output in agent_outputs.items()
         ])
 

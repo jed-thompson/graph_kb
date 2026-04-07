@@ -28,6 +28,7 @@ export function InputArea({
   disabled = false,
 }: InputAreaProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const [showCommandHelp, setShowCommandHelp] = useState(false);
   const [commandFilter, setCommandFilter] = useState('');
   const [filteredCommands, setFilteredCommands] = useState<Command[]>([]);
@@ -120,6 +121,16 @@ export function InputArea({
   }, [commandFilter, COMMANDS]);
 
   useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setShowCommandHelp(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  useEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
 
@@ -141,6 +152,7 @@ export function InputArea({
       if (value.trim().startsWith('/') || value.trim().startsWith('@')) {
         addToHistory(value.trim());
       }
+      setShowCommandHelp(false);
       onSend();
     } else if (e.key === 'Escape') {
       setShowCommandHelp(false);
@@ -186,7 +198,7 @@ export function InputArea({
   };
 
   return (
-    <div className="relative">
+    <div className="relative" ref={containerRef}>
       {showCommandHelp && (
         <Card className="absolute bottom-full left-0 mb-3 p-4 w-80 z-50 border-border bg-popover shadow-lg">
           <ScrollArea className="max-h-64">
@@ -272,6 +284,7 @@ export function InputArea({
               if (value.trim().startsWith('/') || value.trim().startsWith('@')) {
                 addToHistory(value.trim());
               }
+              setShowCommandHelp(false);
               onSend();
             }}
             disabled={disabled || isLoading || !value.trim()}

@@ -146,7 +146,7 @@ def create_app() -> FastAPI:
         allow_origins=CORS_ORIGINS,
         allow_credentials=len(CORS_ORIGINS) > 0
         and CORS_ORIGINS[0] != "*",  # Only allow credentials with specific origins
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
         max_age=600,  # Cache preflight requests for 10 minutes
     )

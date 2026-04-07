@@ -11,6 +11,7 @@ The /ask/stream endpoint uses the LangGraph AskCodeWorkflowEngine which provides
 - Iterative agent reasoning
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -83,19 +84,152 @@ def _build_llm_prompt(query: str, context_items) -> str:
     return "\n".join(parts)
 
 
+_MULTI_REPO_SYSTEM_PROMPT = (
+    "You are a senior software architect with deep expertise in distributed systems and "
+    "multi-service codebases. You are answering questions that span multiple code repositories.\n\n"
+    "## Your primary job\n"
+    "Reason *across* the provided repositories, not about each one in isolation. "
+    "The user wants to understand how these services interact, share data, or diverge in approach.\n\n"
+    "## What to look for when answering\n"
+    "When the question is about communication or integration between services, actively search the "
+    "provided context for:\n"
+    "- **HTTP/REST clients**: `requests`, `httpx`, `axios`, `fetch`, base URLs, route paths\n"
+    "- **gRPC stubs**: `Stub(channel)`, `grpc.insecure_channel`, `.proto` service definitions, "
+    "generated `*_pb2_grpc.py` files\n"
+    "- **Message queues / events**: topic names, `publish`, `subscribe`, `consumer_group`, "
+    "SQS/Kafka/PubSub client calls\n"
+    "- **Shared contracts**: protobuf imports, shared model packages, OpenAPI client generation\n"
+    "- **Environment / config wiring**: env vars like `*_URL`, `*_HOST`, `*_TOPIC` that point "
+    "one service at another\n\n"
+    "## How to structure your answer\n"
+    "1. **State what you found** — cite specific files, functions, and line ranges from the context.\n"
+    "2. **State what is missing** — if call-site code, proto definitions, or config wiring was "
+    "not retrieved, say so explicitly and describe what file types would contain it.\n"
+    "3. **Cross-reference across repos** — if repo A publishes an event and repo B consumes one, "
+    "connect them even if they are in separate context sections.\n"
+    "4. **Name repos explicitly** — always use the repository name when attributing a finding, "
+    "never just 'the service'.\n"
+    "5. **Diagrams when useful** — use a Mermaid diagram to show service topology or data flow "
+    "when prose alone would be confusing.\n\n"
+    "## Mermaid Diagram Rules\n"
+    'Quote node labels with special characters: `A["label (detail)"]`\n'
+    "No HTML tags — use `\\n` inside quoted labels for line breaks.\n"
+    "Node IDs must be alphanumeric. Every `-->` must connect two nodes.\n"
+    'Subgraph titles need a space: `subgraph ID ["Title"]`\n'
+)
+
+
+def _build_multi_repo_prompt(query: str, context_items: List[Any], repo_ids: List[str]) -> str:
+    """Build a user prompt for multi-repo questions.
+
+    Groups retrieved context by repository so the LLM can reason across service
+    boundaries. Surfaces the full repo inventory and flags when inter-service
+    wiring artefacts (clients, protos, env config) were not retrieved.
+    """
+    # Group items by repo_id
+    by_repo: Dict[str, List[Any]] = {r: [] for r in repo_ids}
+    for item in context_items:
+        repo_id = item.get("_repo_id", "") if isinstance(item, dict) else ""
+        if repo_id in by_repo:
+            by_repo[repo_id].append(item)
+
+    parts: List[str] = [
+        "## Repositories in scope\n"
+        + "\n".join(f"- `{r}`" for r in repo_ids)
+        + "\n"
+    ]
+
+    for repo_id in repo_ids:
+        items = by_repo.get(repo_id, [])
+        parts.append(f"\n---\n## Repository: `{repo_id}`\n")
+        if not items:
+            parts.append("_No context retrieved for this repository._\n")
+            continue
+        for item in items:
+            file_path = item.get("file_path", "") if isinstance(item, dict) else (getattr(item, "file_path", "") or "")
+            content = item.get("content", "") if isinstance(item, dict) else (getattr(item, "content", "") or "")
+            start_line = item.get("start_line") if isinstance(item, dict) else getattr(item, "start_line", None)
+            end_line = item.get("end_line") if isinstance(item, dict) else getattr(item, "end_line", None)
+            symbol = item.get("symbol") if isinstance(item, dict) else getattr(item, "symbol", None)
+
+            header = file_path or symbol or "context"
+            if start_line and end_line:
+                header += f" (lines {start_line}–{end_line})"
+            parts.append(f"### {header}\n```\n{content}\n```\n")
+
+    parts.append(
+        "\n---\n## Note on coverage\n"
+        "The context above reflects the top similarity matches for the query. "
+        "If you cannot find HTTP client calls, gRPC stubs, proto imports, queue topic names, "
+        "or environment variable wiring in the context above, state that explicitly — "
+        "those artefacts may not have been retrieved. Do not invent connections that are not "
+        "evidenced in the provided code.\n"
+    )
+
+    parts.append(f"\n## Question\n{query}")
+    return "\n".join(parts)
+
+
+def _build_synthesis_prompt(
+    query: str,
+    successful: Dict[str, Dict[str, Any]],
+    failed: List[str],
+) -> str:
+    """Build synthesis prompt combining per-repo agent analysis outputs."""
+    parts = [
+        "You are answering a question about multiple code repositories.\n"
+        "Each section below contains a full analysis produced by a dedicated agent for one repository.\n"
+        "Synthesize these analyses into a single, coherent answer.\n\n"
+        "When comparing repositories, explicitly name each one. "
+        "Do not repeat identical information — highlight similarities and differences. "
+        "If repositories implement the same concept differently, explain each approach.\n\n"
+        f"## Question\n{query}\n\n"
+        "## Analysis per Repository\n",
+    ]
+    for repo_id, state in successful.items():
+        output = state.get("final_output") or state.get("llm_response") or ""
+        if len(output) > 8000:
+            cutoff = output.rfind("\n", 0, 8000)
+            cutoff = cutoff if cutoff > 0 else 8000
+            output = output[:cutoff] + f"\n\n[... truncated — {len(output) - cutoff} characters omitted ...]"
+        parts.append(f"\n### Repository: `{repo_id}`\n{output}\n")
+    if failed:
+        failed_list = ", ".join(f"`{r}`" for r in failed)
+        parts.append(f"\n> **Note:** The following repositories could not be analysed: {failed_list}\n")
+    parts.append(
+        "\n## Synthesis Instructions\n"
+        "Provide a unified answer that:\n"
+        "1. Directly answers the question by drawing on all repositories above — do not treat each in isolation.\n"
+        "2. Explicitly identifies inter-service communication: HTTP client calls, gRPC stubs, "
+        "shared proto imports, message queue topic names, or environment variable wiring that "
+        "connects one service to another. Cite the file and function where the call-site appears.\n"
+        "3. If call-site code was not present in the per-repo analyses, say so clearly and name "
+        "the file types or patterns that would contain it (e.g. `*_stub.py`, `*_client.py`, "
+        "`settings.py` with `*_URL` variables, `.proto` service definitions).\n"
+        "4. Compares or contrasts implementations where relevant, naming each repository explicitly.\n"
+        "5. References specific files, functions, or line ranges found in each codebase.\n"
+        "6. Uses a Mermaid service-topology diagram when it adds clarity that prose cannot provide.\n"
+    )
+    return "".join(parts)
+
+
 def _context_items_to_sources(context_items) -> List[SourceItem]:
-    """Convert retrieval context items to SourceItem schemas."""
+    """Convert retrieval context items to SourceItem schemas.
+
+    Accepts either ContextItem dataclasses or dicts (state now stores dicts).
+    """
     sources = []
     for item in context_items:
-        if item.file_path:
+        file_path = item.get("file_path") if isinstance(item, dict) else item.file_path
+        if file_path:
             sources.append(
                 SourceItem(
-                    file_path=item.file_path,
-                    start_line=item.start_line,
-                    end_line=item.end_line,
-                    content=item.content,
-                    symbol=item.symbol,
-                    score=item.score,
+                    file_path=file_path,
+                    start_line=item.get("start_line") if isinstance(item, dict) else item.start_line,
+                    end_line=item.get("end_line") if isinstance(item, dict) else item.end_line,
+                    content=item.get("content") if isinstance(item, dict) else item.content,
+                    symbol=item.get("symbol") if isinstance(item, dict) else item.symbol,
+                    score=item.get("score") if isinstance(item, dict) else item.score,
                 )
             )
     return sources
@@ -474,6 +608,150 @@ _ASK_CODE_NODE_PHASES: Dict[str, str] = {
 }
 
 
+async def _run_repo_workflow(
+    repo_id: str,
+    request: AskCodeRequest,
+    app_context: Any,
+    workflow_id: str,
+    event_queue: asyncio.Queue,
+    result_slot: Dict[str, Any],
+) -> None:
+    """Run the full AskCode workflow for a single repo.
+
+    Pushes tagged SSE progress events onto event_queue and writes the
+    completed final_state into result_slot[repo_id] when done.
+    Always puts ('repo_done', repo_id) onto event_queue in the finally block.
+    """
+    from graph_kb_api.flows.v3.checkpointer import CheckpointerFactory
+    from graph_kb_api.flows.v3.graphs.ask_code import AskCodeWorkflowEngine
+    from graph_kb_api.flows.v3.utils.progress_queue import ProgressQueue
+
+    total_nodes = len(_ASK_CODE_NODE_PHASES)
+    nodes_completed = 0
+    final_state: Dict[str, Any] = {}
+    progress_queue = None
+    workflow_task = None
+    progress_task = None
+
+    try:
+        engine = AskCodeWorkflowEngine(
+            llm=app_context.llm,
+            app_context=app_context,
+            checkpointer=CheckpointerFactory.create_checkpointer(),
+            use_default_checkpointer=False,
+        )
+        progress_queue = ProgressQueue()
+
+        config = {
+            "configurable": {
+                "thread_id": f"{workflow_id}_{repo_id}",
+                "services": {
+                    "app_context": app_context,
+                    "progress_queue": progress_queue,
+                },
+            }
+        }
+
+        repo_event_queue: asyncio.Queue = asyncio.Queue()
+
+        async def run_workflow_inner():
+            nonlocal nodes_completed, final_state
+            try:
+                async for chunk in engine.start_workflow_stream(
+                    user_query=request.query,
+                    user_id="http-user",
+                    session_id=workflow_id,
+                    config=config,
+                    repo_id=repo_id,
+                    args=[repo_id, request.query],
+                    original_question=request.query,
+                    refined_question=request.query,
+                ):
+                    for node_name, state_update in chunk.items():
+                        if node_name == "__end__":
+                            continue
+                        nodes_completed += 1
+                        phase = _ASK_CODE_NODE_PHASES.get(node_name, node_name)
+                        progress_pct = min((nodes_completed / total_nodes) * 100, 100)
+                        progress_event = {
+                            "type": "progress",
+                            "step": f"{repo_id}::{node_name}",
+                            "phase": phase,
+                            "progress_percent": round(progress_pct, 1),
+                            "message": f"[{repo_id}] {phase}...",
+                            "repo_id": repo_id,
+                            "node": node_name,
+                            "nodes_completed": nodes_completed,
+                            "total_nodes": total_nodes,
+                            "current_step": nodes_completed,
+                            "total_steps": total_nodes,
+                        }
+                        yield f"data: {json.dumps(progress_event)}\n\n"
+                        if state_update:
+                            final_state.update(state_update)
+            finally:
+                progress_queue.close()
+
+        async def consume_progress_queue_inner():
+            async for event in progress_queue:
+                d = event.to_dict()
+                d["repo_id"] = repo_id
+                yield f"data: {json.dumps(d)}\n\n"
+
+        async def collect_workflow_events_inner():
+            try:
+                async for event in run_workflow_inner():
+                    await repo_event_queue.put(("workflow", event))
+            finally:
+                await repo_event_queue.put(("workflow_done", None))
+
+        async def collect_queue_events_inner():
+            try:
+                async for event in consume_progress_queue_inner():
+                    await repo_event_queue.put(("progress", event))
+            finally:
+                await repo_event_queue.put(("progress_done", None))
+
+        workflow_task = asyncio.create_task(collect_workflow_events_inner())
+        progress_task = asyncio.create_task(collect_queue_events_inner())
+
+        workflow_done_flag = False
+        progress_done_flag = False
+
+        while not (workflow_done_flag and progress_done_flag):
+            try:
+                source, ev = await asyncio.wait_for(repo_event_queue.get(), timeout=30.0)
+                if source == "workflow_done":
+                    workflow_done_flag = True
+                elif source == "progress_done":
+                    progress_done_flag = True
+                elif ev:
+                    await event_queue.put(("sse", ev))
+            except asyncio.TimeoutError:
+                await event_queue.put(("sse", f"data: {json.dumps({'type': 'keepalive'})}\n\n"))
+
+        await asyncio.gather(workflow_task, progress_task, return_exceptions=True)
+
+        # Replace delta-accumulated state with the properly-reduced snapshot.
+        # start_workflow_stream yields per-node deltas; shallow .update() loses
+        # accumulated list fields (e.g. context_items overwritten by a later node).
+        # get_workflow_state returns the fully-reduced LangGraph checkpoint.
+        checkpointed = await engine.get_workflow_state(config)
+        if checkpointed:
+            final_state = checkpointed
+
+    except Exception as exc:
+        logger.error("[CHAT] Per-repo workflow failed for %s: %s", repo_id, exc, exc_info=True)
+        if progress_queue is not None:
+            progress_queue.close()
+        for _t in [workflow_task, progress_task]:
+            if _t is not None and not _t.done():
+                _t.cancel()
+    finally:
+        result_slot[repo_id] = final_state if final_state else None
+        await event_queue.put(("repo_done", repo_id))
+
+
 async def _stream_sse_with_workflow(
     request: AskCodeRequest,
     facade,
@@ -493,8 +771,6 @@ async def _stream_sse_with_workflow(
     - 'mermaid': Mermaid diagrams extracted from the response
     - 'done': Stream completion signal
     """
-    import asyncio
-
     from graph_kb_api.flows.v3.utils.progress_queue import ProgressQueue
 
     workflow_id = str(uuid.uuid4())[:8]
@@ -506,11 +782,164 @@ async def _stream_sse_with_workflow(
     )
 
     # --- No repo_id: general QA without retrieval ---
-    if not request.repo_id:
+    if not request.repo_id and not request.repo_ids:
         logger.info("[CHAT] No repo_id — falling back to direct LLM streaming")
         async for event in _stream_sse(request, facade):
             yield event
         return
+
+    # --- Multi-repo: run full AskCode workflow per repo, then synthesize ---
+    if request.repo_ids and len(request.repo_ids) >= 2:
+        logger.info("[CHAT] Multi-repo full-workflow request: %s", request.repo_ids)
+        try:
+            from graph_kb_api.context import get_app_context
+            from graph_kb_api.flows.v3.graphs.ask_code import AskCodeWorkflowEngine  # noqa: F401
+
+            app_context = get_app_context()
+        except Exception as e:
+            logger.warning("[CHAT] AskCodeWorkflowEngine unavailable for multi-repo (%s), falling back", e)
+            async for event in _stream_sse(request, facade):
+                yield event
+            return
+
+        init_event = {
+            "type": "progress",
+            "step": "multi_repo_init",
+            "phase": "Initializing",
+            "progress_percent": 0,
+            "message": f"Starting full analysis across {len(request.repo_ids)} repositories...",
+            "current_step": 0,
+            "total_steps": len(request.repo_ids) + 1,
+        }
+        yield f"data: {json.dumps(init_event)}\n\n"
+
+        shared_event_queue: asyncio.Queue = asyncio.Queue()
+        result_slot: Dict[str, Any] = {}
+        repos_done: set = set()
+
+        repo_tasks = [
+            asyncio.create_task(
+                _run_repo_workflow(
+                    repo_id=repo_id,
+                    request=request,
+                    app_context=app_context,
+                    workflow_id=workflow_id,
+                    event_queue=shared_event_queue,
+                    result_slot=result_slot,
+                )
+            )
+            for repo_id in request.repo_ids
+        ]
+
+        while len(repos_done) < len(request.repo_ids):
+            try:
+                source, payload = await asyncio.wait_for(shared_event_queue.get(), timeout=30.0)
+                if source == "repo_done":
+                    repos_done.add(payload)
+                    logger.info(
+                        "[CHAT] Multi-repo: %s completed (%d/%d)",
+                        payload, len(repos_done), len(request.repo_ids),
+                    )
+                elif source == "sse" and payload:
+                    yield payload
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'type': 'keepalive'})}\n\n"
+
+        await asyncio.gather(*repo_tasks, return_exceptions=True)
+
+        successful = {
+            rid: state
+            for rid, state in result_slot.items()
+            if state and (state.get("final_output") or state.get("llm_response"))
+        }
+        failed = [rid for rid in request.repo_ids if rid not in successful]
+
+        if failed:
+            logger.warning("[CHAT] Multi-repo: %d/%d repos failed: %s", len(failed), len(request.repo_ids), failed)
+
+        if not successful:
+            all_failed_event = {"type": "error", "message": "All repository analyses failed. Please try again."}
+            yield f"data: {json.dumps(all_failed_event)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'error': True})}\n\n"
+            return
+
+        all_context_items: List = []
+        for repo_id, state in successful.items():
+            for item in state.get("context_items", []):
+                tagged = dict(item) if isinstance(item, dict) else {
+                    "file_path": item.file_path,
+                    "content": item.content,
+                    "start_line": item.start_line,
+                    "end_line": item.end_line,
+                    "symbol": item.symbol,
+                }
+                tagged["_repo_id"] = repo_id
+                all_context_items.append(tagged)
+
+        sources = _context_items_to_sources(all_context_items)
+        total_sources = len(sources)
+        sources_data = [s.model_dump(exclude_none=True) for s in sources[:20]]
+
+        if total_sources > 20:
+            from graph_kb_api.flows.v3.utils.sources_cache import sources_cache
+            sources_cache.store(
+                workflow_id=workflow_id,
+                sources=[s.model_dump(exclude_none=True) for s in sources],
+                total_count=total_sources,
+                repo_id=",".join(request.repo_ids),
+                query=request.query,
+            )
+
+        sources_event = {
+            "type": "sources",
+            "sources": sources_data,
+            "total_sources": total_sources,
+            "workflow_id": workflow_id,
+        }
+        yield f"data: {json.dumps(sources_event)}\n\n"
+
+        synthesis_progress_event = {
+            "type": "progress",
+            "step": "synthesis",
+            "phase": "Synthesizing cross-repo answer",
+            "progress_percent": 95,
+            "message": f"Synthesizing insights from {len(successful)} repositories...",
+        }
+        yield f"data: {json.dumps(synthesis_progress_event)}\n\n"
+
+        synthesis_prompt = _build_synthesis_prompt(request.query, successful, failed)
+
+        try:
+            messages = [SystemMessage(content=_MULTI_REPO_SYSTEM_PROMPT), HumanMessage(content=synthesis_prompt)]
+            full_answer = ""
+            async for chunk in app_context.llm.llm.astream(messages):
+                token = chunk.content if hasattr(chunk, "content") else str(chunk)
+                if token:
+                    full_answer += token
+                    yield f"data: {json.dumps({'type': 'chunk', 'content': token})}\n\n"
+
+            mermaid_diagrams = extract_mermaid_diagrams(full_answer)
+            if mermaid_diagrams:
+                yield f"data: {json.dumps({'type': 'mermaid', 'diagrams': mermaid_diagrams})}\n\n"
+
+            total_tool_calls = sum(len(state.get("tool_calls_history", [])) for state in successful.values())
+            logger.info(
+                "[CHAT] Multi-repo complete | workflow_id=%s repos=%d context_items=%d tool_calls=%d response_len=%d",
+                workflow_id, len(successful), len(all_context_items), total_tool_calls, len(full_answer),
+            )
+        except Exception as exc:
+            logger.error("[CHAT] Multi-repo synthesis failed: %s", exc, exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'error': True})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return
+
+    # Normalize: single-item repo_ids — treat as a single-repo request so
+    # ValidateInputNode receives a non-None repo_id.
+    if request.repo_ids and len(request.repo_ids) == 1 and not request.repo_id:
+        request = request.model_copy(update={"repo_id": request.repo_ids[0]})
 
     # --- Try to use the LangGraph workflow engine ---
     try:
@@ -528,11 +957,14 @@ async def _stream_sse_with_workflow(
         # Create progress queue for granular updates during retrieval
         progress_queue = ProgressQueue()
 
-        # Create the workflow engine
+        # Use the shared checkpointer so conversation history persists across
+        # requests with the same conversation_id (thread_id).
+        from graph_kb_api.flows.v3.checkpointer import CheckpointerFactory
+
         engine = AskCodeWorkflowEngine(
             llm=app_context.llm,
             app_context=app_context,
-            checkpointer=None,  # No checkpointing for stateless HTTP
+            checkpointer=CheckpointerFactory.create_checkpointer(),
             use_default_checkpointer=False,
         )
 
@@ -543,7 +975,16 @@ async def _stream_sse_with_workflow(
         workflow_done = False
 
         # Send initial progress event
-        yield f"data: {json.dumps({'type': 'progress', 'step': 'initializing', 'phase': 'initializing', 'progress_percent': 0, 'message': 'Starting code analysis...', 'current_step': 1, 'total_steps': 8})}\n\n"
+        init_progress_event = {
+            "type": "progress",
+            "step": "initializing",
+            "phase": "initializing",
+            "progress_percent": 0,
+            "message": "Starting code analysis...",
+            "current_step": 1,
+            "total_steps": 8,
+        }
+        yield f"data: {json.dumps(init_progress_event)}\n\n"
 
         # Create async queue consumer task
         async def consume_progress_queue():
@@ -553,13 +994,17 @@ async def _stream_sse_with_workflow(
 
         # Stream the workflow execution
         # Pass args in the format expected by ValidateInputNode: [repo_id, query]
-        # Include app_context and progress_queue in config so nodes can access it
+        # thread_id scopes the LangGraph checkpoint — same id = shared history.
+        # Fall back to the ephemeral workflow_id if no conversation_id was sent.
+        thread_id = request.conversation_id or workflow_id
+
         config = {
             "configurable": {
+                "thread_id": thread_id,
                 "services": {
                     "app_context": app_context,
                     "progress_queue": progress_queue,
-                }
+                },
             }
         }
 
@@ -655,6 +1100,20 @@ async def _stream_sse_with_workflow(
         context_items = final_state.get('context_items', [])
         llm_response = final_state.get('llm_response', '') or final_state.get('final_output', '')
         tool_calls_history = final_state.get('tool_calls_history', [])
+        if not tool_calls_history:
+            # tool_calls_history is a LangGraph reducer field that may not survive dict.update()
+            # accumulation; count ToolMessages from the message thread as the source of truth
+            from langchain_core.messages import ToolMessage
+            tool_calls_history = [m for m in final_state.get('messages', []) if isinstance(m, ToolMessage)]
+
+        # Debug: Log what we extracted from final_state
+        logger.info(
+            "[CHAT] Extracted from final_state | llm_response_len=%d final_output_len=%d context_items=%d messages=%d",
+            len(llm_response) if llm_response else 0,
+            len(final_state.get('final_output', '')) if final_state.get('final_output') else 0,
+            len(context_items),
+            len(final_state.get('messages', [])),
+        )
 
         # Send sources event (limited to 20 for display, include total count)
         sources = _context_items_to_sources(context_items) if context_items else []
@@ -674,7 +1133,14 @@ async def _stream_sse_with_workflow(
                 query=request.query,
             )
 
-        yield f"data: {json.dumps({'type': 'sources', 'sources': sources_data, 'total_sources': total_sources, 'tool_calls': len(tool_calls_history), 'workflow_id': workflow_id})}\n\n"
+        single_repo_sources_event = {
+            "type": "sources",
+            "sources": sources_data,
+            "total_sources": total_sources,
+            "tool_calls": len(tool_calls_history),
+            "workflow_id": workflow_id,
+        }
+        yield f"data: {json.dumps(single_repo_sources_event)}\n\n"
 
         # If we have a response, stream it as chunks
         if llm_response:
@@ -682,6 +1148,22 @@ async def _stream_sse_with_workflow(
             chunk_size = 50  # Characters per chunk
             for i in range(0, len(llm_response), chunk_size):
                 token = llm_response[i:i + chunk_size]
+                yield f"data: {json.dumps({'type': 'chunk', 'content': token})}\n\n"
+        else:
+            # No response - send error message so frontend doesn't hang
+            logger.error("[CHAT] No llm_response in final_state - workflow may have failed")
+            error_msg = (
+                "I encountered an issue generating a response. This might be because:\n\n"
+                f"- The analysis workflow failed\n"
+                f"- Too much context was retrieved ({len(context_items)} code chunks)\n"
+                "- The LLM call timed out or exceeded token limits\n\n"
+                "Try:\n"
+                "- Starting a new conversation\n"
+                "- Asking a more specific question\n"
+                "- Focusing on a particular file or function"
+            )
+            for i in range(0, len(error_msg), 50):
+                token = error_msg[i:i + 50]
                 yield f"data: {json.dumps({'type': 'chunk', 'content': token})}\n\n"
 
         # Send mermaid diagrams if any
@@ -712,7 +1194,8 @@ async def _stream_sse_with_workflow(
 
     except TypeError as e:
         logger.warning(
-            "[CHAT] AskCodeWorkflowEngine initialization failed (%s), falling back to direct retrieval | workflow_id=%s",
+            "[CHAT] AskCodeWorkflowEngine initialization failed (%s), "
+            "falling back to direct retrieval | workflow_id=%s",
             e,
             workflow_id,
         )

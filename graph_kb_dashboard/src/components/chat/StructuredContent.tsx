@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { DocumentSuiteIndex } from './DocumentSuiteIndex';
 import { CollapsibleSection } from '@/components/ui/collapsible';
@@ -310,6 +310,8 @@ function JsonContent({
     );
 }
 
+const ARRAY_PREVIEW_LIMIT = 10;
+
 function ArrayContent({
     items,
     defaultCollapsed,
@@ -319,13 +321,18 @@ function ArrayContent({
     defaultCollapsed: boolean;
     sectionVariant: 'default' | 'emerald' | 'sky' | 'amber' | 'violet';
 }) {
+    const [showAll, setShowAll] = useState(false);
+
     if (items.length === 0) {
         return <p className="text-sm text-gray-500 italic">No items</p>;
     }
 
+    const visibleItems = showAll ? items : items.slice(0, ARRAY_PREVIEW_LIMIT);
+    const hiddenCount = items.length - ARRAY_PREVIEW_LIMIT;
+
     return (
         <div className="space-y-2">
-            {items.map((item, idx) => (
+            {visibleItems.map((item, idx) => (
                 <CollapsibleSection
                     key={`${deriveArrayItemTitle(item, idx)}-${idx}`}
                     title={deriveArrayItemTitle(item, idx)}
@@ -341,6 +348,22 @@ function ArrayContent({
                     />
                 </CollapsibleSection>
             ))}
+            {!showAll && hiddenCount > 0 && (
+                <button
+                    onClick={() => setShowAll(true)}
+                    className="text-xs text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 underline mt-1"
+                >
+                    Show all {items.length} items
+                </button>
+            )}
+            {showAll && items.length > ARRAY_PREVIEW_LIMIT && (
+                <button
+                    onClick={() => setShowAll(false)}
+                    className="text-xs text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 underline mt-1"
+                >
+                    Show less
+                </button>
+            )}
         </div>
     );
 }

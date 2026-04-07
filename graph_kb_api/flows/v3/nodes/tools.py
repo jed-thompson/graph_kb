@@ -142,7 +142,7 @@ class AgenticToolNode(BaseWorkflowNodeV3):
                             'iteration': state.get('agent_iterations', 0),
                             'tool': tool_name,
                             'args': tool_args,
-                            'result_summary': str(result)[:200]
+                            'result_summary': str(result)
                         })
 
                         # Mark as completed for state update

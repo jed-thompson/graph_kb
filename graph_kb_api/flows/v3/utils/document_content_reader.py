@@ -41,9 +41,9 @@ TEXT_MIME_TYPES: frozenset[str] = frozenset(
     }
 )
 
-PRIMARY_DOC_TOKEN_BUDGET: int = 8_000
-SUPPORTING_DOC_TOKEN_BUDGET: int = 4_000
-MAX_TOTAL_UPLOADED_TOKENS: int = 20_000
+PRIMARY_DOC_TOKEN_BUDGET: int = 200_000
+SUPPORTING_DOC_TOKEN_BUDGET: int = 200_000
+MAX_TOTAL_UPLOADED_TOKENS: int = 200_000
 
 
 # --- Public API --------------------------------------------------------------

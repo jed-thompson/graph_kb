@@ -10,7 +10,6 @@ Analyzes collected context for:
 """
 
 from __future__ import annotations
-from graph_kb_api.flows.v3.state import UnifiedSpecState
 
 import json
 import logging
@@ -26,7 +25,7 @@ from graph_kb_api.flows.v3.agents.base_agent import AgentCapability, BaseAgent
 from graph_kb_api.flows.v3.agents.personas import get_agent_prompt_manager
 from graph_kb_api.flows.v3.models.types import AgentResult, AgentTask
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
-from graph_kb_api.flows.v3.state.plan_state import ContextSubgraphState
+from graph_kb_api.flows.v3.state import UnifiedSpecState
 from graph_kb_api.flows.v3.utils.context_utils import append_document_context_to_prompt, sanitize_context_for_prompt
 from graph_kb_api.websocket.events import PhaseId, emit_phase_progress
 
@@ -314,6 +313,16 @@ class ContextReviewAgent(BaseAgent):
             )
         llm_raw: LLMService = workflow_context.llm
 
+        # Build tools from workflow context for tool-augmented analysis
+        app_context = workflow_context.app_context
+        if app_context:
+            from graph_kb_api.flows.v3.tools import get_all_tools
+
+            retrieval_config = app_context.get_retrieval_settings()
+            tools = get_all_tools(retrieval_config)
+        else:
+            tools = []
+
         prompt = self._build_analysis_prompt(context, codebase_context, web_context)
 
         try:
@@ -328,7 +337,8 @@ class ContextReviewAgent(BaseAgent):
                 ]
             else:
                 messages = [{"role": "user", "content": prompt}]
-            response: AIMessage = await llm_raw.ainvoke(messages)
+            llm_with_tools = llm_raw.bind_tools(tools) if tools else llm_raw
+            response: AIMessage = await llm_with_tools.ainvoke(messages)
             # Handle multi-modal content (str | list[str | dict])
             raw_content = response.content
             content: str = str(raw_content) if not isinstance(raw_content, str) else raw_content
@@ -357,9 +367,9 @@ class ContextReviewAgent(BaseAgent):
             if isinstance(bp, list) and bp and isinstance(bp[0], str):
                 extra_context.append(f"Best practices found: {json.dumps(bp)}")
             elif isinstance(bp, str):
-                extra_context.append(f"Best practices found: {bp[:2000]}")
+                extra_context.append(f"Best practices found: {bp}")
             else:
-                extra_context.append(f"Best practices found: {json.dumps(bp, default=str)[:2000]}")
+                extra_context.append(f"Best practices found: {json.dumps(bp, default=str)}")
 
         extra_context_str = "\n".join(extra_context) if extra_context else "No additional context available."
 

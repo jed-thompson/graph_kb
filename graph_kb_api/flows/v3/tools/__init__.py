@@ -45,7 +45,9 @@ def get_all_tools(retrieval_config: RetrievalConfig) -> List[StructuredTool]:
     all_tools = graph_kb_tools + [
         get_file_content,
         get_related_files,
-        execute_cypher_query
+        execute_cypher_query,
+        websearch,
+        websearch_with_content,
     ]
 
     return all_tools

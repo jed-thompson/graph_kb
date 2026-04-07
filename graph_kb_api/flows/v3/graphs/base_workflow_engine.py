@@ -43,7 +43,7 @@ class BaseWorkflowEngine(ABC):
     def __init__(
         self,
         workflow_context: WorkflowContext,
-        max_iterations: int = 5,
+        max_iterations: int = 8,
         workflow_name: str = "workflow",
         use_default_checkpointer: bool = True,
     ):

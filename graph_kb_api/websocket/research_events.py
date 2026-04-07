@@ -5,10 +5,40 @@ Provides event models for standalone research context gathering with
 repository selection, web URL fetching, and document processing.
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+from graph_kb_api.flows.v3.models.research_models import (
+    ResearchContextCard,
+    ResearchFindings,
+    ResearchGap,
+    ResearchReviewResult,
+    ResearchRisk,
+)
+
+__all__ = [
+    # Domain models (re-exported for convenience)
+    "ResearchContextCard",
+    "ResearchFindings",
+    "ResearchGap",
+    "ResearchReviewResult",
+    "ResearchRisk",
+    # Payload models
+    "ResearchGapAnswerPayload",
+    "ResearchHitlPausePayload",
+    "ResearchHitlResponsePayload",
+    "ResearchReviewCompletePayload",
+    "ResearchReviewStartPayload",
+    "ResearchStartPayload",
+    "RepoRelationshipPayload",
+    "MultiRepoResearchStartPayload",
+    # Emit helpers
+    "set_research_ws_manager",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -47,70 +77,7 @@ class ResearchReviewCompletePayload(BaseModel):
     """Payload for research.review.complete — result of LLM review."""
 
     session_id: str = Field(..., min_length=1)
-    review_result: "ResearchReviewResult"
-
-
-# ── Research Context Card Model ────────────────────────────────────
-
-
-class ResearchContextCard(BaseModel):
-    """A single context card with mermaid-enabled content."""
-
-    id: str
-    source_type: str = Field(..., description="web, document, repository, generated")
-    source_url: Optional[str] = None
-    source_name: str
-    title: str
-    content: str = Field(..., description="Markdown content with possible mermaid diagrams")
-    relevance_score: float = Field(..., ge=0.0, le=1.0)
-    tags: List[str] = Field(default_factory=list)
-    created_at: str
-
-
-class ResearchGap(BaseModel):
-    """A detected knowledge gap requiring user input."""
-
-    id: str
-    category: str = Field(..., description="scope, technical, constraint, stakeholder")
-    question: str
-    context: str
-    suggested_answers: List[str] = Field(default_factory=list)
-    impact: str = Field(..., description="high, medium, low")
-
-
-class ResearchRisk(BaseModel):
-    """A detected risk in the research."""
-
-    id: str
-    category: str = Field(..., description="technical, timeline, resource, dependency")
-    description: str
-    severity: str = Field(..., description="critical, high, medium, low")
-    mitigation: str
-
-
-class ResearchFindings(BaseModel):
-    """Aggregated research findings."""
-
-    summary: str
-    confidence_score: float = Field(..., ge=0.0, le=1.0)
-    key_insights: List[str] = Field(default_factory=list)
-    related_modules: List[Dict[str, str]] = Field(default_factory=list)
-    risks: List[ResearchRisk] = Field(default_factory=list)
-
-
-class ResearchReviewResult(BaseModel):
-    """Result of LLM review of gathered context."""
-
-    id: str
-    summary: str
-    strengths: List[str] = Field(default_factory=list)
-    weaknesses: List[str] = Field(default_factory=list)
-    recommendations: List[str] = Field(default_factory=list)
-    overall_assessment: str = Field(
-        ...,
-        description="excellent, good, adequate, needs_improvement"
-    )
-    reviewed_at: str
+    review_result: ResearchReviewResult
 
 
 # ── Event Emission Helpers ─────────────────────────────────────────
@@ -268,7 +235,7 @@ async def emit_research_complete(
     await _emit_event(
         "research.complete",
         session_id,
-        {"session_id": session_id, "findings": findings.model_dump()},
+        {"session_id": session_id, "findings": findings.model_dump(by_alias=True)},
         client_id,
     )
 
@@ -312,5 +279,200 @@ async def emit_research_error(
         "research.error",
         session_id,
         {"session_id": session_id, "message": message, "code": code},
+        client_id,
+    )
+
+
+# ── Multi-Repo Payloads ────────────────────────────────────────────
+
+class RepoRelationshipPayload(BaseModel):
+    """A single inter-repo relationship."""
+
+    source_repo_id: str = Field(..., min_length=1)
+    target_repo_id: str = Field(..., min_length=1)
+    relationship_type: Literal["dependency", "rest", "grpc"]
+
+
+class MultiRepoResearchStartPayload(BaseModel):
+    """Extended payload for research.start — multi-repo variant."""
+
+    repo_ids: List[str] = Field(..., min_length=1)
+    relationships: List[RepoRelationshipPayload] = Field(default_factory=list)
+    strategy: Literal["parallel_merge", "dependency_aware"] = "parallel_merge"
+    web_urls: List[str] = Field(default_factory=list)
+    document_ids: List[str] = Field(default_factory=list)
+    query: Optional[str] = None
+
+
+class ResearchHitlPausePayload(BaseModel):
+    """Emitted when a repo fails and user input is required."""
+
+    session_id: str
+    failed_repo_id: str
+    error_message: str
+    phase: str
+    choices: List[str] = Field(default_factory=lambda: ["continue", "retry", "abort"])
+
+
+class ResearchHitlResponsePayload(BaseModel):
+    """Incoming HITL response from the user."""
+
+    session_id: str = Field(..., min_length=1)
+    choice: Literal["continue", "retry", "abort"]
+
+
+# ── Multi-Repo Emit Helpers ────────────────────────────────────────
+
+
+async def emit_repo_started(
+    session_id: str,
+    repo_id: str,
+    repo_index: int,
+    total_repos: int,
+    client_id: Optional[str] = None,
+) -> None:
+    """Emit research.repo.started when an individual repo research begins."""
+    await _emit_event(
+        "research.repo.started",
+        session_id,
+        {
+            "session_id": session_id,
+            "repo_id": repo_id,
+            "repo_index": repo_index,
+            "total_repos": total_repos,
+        },
+        client_id,
+    )
+
+
+async def emit_repo_progress(
+    session_id: str,
+    repo_id: str,
+    phase: str,
+    message: str,
+    percent: float,
+    client_id: Optional[str] = None,
+) -> None:
+    """Emit research.repo.progress with per-repo progress."""
+    await _emit_event(
+        "research.repo.progress",
+        session_id,
+        {
+            "session_id": session_id,
+            "repo_id": repo_id,
+            "phase": phase,
+            "message": message,
+            "percent": percent,
+        },
+        client_id,
+    )
+
+
+async def emit_repo_complete(
+    session_id: str,
+    repo_id: str,
+    findings: Dict[str, Any],
+    client_id: Optional[str] = None,
+) -> None:
+    """Emit research.repo.complete when an individual repo finishes."""
+    await _emit_event(
+        "research.repo.complete",
+        session_id,
+        {"session_id": session_id, "repo_id": repo_id, "findings": findings},
+        client_id,
+    )
+
+
+async def emit_repo_failed(
+    session_id: str,
+    repo_id: str,
+    error_message: str,
+    phase: str,
+    repo_index: int,
+    total_repos: int,
+    client_id: Optional[str] = None,
+) -> None:
+    """Emit research.repo.failed when an individual repo errors."""
+    await _emit_event(
+        "research.repo.failed",
+        session_id,
+        {
+            "session_id": session_id,
+            "repo_id": repo_id,
+            "error_message": error_message,
+            "phase": phase,
+            "repo_index": repo_index,
+            "total_repos": total_repos,
+        },
+        client_id,
+    )
+
+
+async def emit_hitl_pause(
+    session_id: str,
+    failed_repo_id: str,
+    error_message: str,
+    phase: str,
+    client_id: Optional[str] = None,
+) -> None:
+    """Emit research.hitl.pause to request user decision on repo failure."""
+    await _emit_event(
+        "research.hitl.pause",
+        session_id,
+        {
+            "session_id": session_id,
+            "failed_repo_id": failed_repo_id,
+            "error_message": error_message,
+            "phase": phase,
+            "choices": ["continue", "retry", "abort"],
+        },
+        client_id,
+    )
+
+
+async def emit_synthesis_started(
+    session_id: str,
+    client_id: Optional[str] = None,
+) -> None:
+    """Emit research.synthesis.started when cross-repo synthesis begins."""
+    await _emit_event(
+        "research.synthesis.started",
+        session_id,
+        {"session_id": session_id, "message": "Starting cross-repository synthesis"},
+        client_id,
+    )
+
+
+async def emit_synthesis_progress(
+    session_id: str,
+    phase: str,
+    message: str,
+    percent: float,
+    client_id: Optional[str] = None,
+) -> None:
+    """Emit research.synthesis.progress during cross-repo synthesis."""
+    await _emit_event(
+        "research.synthesis.progress",
+        session_id,
+        {
+            "session_id": session_id,
+            "phase": phase,
+            "message": message,
+            "percent": percent,
+        },
+        client_id,
+    )
+
+
+async def emit_synthesis_complete(
+    session_id: str,
+    synthesis: Dict[str, Any],
+    client_id: Optional[str] = None,
+) -> None:
+    """Emit research.synthesis.complete with cross-repo synthesis results."""
+    await _emit_event(
+        "research.synthesis.complete",
+        session_id,
+        {"session_id": session_id, "synthesis": synthesis},
         client_id,
     )

@@ -97,6 +97,18 @@ function sanitizeMermaid(raw: string): string {
   //    Mermaid doesn't support \" inside "...", so strip them
   //    e.g. A["model \"name\""] → A["model name"]
   s = s.replace(/\\"/g, '');
+  // 6. Sanitize edge labels (|...|): replace chars that break mermaid parsing.
+  //    { } are used for mermaid special node types; [ ] open node label syntax.
+  //    \n (literal backslash-n) is not valid in edge labels — replace with space.
+  s = s.replace(/\|([^|]+)\|/g, (_match, label) => {
+    const cleaned = label
+      .replace(/\{/g, '(')
+      .replace(/\}/g, ')')
+      .replace(/\[/g, '(')
+      .replace(/\]/g, ')')
+      .replace(/\\n/g, ' ');
+    return `|${cleaned}|`;
+  });
   return s;
 }
 
@@ -481,7 +493,7 @@ export function MarkdownRenderer({
     };
   }, [enableMermaid, enableCodeHighlight]);
 
-  const components: Components = {
+  const components: Components = useMemo(() => ({
     code: buildCodeComponent(),
     a({ href, children, ...props }) {
       return (
@@ -490,7 +502,7 @@ export function MarkdownRenderer({
         </a>
       );
     },
-  };
+  }), [buildCodeComponent]);
 
   return (
     <>

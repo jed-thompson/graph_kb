@@ -791,6 +791,7 @@ class VectorRepository:
 
                 # If no pattern worked, try a broader search using symbol name directly
                 if not all_results:
+                    edge_pattern = "|".join(edge_types)
                     result = session.run(
                         TraversalQueries.build_symbol_expansion_query(edge_pattern, hops),
                         repo_id=repo_id,

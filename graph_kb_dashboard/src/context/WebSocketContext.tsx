@@ -88,8 +88,12 @@ interface StartPayload {
 export interface WebSocketContextValue {
   ws: GraphKBWebSocket | null;
   isConnected: boolean;
+  connectionError: string | null;
+  reconnectAttempts: number;
+  maxReconnectAttempts: number;
   connect: () => void;
   disconnect: () => void;
+  forceReconnect: () => void;
   sendMessage: (message: LegacyWSMessage | WSOutgoingMessage | Record<string, unknown>) => void;
 
   /** Current workflow tracking state. */
@@ -143,6 +147,8 @@ export function useWebSocket() {
 export function WebSocketProvider({ children }: { children: React.ReactNode }) {
   const [ws, setWs] = useState<GraphKBWebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [reconnectAttempts, setReconnectAttempts] = useState(0);
   const [currentWorkflow, setCurrentWorkflow] = useState<
     WebSocketContextValue['currentWorkflow']
   >({
@@ -158,6 +164,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
   );
 
   const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws';
+  const maxReconnectAttempts = 10;
 
   // Initialize WebSocket on mount
   useEffect(() => {
@@ -278,8 +285,22 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
           return phases;
         };
 
-        const getExistingPlanMsg = () =>
-          findPlanMessageBySession(chatState.getActiveSession()?.messages || [], eventSessionId);
+        const getExistingPlanMsg = () => {
+          // Search across all sessions so resumed/reconnected plans in non-active
+          // sessions are found. Switch active session if the message lives elsewhere
+          // so that subsequent updateMessage calls target the correct session.
+          const allMessages = chatState.sessions.flatMap((s) => s.messages);
+          const found = findPlanMessageBySession(allMessages, eventSessionId);
+          if (found) {
+            const ownerSession = chatState.sessions.find((s) =>
+              s.messages.some((m) => m.id === found.id),
+            );
+            if (ownerSession && ownerSession.id !== chatState.activeSessionId) {
+              chatState.setActiveSession(ownerSession.id);
+            }
+          }
+          return found;
+        };
 
         // Merge artifact entries by key (accumulate, dedup)
         const mergeArtifacts = (
@@ -343,6 +364,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                     : getExistingArtifacts(existingPlanPanel) || undefined,
                   budget: data.budget || existingPlanPanel?.budget || undefined,
                   workflowStatus: budgetExhausted ? 'budget_exhausted' : (existingPlanPanel?.workflowStatus as string),
+                  planTasks: (data.plan_tasks as Record<string, unknown>) || existingPlanPanel?.planTasks || undefined,
                 },
                 planCurrentPhase: phase,
                 planPhases: existingPhases,
@@ -372,6 +394,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                   planContextItems: data.context_items || null,
                   planArtifacts: (data.artifacts as Array<{ key: string }>) || undefined,
                   workflowStatus: budgetExhausted ? 'budget_exhausted' : 'running',
+                  planTasks: (data.plan_tasks as Record<string, unknown>) || undefined,
                 },
                 planCurrentPhase: phase,
                 planPhases: phases,
@@ -754,6 +777,13 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
 
         // plan.error — mark workflow as errored
         if (msgType === 'plan.error' && data) {
+          // SESSION_NOT_FOUND means the persisted sessionId is stale (e.g. backend
+          // was restarted). Clear it silently so the user isn't shown a spurious
+          // error card and future reconnects don't retry the dead session.
+          if ((data.code as string) === 'SESSION_NOT_FOUND') {
+            usePlanStore.getState().setSessionId(null);
+            return;
+          }
           const existingMsg = getExistingPlanMsg();
           if (existingMsg?.metadata?.planPanel) {
             const meta = existingMsg.metadata.planPanel as Record<string, unknown>;
@@ -905,13 +935,46 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
     });
 
     // -- Connection lifecycle -------------------------------------------------
-    const unsubConnect = socket.on('connected', () => setIsConnected(true));
-    const unsubDisconnect = socket.on('disconnected', () => {
+    const unsubConnect = socket.on('connected', () => {
+      console.log('[WebSocketContext] Connected event received');
+      setIsConnected(true);
+      setConnectionError(null);
+      setReconnectAttempts(0);
+
+      // Re-hydrate plan state after reconnect if a session was active.
+      // The backend handle_reconnect handler will re-emit plan.state and the
+      // current interrupt prompt so the UI recovers without a manual refresh.
+      const planSessionId = usePlanStore.getState().sessionId;
+      if (planSessionId) {
+        console.log('[WebSocketContext] Sending plan.reconnect for session', planSessionId);
+        socket.send({ type: 'plan.reconnect', payload: { session_id: planSessionId } } as unknown as Parameters<typeof socket.send>[0]);
+      }
+    });
+    
+    const unsubDisconnect = socket.on('disconnected', (data: unknown) => {
+      const disconnectData = data as { code?: number; reason?: string } | undefined;
+      console.log('[WebSocketContext] Disconnected event received:', disconnectData);
       setIsConnected(false);
       setCurrentWorkflow((prev) => ({
         ...prev,
         status: 'idle',
       }));
+      
+      if (disconnectData?.code && disconnectData.code !== 1000) {
+        setConnectionError(`Connection closed: ${disconnectData.reason || 'Unknown reason'}`);
+      }
+    });
+
+    const unsubWsError = socket.on('ws_error', (error: unknown) => {
+      console.error('[WebSocketContext] Error event received:', error);
+      setConnectionError('WebSocket connection error');
+    });
+
+    const unsubMaxReconnect = socket.on('max_reconnect_attempts', (data: unknown) => {
+      const attemptData = data as { attempts?: number } | undefined;
+      console.error('[WebSocketContext] Max reconnection attempts reached:', attemptData?.attempts);
+      setConnectionError(`Failed to reconnect after ${attemptData?.attempts || maxReconnectAttempts} attempts`);
+      setReconnectAttempts(attemptData?.attempts || maxReconnectAttempts);
     });
 
     setWs(socket);
@@ -930,8 +993,10 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       unsubGenericMessage();
       unsubConnect();
       unsubDisconnect();
+      unsubWsError();
+      unsubMaxReconnect();
     };
-  }, [wsUrl]);
+  }, [wsUrl, maxReconnectAttempts]);
 
   // ---------------------------------------------------------------------------
   // Generic send helper – works with both typed WSMessage and raw objects
@@ -1013,8 +1078,17 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
   const value: WebSocketContextValue = {
     ws,
     isConnected,
+    connectionError,
+    reconnectAttempts,
+    maxReconnectAttempts,
     connect: () => ws?.connect(),
     disconnect: () => ws?.disconnect(),
+    forceReconnect: () => {
+      console.log('[WebSocketContext] Force reconnect requested');
+      setConnectionError(null);
+      setReconnectAttempts(0);
+      ws?.forceReconnect();
+    },
     sendMessage,
     currentWorkflow,
     setCurrentWorkflow,

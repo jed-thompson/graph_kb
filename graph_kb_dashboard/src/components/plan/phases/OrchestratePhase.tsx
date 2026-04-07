@@ -407,7 +407,7 @@ export function OrchestratePhase({
     }
 
     const taskGroups = groupPlanTasks(displayTasks);
-    const completedTaskCount = displayTasks.filter((task) => task.status === 'complete').length;
+    const completedTaskCount = taskGroups.filter((g) => g.parent.status === 'complete').length;
     const deliverables = completedTaskArtifacts?.filter(isDeliverableArtifact) ?? [];
     const totalDeliverableSize = deliverables.reduce((sum, artifact) => sum + artifact.size_bytes, 0);
     const activeTask = displayTasks.find((task) => task.status === 'in_progress' || task.status === 'critiquing');
@@ -453,7 +453,7 @@ export function OrchestratePhase({
                                     {(totalDeliverableSize / 1024).toFixed(1)}K gen
                                 </span>
                             )}
-                            <span className="font-medium">{completedTaskCount} / {displayTasks.length} Completed</span>
+                            <span className="font-medium">{completedTaskCount} / {taskGroups.length} Completed</span>
                         </div>
                     </div>
                     <div className="space-y-2">

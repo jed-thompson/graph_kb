@@ -27,6 +27,7 @@ from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
 from graph_kb_api.flows.v3.state import ContextData, PlanData, ResearchData
 from graph_kb_api.flows.v3.state.plan_state import BudgetState, OrchestrateSubgraphState, PlanState
 from graph_kb_api.flows.v3.state.workflow_state import OrchestrateData
+from graph_kb_api.flows.v3.tools import get_all_tools
 from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator
 from graph_kb_api.storage.blob_storage import BlobStorage
 from graph_kb_api.websocket.plan_events import (
@@ -95,10 +96,11 @@ class PruneAfterOrchestrateNode(SubgraphAwareNode[PlanState]):
             pruned_orchestrate["all_complete"] = False
 
         output: Dict[str, Any] = {"orchestrate": pruned_orchestrate}
-        # Clear re-orchestration flags after processing
+        # Clear re-orchestration flags and increment cycle counter after processing
         if re_execute_ids:
             output["needs_re_orchestrate"] = False
             output["re_execute_task_ids"] = []
+            output["re_orchestration_count"] = state.get("re_orchestration_count", 0) + 1
 
         return NodeExecutionResult.success(output=output)
 
@@ -228,8 +230,9 @@ class TaskSelectorNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         elif len(finished_ids) == len(tasks):
             output["orchestrate"]["all_complete"] = True
 
-        # Emit plan.tasks.dag on first invocation so frontend can render task cards
-        if orchestrate.get("current_task_index", 0) == 0 and tasks:
+        # Emit plan.tasks.dag on first invocation and on resume so frontend can render task cards
+        dag_emitted = orchestrate.get("dag_emitted", False)
+        if not dag_emitted and tasks:
             configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
             session_id = state.get("session_id", "")
             client_id: str | None = configurable.get("client_id")
@@ -247,6 +250,7 @@ class TaskSelectorNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                     ],
                     client_id=client_id,
                 )
+                output["orchestrate"]["dag_emitted"] = True
             except Exception as e:
                 logger.warning(f"TaskSelectorNode emit_tasks_dag failed: {e}")
 
@@ -452,6 +456,14 @@ class GapNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         if not workflow_context:
             return NodeExecutionResult.success(output={"orchestrate": {**orchestrate, "context_gaps": []}})
 
+        # Build tools from workflow context
+        app_context = workflow_context.app_context
+        if app_context:
+            retrieval_config = app_context.get_retrieval_settings()
+            tools = get_all_tools(retrieval_config)
+        else:
+            tools = []
+
         agent_task: AgentTask = {
             "description": "Task-level gap analysis",
             "task_id": f"task_gap_{session_id}_{uuid.uuid4().hex[:8]}",
@@ -474,7 +486,10 @@ class GapNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             },
         }
 
-        result: AgentResult = await agent.execute(task=agent_task, state={}, workflow_context=workflow_context)
+        agent_state = {"available_tools": tools}
+        result: AgentResult = await agent.execute(
+            task=agent_task, state=agent_state, workflow_context=workflow_context,
+        )
 
         # Convert agent gaps to node format
         for gap in result.get("gaps", []):
@@ -649,6 +664,15 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             workflow_context = configurable.get("context")
             if not workflow_context:
                 raise RuntimeError("TaskResearchNode requires workflow_context")
+
+            # Build tools from workflow context
+            app_context = workflow_context.app_context
+            if app_context:
+                retrieval_config = app_context.get_retrieval_settings()
+                tools = get_all_tools(retrieval_config)
+            else:
+                tools = []
+
             agent = ResearchAgent(client_id=client_id)
 
             spec_section = current_task.get("spec_section", "general")
@@ -686,10 +710,15 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                     "constraints": context_data.get("constraints", {}),
                     "uploaded_document_contents": scoped_doc_contents,
                     "document_section_index": context_data.get("document_section_index", []),
+                    "target_repo_id": context_data.get("target_repo_id", ""),
+                    "supporting_docs": context_data.get("supporting_docs", []),
                 },
             }
 
-            result: AgentResult = await agent.execute(task=agent_task, state={}, workflow_context=workflow_context)
+            agent_state = {"available_tools": tools, "session_id": session_id}
+            result: AgentResult = await agent.execute(
+                task=agent_task, state=agent_state, workflow_context=workflow_context,
+            )
 
             # ResearchAgent.execute() returns {"output": json_string, ...}
             # Parse the serialized findings from the "output" key
@@ -737,7 +766,7 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
         # Emit research summary for frontend TaskContextPanel (Step 11c)
         if task_research_results and task_research_results.get("summary"):
-            research_summary = task_research_results["summary"][:2000]
+            research_summary = task_research_results["summary"]
             key_insights = task_research_results.get("findings", {}).get("key_insights", [])
             if key_insights:
                 bullets = "\n".join(f"• {ins}" for ins in key_insights[:5])
@@ -1044,10 +1073,18 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             "context": task_context,
         }
 
+        # Build tools from workflow context
+        app_context = workflow_context.app_context
+        if app_context:
+            retrieval_config = app_context.get_retrieval_settings()
+            tools = get_all_tools(retrieval_config)
+        else:
+            tools = []
+
         # Build the state dict the agent expects
         agent_state = {
             "agent_context": agent_context,
-            "available_tools": [],
+            "available_tools": tools,
         }
 
         output_content = ""
@@ -1170,7 +1207,7 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                 section_type=section_type,
                 dependencies=agent_context.get("dependencies", []),
                 token_count=tokens_used,
-                error_message=None if task_status == "done" else output_content[:200],
+                error_message=None if task_status == "done" else output_content,
                 composed_at=None,
             )
             entries = [e for e in entries if e["task_id"] != task_id]

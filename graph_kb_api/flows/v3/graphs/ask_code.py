@@ -15,8 +15,8 @@ from langgraph.graph.state import CompiledStateGraph
 from graph_kb_api.context import AppContext
 from graph_kb_api.flows.v3.graphs.base_workflow_engine import BaseWorkflowEngine
 from graph_kb_api.flows.v3.nodes.ask_code_nodes import (
-    AnalyzeQuestionNode,
     ClarificationNode,
+    ClassifyQuestionNode,
     FormatResponseNode,
     GraphExpansionNode,
     PresentToUserNode,
@@ -53,7 +53,7 @@ class AskCodeWorkflowEngine(BaseWorkflowEngine):
         llm,
         app_context: AppContext,
         checkpointer: Optional[BaseCheckpointSaver] = None,
-        max_iterations: int = 5,
+        max_iterations: int = 8,
         use_default_checkpointer: bool = True,
     ):
         """
@@ -63,7 +63,7 @@ class AskCodeWorkflowEngine(BaseWorkflowEngine):
             llm: LLM instance to use for agent
             app_context: Application context with services
             checkpointer: Optional checkpointer for state persistence
-            max_iterations: Maximum number of tool calling iterations (default: 5)
+            max_iterations: Maximum number of tool calling iterations (default: 8)
             use_default_checkpointer: If True and checkpointer is None, create default checkpointer.
                                      If False, respect None as "no checkpointing".
         """
@@ -122,7 +122,7 @@ class AskCodeWorkflowEngine(BaseWorkflowEngine):
     def _initialize_nodes(self) -> None:
         """Initialize all node instances."""
         self.validate_node = ValidateInputNode()
-        self.analyze_node = AnalyzeQuestionNode()
+        self.analyze_node = ClassifyQuestionNode(self.workflow_context.llm)
         self.clarify_node = ClarificationNode()
         self.retrieve_node = SemanticRetrievalNode()
         self.graph_expansion_node = GraphExpansionNode()
@@ -303,6 +303,13 @@ class AskCodeWorkflowEngine(BaseWorkflowEngine):
             )
             return "tools"
 
-        # Agent provided final answer
-        logger.info("Agent provided final answer, formatting response")
+        # Agent provided final answer without requesting any tools
+        logger.info(
+            "Agent answered from context without tool calls",
+            data={
+                "context_items": len(state.get("context_items", [])),
+                "agent_iterations": state.get("agent_iterations", 0),
+                "tool_calls_made": len(state.get("tool_calls_history", [])),
+            },
+        )
         return "format"

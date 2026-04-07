@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { FileText, Folder, X, Edit2, Check } from 'lucide-react';
+import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -144,9 +145,10 @@ export function DocumentOverlay({ document, onClose, onCategoryUpdate }: Documen
           </div>
           {/* Overlay content */}
           <div className="flex-1 overflow-auto p-6">
-            <pre className="text-sm bg-gray-50 dark:bg-gray-800 p-6 rounded-lg whitespace-pre-wrap font-mono leading-relaxed">
-              {document.content || 'No content available'}
-            </pre>
+            {document.content
+              ? <MarkdownRenderer content={document.content} enableMermaid enableCodeHighlight />
+              : <p className="text-sm text-muted-foreground">No content available</p>
+            }
           </div>
         </div>
       </div>

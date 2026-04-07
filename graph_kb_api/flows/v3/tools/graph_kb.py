@@ -11,6 +11,7 @@ LangGraph Ref: https://docs.langchain.com/oss/python/langchain/tools
 """
 
 import json
+import re
 from typing import List, Optional
 
 from langchain_core.tools import tool
@@ -127,7 +128,7 @@ def create_graph_kb_tools(retrieval_config: RetrievalConfig) -> List:
             repo_id: Repository identifier
             include_callers: Include functions that call this symbol
             include_callees: Include functions this symbol calls
-            limit: Maximum number of callers/callees to return (optional - uses user's configured value if not specified)
+            limit: Maximum number of callers/callees to return (optional - uses configured value if not specified)
 
         Returns:
             JSON string with symbol details, location, and relationships
@@ -276,7 +277,7 @@ def create_graph_kb_tools(retrieval_config: RetrievalConfig) -> List:
                     'valid_directions': ['outgoing', 'incoming']
                 })
 
-            # Find starting symbol
+            # Find starting symbol — try exact match first, fall back to partial
             symbols_results = facade.query_service.get_symbols_by_pattern(
                 repo_id=repo_id,
                 name_pattern=f"^{symbol_name}$",  # Exact match
@@ -284,8 +285,20 @@ def create_graph_kb_tools(retrieval_config: RetrievalConfig) -> List:
             )
 
             if not symbols_results:
+                # Partial case-insensitive fallback (e.g. "GetRates" → "CarrierServicer.GetRates")
+                symbols_results = facade.query_service.get_symbols_by_pattern(
+                    repo_id=repo_id,
+                    name_pattern=f"(?i).*{re.escape(symbol_name)}.*",
+                    limit=5
+                )
+
+            if not symbols_results:
                 return json.dumps({
-                    'error': f"Symbol '{symbol_name}' not found in repository '{repo_id}'",
+                    'error': (
+                        f"Symbol '{symbol_name}' not found in '{repo_id}'. "
+                        "Try a class-qualified name (e.g. 'ClassName.method') "
+                        "or use search_code to find the exact symbol name first."
+                    ),
                     'symbol_name': symbol_name,
                     'repo_id': repo_id
                 })

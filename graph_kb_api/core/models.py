@@ -99,6 +99,10 @@ class OpenAIModel(str, Enum):
     GPT_5_2_PRO = "gpt-5.2-pro"
     GPT_5_2_PRO_2025_12_11 = "gpt-5.2-pro-2025-12-11"
 
+    # GPT-5.4 models
+    GPT_5_4 = "gpt-5.4"
+    GPT_5_4_2026_03_05 = "gpt-5.4-2026-03-05"
+
     # GPT Audio models
     GPT_AUDIO = "gpt-audio"
     GPT_AUDIO_2025_08_28 = "gpt-audio-2025-08-28"
@@ -251,6 +255,10 @@ class OpenAIModel(str, Enum):
             cls.GPT_5_2_CHAT_LATEST.value: 200000,
             cls.GPT_5_2_PRO.value: 200000,
             cls.GPT_5_2_PRO_2025_12_11.value: 200000,
+
+            # GPT-5.4 models (1M extended context window)
+            cls.GPT_5_4.value: 1050000,
+            cls.GPT_5_4_2026_03_05.value: 1050000,
 
             # O-series reasoning models (assumed high limits)
             cls.O1.value: 128000,

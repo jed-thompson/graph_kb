@@ -17,12 +17,14 @@ const RANGES = {
     top_k: { min: 5, max: 5000, step: 5 },
     max_depth: { min: 1, max: 100, step: 1 },
     temperature: { min: 0, max: 2, step: 0.1 },
+    multi_repo_concurrency_limit: { min: 1, max: 10, step: 1 },
 } as const;
 
 interface ValidationErrors {
     top_k?: string;
     max_depth?: string;
     temperature?: string;
+    multi_repo_concurrency_limit?: string;
 }
 
 function validate(field: keyof Settings, value: number): string | undefined {
@@ -43,6 +45,12 @@ function validate(field: keyof Settings, value: number): string | undefined {
             const r = RANGES.temperature;
             if (value < r.min || value > r.max)
                 return `temperature must be between ${r.min} and ${r.max}`;
+            break;
+        }
+        case 'multi_repo_concurrency_limit': {
+            const r = RANGES.multi_repo_concurrency_limit;
+            if (!Number.isInteger(value) || value < r.min || value > r.max)
+                return `multi_repo_concurrency_limit must be an integer between ${r.min} and ${r.max}`;
             break;
         }
     }
@@ -105,7 +113,7 @@ export default function SettingsPage() {
     );
 
     const handleNumberChange = (
-        field: 'top_k' | 'max_depth' | 'temperature',
+        field: 'top_k' | 'max_depth' | 'temperature' | 'multi_repo_concurrency_limit',
         raw: string
     ) => {
         if (!settings) return;
@@ -122,7 +130,7 @@ export default function SettingsPage() {
     };
 
     const handleSliderChange = (
-        field: 'top_k' | 'max_depth' | 'temperature',
+        field: 'top_k' | 'max_depth' | 'temperature' | 'multi_repo_concurrency_limit',
         values: number[]
     ) => {
         if (!settings) return;
@@ -386,6 +394,39 @@ export default function SettingsPage() {
                                     onCheckedChange={handleAutoReviewToggle}
                                 />
                             </div>
+                        </CardContent>
+                    </Card>
+
+                    {/* multi_repo_concurrency_limit */}
+                    <Card>
+                        <CardContent className="py-4 space-y-3">
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <h3 className="font-medium">Multi-repo concurrency limit</h3>
+                                    <p className="text-sm text-muted-foreground">
+                                        Maximum repositories researched simultaneously ({RANGES.multi_repo_concurrency_limit.min}–{RANGES.multi_repo_concurrency_limit.max})
+                                    </p>
+                                </div>
+                                <Input
+                                    type="number"
+                                    min={RANGES.multi_repo_concurrency_limit.min}
+                                    max={RANGES.multi_repo_concurrency_limit.max}
+                                    step={RANGES.multi_repo_concurrency_limit.step}
+                                    value={settings.multi_repo_concurrency_limit}
+                                    onChange={(e) => handleNumberChange('multi_repo_concurrency_limit', e.target.value)}
+                                    className="w-24 text-right"
+                                />
+                            </div>
+                            <Slider
+                                min={RANGES.multi_repo_concurrency_limit.min}
+                                max={RANGES.multi_repo_concurrency_limit.max}
+                                step={RANGES.multi_repo_concurrency_limit.step}
+                                value={[settings.multi_repo_concurrency_limit]}
+                                onValueChange={(v) => handleSliderChange('multi_repo_concurrency_limit', v)}
+                            />
+                            {validationErrors.multi_repo_concurrency_limit && (
+                                <p className="text-sm text-red-600">{validationErrors.multi_repo_concurrency_limit}</p>
+                            )}
                         </CardContent>
                     </Card>
 

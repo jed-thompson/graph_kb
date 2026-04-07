@@ -719,6 +719,9 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
         if composition_result.get("needs_re_orchestrate") and re_execute_task_ids:
             output["needs_re_orchestrate"] = True
             output["re_execute_task_ids"] = list(set(re_execute_task_ids))
+        else:
+            output["needs_re_orchestrate"] = False
+            output["re_execute_task_ids"] = []
 
         return NodeExecutionResult.success(output=output)
 
@@ -1015,8 +1018,13 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
             },
         }
 
+        tools = []
+        if workflow_context and workflow_context.app_context:
+            from graph_kb_api.flows.v3.tools import get_all_tools
+            tools = get_all_tools(workflow_context.app_context.get_retrieval_settings())
+
         result: AgentResult = await agent.execute(
-            task=agent_task, state=cast("UnifiedSpecState", {}), workflow_context=workflow_context
+            task=agent_task, state=cast("UnifiedSpecState", {"available_tools": tools}), workflow_context=workflow_context
         )
 
         # Extract validation results
@@ -1099,7 +1107,7 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
             requirements.append(
                 {
                     "type": "user_intent",
-                    "description": user_explanation[:500],
+                    "description": user_explanation,
                 }
             )
 
@@ -1115,7 +1123,7 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
                 requirements.append(
                     {
                         "type": "task_coverage",
-                        "description": f"{name}: {description[:200]}",
+                        "description": f"{name}: {description}",
                     }
                 )
 

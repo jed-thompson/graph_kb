@@ -3,6 +3,7 @@ import { Inter } from 'next/font/google';
 import './globals.css';
 import { Providers } from '@/components/Providers';
 import { AppShell } from '@/components/layout/AppShell';
+import { WebSocketStatus } from '@/components/WebSocketStatus';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -21,6 +22,7 @@ export default function RootLayout({
       <body className={inter.className}>
         <Providers>
           <AppShell>{children}</AppShell>
+          <WebSocketStatus />
         </Providers>
       </body>
     </html>

@@ -8,17 +8,20 @@ context checking, and response formatting.
 
 import asyncio
 import re
+from dataclasses import asdict
+from dataclasses import fields as dataclass_fields
+from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage
 from langgraph.types import interrupt
+from pydantic import BaseModel, Field
 
 from graph_kb_api.context import AppContext
 from graph_kb_api.database import SyncMetadataService
 from graph_kb_api.flows.v3.models import ServiceRegistry
 from graph_kb_api.flows.v3.models.node_models import NodeExecutionResult
 from graph_kb_api.flows.v3.nodes.base_node import BaseWorkflowNodeV3
-from graph_kb_api.flows.v3.utils.progress_display import CodeAnalysisProgressDisplay
 from graph_kb_api.flows.v3.utils.progress_queue import (
     ProgressQueue,
     create_retrieval_progress_event,
@@ -189,9 +192,6 @@ class DetermineRepoNode(BaseWorkflowNodeV3):
                     metadata={"node_type": self.node_name, "error_type": "no_repo"},
                 )
 
-            # Update progress message if it exists (from ValidateInputNode)
-            progress_msg_id = state.get("progress_message_id")
-
             logger.info("Repository determined", data={"repo_id": repo_id})
 
             return NodeExecutionResult.success(output={"repo_id": repo_id})
@@ -222,9 +222,6 @@ class ValidateInputNode(BaseWorkflowNodeV3):
             # Extract args from state directly
             args = state.get("args", [])
 
-            # Extract repo_id (first arg)
-            repo_id = args[0] if args else "unknown"
-
             # Get refined_question or use it directly from state
             user_query = state.get("refined_question") or state.get("original_question", "")
 
@@ -243,11 +240,19 @@ class ValidateInputNode(BaseWorkflowNodeV3):
                 data={"query_length": len(user_query), "args_count": len(args), "progress_msg_id": progress_msg_id},
             )
 
+            # Clear messages from prior conversation turns to prevent token overflow.
+            # The messages field uses add_messages (accumulates across turns via checkpoint).
+            # Each turn adds a large HumanMessage with full code context, causing the
+            # prompt to grow by ~hundreds of thousands of tokens per turn.
+            prior_messages = state.get("messages", [])
+            clear_messages = [RemoveMessage(id=msg.id) for msg in prior_messages]
+
             return NodeExecutionResult.success(
                 output={
                     "original_question": user_query,
                     "refined_question": user_query,
                     "progress_message_id": progress_msg_id,
+                    "messages": clear_messages,
                 }
             )
 
@@ -293,15 +298,23 @@ class AnalyzeQuestionNode(BaseWorkflowNodeV3):
             word_count = len(question.split())
 
             # Check for specific code-related indicators
-            # Use word boundaries for short keywords to avoid false matches
+            # Use word boundaries for short keywords to avoid false matches like
+            # "functionality" matching "function", "classified" matching "class", etc.
             specific_keywords = ["function", "class", "method", "file", "module"]
             specific_extensions = [".py", ".js", ".java", ".ts", ".go", ".rb"]
             specific_python = ["def ", "import ", "from "]
             specific_verbs = ["authenticate", "calculate", "process", "validate"]
-            specific_nouns = ["repository", "service", "controller", "model", "handler", "manager"]
+            # Note: "repository" is intentionally excluded — it always refers to the whole
+            # codebase and is never a specific code reference.  Including it blocks
+            # architectural detection for queries like "explain this repository".
+            specific_nouns = ["service", "controller", "model", "handler", "manager"]
 
-            # Check each category
-            has_keyword = any(keyword in question_lower for keyword in specific_keywords)
+            # Check each category — use word boundaries for keywords to prevent
+            # substring false positives ("functionality" ≠ "function", etc.)
+            has_keyword = any(
+                re.search(r"\b" + re.escape(keyword) + r"\b", question_lower)
+                for keyword in specific_keywords
+            )
             has_extension = any(ext in question_lower for ext in specific_extensions)
             has_python = any(py in question_lower for py in specific_python)
             has_verb = any(verb in question_lower for verb in specific_verbs)
@@ -344,26 +357,206 @@ class AnalyzeQuestionNode(BaseWorkflowNodeV3):
             else:
                 clarity = "vague"
 
+            # Detect architectural / broad questions to allocate more tool iterations.
+            # Use multi-word phrases to avoid false positives on specific questions like
+            # "how does authenticate_user work?" — those are caught by has_code_identifier.
+            architectural_keywords = [
+                "architecture", "overview", "core functionality", "data flow", "data flows",
+                "end-to-end", "end to end", "how does the", "how do the",
+                "how it works", "explain the", "describe the", "communicate", "integrate",
+                "platform", "pipeline", "workflow", "infrastructure",
+            ]
+            is_architectural = (
+                any(kw in question_lower for kw in architectural_keywords)
+                and word_count >= 6
+                and not has_code_identifier  # Not asking about a specific symbol
+                and not has_specific  # Not asking about a named function/verb
+            )
+
+            if is_architectural:
+                question_type: Literal["architectural", "specific", "general"] = "architectural"
+                # Architectural questions are well-defined enough to not need clarification —
+                # routing to "clarify" would interrupt for a question we already know how to handle.
+                clarity = "clear"
+            elif has_code_identifier or has_specific:
+                question_type = "specific"
+            else:
+                question_type = "general"
+
             logger.info(
                 "Question analyzed",
                 data={
                     "clarity": clarity,
+                    "question_type": question_type,
                     "question_length": len(question),
                     "word_count": word_count,
                     "has_specific": has_specific,
                     "has_vague": has_vague,
                     "has_generic": has_generic,
                     "has_code_identifier": has_code_identifier,
+                    "is_architectural": is_architectural,
                 },
             )
 
-            return NodeExecutionResult.success(output={"question_clarity": clarity})
+            output = {"question_clarity": clarity, "question_type": question_type}
+            if question_type == "architectural":
+                output["max_agent_iterations"] = 10
+            return NodeExecutionResult.success(output=output)
 
         except Exception as e:
             logger.error(f"Question analysis failed: {e}")
             return NodeExecutionResult.error(
                 f"Question analysis failed: {str(e)}", metadata={"node_type": self.node_name}
             )
+
+
+class _QuestionClassification(BaseModel):
+    """Structured output schema for LLM-based question classification."""
+
+    question_type: Literal["architectural", "specific", "general"] = Field(
+        description=(
+            "architectural: broad questions about the whole system — how the repo works end-to-end, "
+            "data flows, system architecture, repository overview, pipelines, infrastructure, "
+            "component communication. "
+            "specific: targets a named code element — a function, class, method, file, or a "
+            "CamelCase/snake_case code identifier. "
+            "general: everything else."
+        )
+    )
+    question_clarity: Literal["clear", "vague", "ambiguous"] = Field(
+        description=(
+            "clear: answerable as-is; architectural questions are almost always clear. "
+            "vague: too short or contentless to answer (e.g. 'how does it work?' with no subject). "
+            "ambiguous: could reasonably mean multiple conflicting things."
+        )
+    )
+    reasoning: str = Field(description="One-sentence explanation of the classification decision.")
+
+
+class ClassifyQuestionNode(BaseWorkflowNodeV3):
+    """
+    LLM-powered question classifier that replaces brittle keyword heuristics.
+
+    Uses structured output to determine:
+    - question_type: architectural | specific | general
+    - question_clarity: clear | vague | ambiguous
+
+    Falls back to simplified keyword heuristics if the LLM call fails.
+    """
+
+    _SYSTEM_PROMPT = (
+        "You are a code question classifier for a codebase assistant. "
+        "Classify the user's question by type and clarity.\n\n"
+        "QUESTION TYPE:\n"
+        "  architectural — broad questions about the whole system: how the repo works end-to-end, "
+        "data flows, system architecture, repository overview, pipelines, infrastructure, "
+        "component communication. Examples: 'Explain the core functionality', 'How does data "
+        "flow through this system?', 'Give me an overview of this repository'.\n"
+        "  specific — targets a named code element: a specific function, class, method, file, "
+        "module, or an identifiable code identifier (CamelCase or snake_case name). "
+        "Examples: 'How does authenticate_user work?', 'What does GraphKBFacade do?'.\n"
+        "  general — everything else.\n\n"
+        "QUESTION CLARITY:\n"
+        "  clear — answerable as-is. Architectural and specific questions are almost always clear.\n"
+        "  vague — too short or contentless to answer meaningfully without guessing "
+        "(e.g. 'how does it work?' with no subject and no loaded repository).\n"
+        "  ambiguous — could reasonably mean multiple conflicting things.\n\n"
+        "RULE: If the question is architectural, set clarity to 'clear' unless it is genuinely "
+        "impossible to answer without additional information from the user.\n\n"
+        'Respond with ONLY a JSON object, no markdown, no explanation:\n'
+        '{"question_type": "architectural|specific|general",'
+        ' "question_clarity": "clear|vague|ambiguous", "reasoning": "one sentence"}'
+    )
+
+    def __init__(self, llm):
+        super().__init__("classify_question")
+        self._llm = llm
+
+    async def _execute_async(self, state: Dict[str, Any], services: ServiceRegistry) -> NodeExecutionResult:
+        self._setup_execution_context(state, services)
+
+        question = state.get("refined_question") or state.get("original_question", "")
+        if not question or not question.strip():
+            return NodeExecutionResult.error(
+                "No question provided to classify",
+                metadata={"node_type": self.node_name, "error_type": "validation"},
+            )
+
+        try:
+            import json as _json
+
+            response = await self._llm.ainvoke(
+                [
+                    SystemMessage(content=self._SYSTEM_PROMPT),
+                    HumanMessage(content=f"Classify this question:\n\n{question}"),
+                ]
+            )
+            content = response.content if hasattr(response, "content") else str(response)
+
+            # Extract JSON — strip markdown fences if present
+            json_match = re.search(r"\{[^{}]+\}", content, re.DOTALL)
+            raw = json_match.group() if json_match else content.strip()
+            data = _json.loads(raw)
+            result = _QuestionClassification.model_validate(data)
+
+            logger.info(
+                "Question classified by LLM",
+                data={
+                    "question_type": result.question_type,
+                    "question_clarity": result.question_clarity,
+                    "reasoning": result.reasoning,
+                },
+            )
+
+            output: Dict[str, Any] = {
+                "question_clarity": result.question_clarity,
+                "question_type": result.question_type,
+            }
+            if result.question_type == "architectural":
+                output["max_agent_iterations"] = 10
+
+            return NodeExecutionResult.success(output=output)
+
+        except Exception as e:
+            logger.warning(f"LLM classification failed, falling back to keyword heuristics: {e}")
+            return self._heuristic_classify(question)
+
+    def _heuristic_classify(self, question: str) -> NodeExecutionResult:
+        """Keyword-based fallback when LLM classification fails."""
+        question_lower = question.lower()
+        word_count = len(question.split())
+
+        has_camel = bool(re.search(r"[A-Z][a-z]+[A-Z]", question))
+        has_snake = bool(re.search(r"[a-z]+_[a-z]+", question_lower))
+        has_code_id = has_camel or has_snake
+
+        architectural_keywords = [
+            "architecture", "overview", "core functionality", "data flow", "data flows",
+            "end-to-end", "end to end", "how does the", "how do the", "how it works",
+            "explain the", "describe the", "communicate", "integrate",
+            "platform", "pipeline", "workflow", "infrastructure",
+        ]
+        is_architectural = (
+            any(kw in question_lower for kw in architectural_keywords)
+            and word_count >= 6
+            and not has_code_id
+        )
+
+        if is_architectural:
+            q_type: Literal["architectural", "specific", "general"] = "architectural"
+            clarity: Literal["clear", "vague", "ambiguous"] = "clear"
+        elif has_code_id:
+            q_type = "specific"
+            clarity = "clear"
+        else:
+            q_type = "general"
+            clarity = "clear" if word_count >= 5 else "vague"
+
+        output: Dict[str, Any] = {"question_clarity": clarity, "question_type": q_type}
+        if q_type == "architectural":
+            output["max_agent_iterations"] = 10
+
+        return NodeExecutionResult.success(output=output)
 
 
 class ClarificationNode(BaseWorkflowNodeV3):
@@ -426,6 +619,9 @@ class SemanticRetrievalNode(BaseWorkflowNodeV3):
     async def _execute_async(self, state: Dict[str, Any], services: ServiceRegistry) -> NodeExecutionResult:
         """
         Perform semantic search to find relevant code.
+
+        Note: Always runs fresh retrieval, ignoring any cached context_items from checkpoints.
+        This ensures we use the latest retrieval configuration and limits.
         """
 
         # Session ID set by _setup_execution_context
@@ -436,12 +632,18 @@ class SemanticRetrievalNode(BaseWorkflowNodeV3):
 
             repo_id = state.get("repo_id")
             question = state.get("refined_question") or state.get("original_question", "")
-            progress_msg_id = state.get("progress_message_id")
 
             if not repo_id or not question:
                 return NodeExecutionResult.error("Missing repo_id or question", metadata={"node_type": self.node_name})
 
             logger.info("Performing semantic retrieval", data={"repo_id": repo_id, "query": question[:100]})
+
+            # Warn if we're loading from a checkpoint with stale context
+            if "context_items" in state and len(state.get("context_items", [])) > 100:
+                logger.warning(
+                    "Checkpoint contains large context from previous conversation - running fresh retrieval",
+                    data={"old_context_count": len(state.get("context_items", []))},
+                )
 
             # Get retrieval service - returns error if not available
             retrieval_service, error = self._require_retrieval_service(services)
@@ -597,11 +799,13 @@ class SemanticRetrievalNode(BaseWorkflowNodeV3):
             app_context = services.get("app_context")
             graph_store = getattr(app_context, "graph_kb_facade", None) if app_context else None
 
+            limited_context_items = context_items
+
             if graph_store and graph_store.prompt_manager:
                 # Use prompt_manager to render the context properly (same as v2)
                 prompts = graph_store.prompt_manager.render_full_prompt(
                     question=question,
-                    context_items=context_items,
+                    context_items=limited_context_items,
                     include_tools=False,  # Agent handles tools natively
                 )
 
@@ -610,13 +814,17 @@ class SemanticRetrievalNode(BaseWorkflowNodeV3):
 
                 logger.info(
                     "Context rendered using prompt_manager",
-                    data={"user_prompt_length": len(context_with_question), "context_items_count": len(context_items)},
+                    data={
+                        "user_prompt_length": len(context_with_question),
+                        "context_items_total": len(context_items),
+                        "context_items_in_prompt": len(limited_context_items),
+                    },
                 )
             else:
                 # Fallback: simple formatting if prompt_manager not available
                 logger.warning("prompt_manager not available, using simple context formatting")
                 context_summary = "\n\n".join(
-                    [f"File: {item.file_path}\n{item.content[:500]}..." for item in context_items[:10]]
+                    [f"File: {item.file_path}\n{item.content}" for item in context_items[:10]]
                 )
                 context_with_question = f"""User Question: {question}
 
@@ -625,14 +833,63 @@ Retrieved Context:
 
 Please analyze the retrieved context and answer the user's question."""
 
+            # Prepend prior conversation summary so the LLM retains multi-turn context.
+            # Messages from prior turns are cleared in ValidateInputNode to prevent token
+            # overflow, so conversation_history is the lightweight replacement.
+            conversation_history: List[dict] = state.get("conversation_history", [])
+            if conversation_history:
+                prior_qa = "\n".join(
+                    f"Q: {entry.get('question', '')}\nA: {entry.get('answer', '')}"
+                    for entry in conversation_history[-3:]  # last 3 turns max
+                )
+                context_with_question = (
+                    f"Prior conversation (for context):\n{prior_qa}\n\n---\n\n{context_with_question}"
+                )
+
+            # For architectural/broad questions, prepend a mandatory exploration directive.
+            # Without this, the LLM answers from the pre-loaded context dump and makes
+            # zero tool calls — even though the system prompt says to explore with tools.
+            question_type = state.get("question_type", "general")
+            if question_type == "architectural":
+                repo_id_hint = f'"{state.get("repo_id", "this-repo")}"'
+                exploration_directive = (
+                    "**MANDATORY EXPLORATION REQUIRED**\n\n"
+                    "This is a broad architectural question. The context below is a *starting point only*. "
+                    "You MUST use the available tools to research the codebase before answering. "
+                    "Do NOT answer based solely on the context provided.\n\n"
+                    "Required steps before writing your answer:\n"
+                    f"1. Call `search_code` to find the main entry points and startup logic (repo_id={repo_id_hint})\n"
+                    f"2. Call `trace_call_chain` on the primary entry point "
+                    f"(direction=\"outgoing\", max_depth=4) to trace the main request flow\n"
+                    f"3. Call `get_file_content` on key orchestrator/facade files you discover\n"
+                    f"4. Repeat for each major capability or distinct code path (do not stop after one)\n"
+                    f"5. Call `search_code` for error handling patterns\n\n"
+                    "Only write your final answer after completing these tool calls.\n\n"
+                    "---\n\n"
+                )
+                context_with_question = exploration_directive + context_with_question
+
             # Create HumanMessage with the rendered context
             initial_message = HumanMessage(content=context_with_question)
 
             logger.info("Initial message created for agent", data={"message_length": len(initial_message.content)})
 
+            # Convert ContextItem dataclasses to dicts before storing in state.
+            # The state schema declares List[dict] but retrieval returns ContextItem
+            # dataclasses, causing LangGraph msgpack deserialization warnings.
+            def _to_dict(item: Any) -> dict:
+                try:
+                    dataclass_fields(item)
+                    raw = asdict(item)
+                    # asdict() preserves enum instances; convert to primitives so
+                    # LangGraph msgpack checkpointing doesn't warn about unregistered types.
+                    return {k: v.value if isinstance(v, Enum) else v for k, v in raw.items()}
+                except TypeError:
+                    return item if isinstance(item, dict) else vars(item)
+
             return NodeExecutionResult.success(
                 output={
-                    "context_items": context_items,
+                    "context_items": [_to_dict(item) for item in context_items],
                     "context_sufficiency": sufficiency,
                     "vector_search_duration": vector_search_duration,
                     "messages": [initial_message],
@@ -679,7 +936,6 @@ class GraphExpansionNode(BaseWorkflowNodeV3):
             # 1. Extract inputs from state
             repo_id = state.get("repo_id")
             question = state.get("refined_question") or state.get("original_question", "")
-            progress_msg_id = state.get("progress_message_id")
 
             if not repo_id or not question:
                 return NodeExecutionResult.error("Missing repo_id or question", metadata={"node_type": self.node_name})
@@ -706,7 +962,8 @@ class GraphExpansionNode(BaseWorkflowNodeV3):
             try:
                 with logger.timer("graph_expansion", level="info") as timer:
                     graph_context = await asyncio.wait_for(
-                        analysis_service.retrieve_context(
+                        asyncio.to_thread(
+                            analysis_service.retrieve_context,
                             repo_id=repo_id,
                             query=question,
                             max_depth=config.get("max_depth", 5),
@@ -732,18 +989,41 @@ class GraphExpansionNode(BaseWorkflowNodeV3):
                     },
                 )
 
-                # 8. Return results
+                # 8. Build graph expansion summary message for the agent.
+                # Use SystemMessage so it doesn't break the HumanMessage → AIMessage
+                # alternating pattern required by some model providers.
+                nodes_explored = (
+                    graph_context.total_nodes_explored if hasattr(graph_context, "total_nodes_explored") else 0
+                )
+                symbols_found = graph_context.symbols_found if hasattr(graph_context, "symbols_found") else []
+                # Extract .code (str) from MermaidDiagram dataclass; state declares visualization: str
+                _viz = graph_context.visualization if hasattr(graph_context, "visualization") else None
+                visualization_code: Optional[str] = _viz.code if _viz is not None else None
+
+                graph_messages = []
+                if symbols_found:
+                    symbols_preview = ", ".join(f"`{s}`" for s in symbols_found[:25])
+                    if len(symbols_found) > 25:
+                        symbols_preview += f" ... and {len(symbols_found) - 25} more"
+                    graph_summary = (
+                        f"[Graph Expansion Results]\n"
+                        f"Traversed {nodes_explored} nodes in the code graph and found "
+                        f"{len(symbols_found)} related symbols.\n\n"
+                        f"Key symbols discovered: {symbols_preview}"
+                    )
+                    if visualization_code:
+                        graph_summary += f"\n\nRelationship diagram:\n```mermaid\n{visualization_code}\n```"
+                    graph_messages = [SystemMessage(content=graph_summary)]
+
+                # 9. Return results
                 return NodeExecutionResult.success(
                     output={
                         "graph_context": graph_context,
-                        "total_nodes_explored": graph_context.total_nodes_explored
-                        if hasattr(graph_context, "total_nodes_explored")
-                        else 0,
-                        "symbols_found": graph_context.symbols_found if hasattr(graph_context, "symbols_found") else [],
-                        "visualization": graph_context.visualization
-                        if hasattr(graph_context, "visualization")
-                        else None,
+                        "total_nodes_explored": nodes_explored,
+                        "symbols_found": symbols_found,
+                        "visualization": visualization_code,
                         "graph_expansion_duration": duration,
+                        "messages": graph_messages,
                     }
                 )
 
@@ -982,21 +1262,70 @@ class FormatResponseNode(BaseWorkflowNodeV3):
             self._setup_execution_context(state, services)
 
             messages = state.get("messages", [])
-            progress_msg_id = state.get("progress_message_id")
-            repo_id = state.get("repo_id", "unknown")
             context_items = state.get("context_items", [])
             tool_calls_history = state.get("tool_calls_history", [])
 
-            if not messages:
-                return NodeExecutionResult.error("No messages to format", metadata={"node_type": self.node_name})
+            # Check if we have messages to format
+            if not messages or len(messages) == 0:
+                logger.warning("No messages to format - LLM may have failed")
+                # Create a helpful error message
+                error_response = (
+                    "I encountered an issue analyzing the code. This might be because:\n\n"
+                    f"- Too much context was retrieved ({len(context_items)} code chunks)\n"
+                    "- The context exceeded the model's token limit\n\n"
+                    "Try:\n"
+                    "- Asking a more specific question\n"
+                    "- Focusing on a particular file or function\n"
+                    "- Breaking your question into smaller parts"
+                )
+                return NodeExecutionResult.success(
+                    output={"llm_response": error_response, "final_output": error_response}
+                )
 
-            # Get last message (should be LLM response)
+            # Get last message (should be AIMessage from LLM)
             last_message = messages[-1]
 
+            # Check if the last message is actually an AI response (not the user's question with context)
+            if not isinstance(last_message, AIMessage):
+                logger.warning(
+                    "Last message is not an AIMessage - LLM likely failed",
+                    data={"message_type": type(last_message).__name__, "messages_count": len(messages)},
+                )
+                error_response = (
+                    "I encountered an issue analyzing the code. This might be because:\n\n"
+                    f"- Too much context was retrieved ({len(context_items)} code chunks)\n"
+                    "- The context exceeded the model's token limit\n"
+                    "- The LLM call failed or timed out\n\n"
+                    "Try:\n"
+                    "- Starting a new conversation\n"
+                    "- Asking a more specific question\n"
+                    "- Focusing on a particular file or function"
+                )
+                return NodeExecutionResult.success(
+                    output={"llm_response": error_response, "final_output": error_response}
+                )
+
+            # Extract content from the AI message
             if hasattr(last_message, "content"):
                 response_content = last_message.content
             else:
                 response_content = str(last_message)
+
+            # If response is empty or too short, provide helpful message
+            if not response_content or len(response_content.strip()) < 10:
+                logger.warning(
+                    "LLM response is empty or too short",
+                    data={"response_length": len(response_content) if response_content else 0},
+                )
+                response_content = (
+                    "I encountered an issue analyzing the code. This might be because:\n\n"
+                    f"- Too much context was retrieved ({len(context_items)} code chunks)\n"
+                    "- The context exceeded the model's token limit\n\n"
+                    "Try:\n"
+                    "- Asking a more specific question\n"
+                    "- Focusing on a particular file or function\n"
+                    "- Breaking your question into smaller parts"
+                )
 
             # Add statistics footer to the response
             # Use explicit newlines to ensure proper formatting in Chainlit
@@ -1064,7 +1393,6 @@ class PresentToUserNode(BaseWorkflowNodeV3):
             final_output = state.get("final_output", "")
             error = state.get("error", "")
             progress_msg_id = state.get("progress_message_id")
-            repo_id = state.get("repo_id", "unknown")
             tool_calls_history = state.get("tool_calls_history", [])
 
             logger.info(
@@ -1095,7 +1423,18 @@ class PresentToUserNode(BaseWorkflowNodeV3):
                 data={"output_length": len(final_output), "tools_used": completed_calls_count},
             )
 
-            return NodeExecutionResult.success(output={"success": True})
+            # Persist this turn's Q&A to conversation_history so future turns
+            # can reference prior context without re-sending the full code context.
+            question = state.get("refined_question") or state.get("original_question", "")
+            llm_response = state.get("llm_response", "")
+            history_entry = {
+                "question": question,
+                "answer": llm_response,
+            }
+
+            return NodeExecutionResult.success(
+                output={"success": True, "conversation_history": [history_entry]}
+            )
 
         except Exception as e:
             logger.error(f"Presentation failed: {e}")

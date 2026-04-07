@@ -10,9 +10,8 @@ from __future__ import annotations
 import operator
 from typing import Annotated, List, Literal
 
-from typing_extensions import NotRequired, TypedDict
-
 from langgraph.graph import add_messages
+from typing_extensions import NotRequired, TypedDict
 
 from graph_kb_api.flows.v3.state.common import BaseCommandState
 from graph_kb_api.graph_kb.querying.models import GraphRAGResult
@@ -40,14 +39,20 @@ class AskCodeState(BaseCommandState, TypedDict):
 
     # Clarification loop
     question_clarity: Literal["clear", "vague", "ambiguous"]
+    question_type: NotRequired[Literal["architectural", "specific", "general"]]
     clarification_attempts: int
 
     # Messages for LLM interactions - use add_messages reducer
     # This reducer intelligently merges message lists, handling tool calls properly
     messages: Annotated[list, add_messages]
 
-    # Retrieval results - accumulate across nodes using operator.add
-    context_items: Annotated[List[dict], operator.add]
+    # Retrieval results - replaced each turn (no accumulator).
+    # operator.add was removed because checkpointing now persists state across
+    # conversation turns (via conversation_id thread_id). With operator.add, each
+    # turn's retrieved items were appended to previous turns' items, causing
+    # unbounded growth (e.g. 7845 items after a few turns at top_k=2000).
+    # SemanticRetrievalNode always runs on each invocation and replaces this field.
+    context_items: List[dict]
     context_sufficiency: Literal["sufficient", "sparse", "none"]
     additional_queries_made: int
 
@@ -72,7 +77,7 @@ class AskCodeState(BaseCommandState, TypedDict):
 
     # Agentic tool loop
     agent_iterations: int
-    max_agent_iterations: int  # Default: 5
+    max_agent_iterations: int  # Default: 8; elevated to 10 for architectural questions
     agent_needs_more_info: bool
     tool_calls_history: Annotated[List[dict], operator.add]  # Track all tool calls made
 

@@ -10,6 +10,8 @@ Usage:
     print(settings.embedding_dimensions)
 """
 
+from __future__ import annotations
+
 import logging
 from typing import List, Optional
 
@@ -170,7 +172,7 @@ class Settings(BaseSettings):
 
     # ── LLM Configuration ─────────────────────────────────────────────
     openai_model: str = Field(
-        OpenAIModel.GPT_5_2.value, validation_alias="OPENAI_MODEL"
+        OpenAIModel.GPT_5_4.value, validation_alias="OPENAI_MODEL"
     )
     llm_temperature: float = Field(0.0, validation_alias="LLM_TEMPERATURE")
     llm_max_tokens: Optional[int] = Field(None, validation_alias="LLM_MAX_TOKENS")
@@ -256,6 +258,15 @@ class Settings(BaseSettings):
 
     # ── Agent Configuration ───────────────────────────────────────────
     show_agent_tool_calls: bool = Field(True, validation_alias="SHOW_AGENT_TOOL_CALLS")
+
+    # ── Multi-Repo Research ───────────────────────────────────────────
+    multi_repo_concurrency_limit: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        validation_alias="MULTI_REPO_CONCURRENCY_LIMIT",
+        description="Maximum number of repositories researched concurrently in multi-repo mode",
+    )
     deep_agent_max_iterations: int = Field(
         50, validation_alias="DEEP_AGENT_MAX_ITERATIONS"
     )

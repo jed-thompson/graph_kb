@@ -77,6 +77,20 @@ class PlanSessionRepository:
         )
         return list(result.scalars().all())
 
+    async def list_all(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[PlanSession]:
+        """List all sessions ordered by updated_at desc."""
+        result = await self._execute(
+            select(PlanSession)
+            .order_by(PlanSession.updated_at.desc())
+            .limit(limit)
+            .offset(offset),
+        )
+        return list(result.scalars().all())
+
     async def update(
         self,
         session_id: str,

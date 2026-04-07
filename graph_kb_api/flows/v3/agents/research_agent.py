@@ -114,7 +114,7 @@ class ResearchAgent(BaseAgent):
                 "research_summary",
             ],
             required_tools=[],
-            optional_tools=["search_code", "get_file_content"],
+            optional_tools=["search_code", "get_file_content", "websearch", "websearch_with_content"],
             description="Analyzes codebase and documents for feature spec context, identifies risks and gaps",
             system_prompt=_RESEARCHER_SYSTEM_PROMPT,
         )
@@ -284,10 +284,10 @@ class ResearchAgent(BaseAgent):
                 results.append({
                     "name": getattr(item, "symbol", file_path) or file_path,
                     "file_path": file_path,
-                    "description": (getattr(item, "content", "") or "")[:200].strip(),
+                    "description": (getattr(item, "content", "") or "").strip(),
                     "relevance": getattr(item, "score", 0.5) or 0.5,
                 })
-            return results[:10]
+            return results
         except Exception as e:
             logger.warning(f"Failed to find similar features: {e}")
             return []
@@ -333,7 +333,7 @@ class ResearchAgent(BaseAgent):
                         "path": module_path,
                         "reason": f"Module {module_name} identified in repository architecture",
                     })
-            return modules[:10]
+            return modules
         except Exception as e:
             logger.warning(f"Failed to find relevant modules: {e}")
             return []
@@ -570,7 +570,7 @@ class ResearchAgent(BaseAgent):
                         "relevance": 0.7 if is_spec else 0.5,
                     })
 
-            return results[:10]
+            return results
         except Exception as e:
             logger.warning(f"Failed to search specs: {e}")
             return []
@@ -618,7 +618,7 @@ class ResearchAgent(BaseAgent):
                         "relevance": 0.7 if is_api else 0.5,
                     })
 
-            return results[:10]
+            return results
         except Exception as e:
             logger.warning(f"Failed to search API docs: {e}")
             return []

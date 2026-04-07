@@ -146,7 +146,12 @@ class PlanEngine(BaseWorkflowEngine):
         builder.add_conditional_edges(
             "assembly",
             PlanEngine._route_after_assembly,
-            {"finalize": "finalize", "__end__": END, "halt_on_incomplete": "halt_on_incomplete"},
+            {
+                "finalize": "finalize",
+                "__end__": END,
+                "halt_on_incomplete": "halt_on_incomplete",
+                "prune_after_orchestrate": "prune_after_orchestrate",
+            },
         )
         builder.add_edge("finalize", END)
 
@@ -222,11 +227,18 @@ class PlanEngine(BaseWorkflowEngine):
         # Check for composition review re-orchestration (Step 16)
         re_execute_ids = state.get("re_execute_task_ids", [])
         if state.get("needs_re_orchestrate", False) and re_execute_ids:
-            logger.info(
-                f"Composition review flagged {len(re_execute_ids)} tasks "
-                f"for re-execution: {re_execute_ids}"
-            )
-            return "prune_after_orchestrate"
+            re_orch_count = state.get("re_orchestration_count", 0)
+            if re_orch_count >= 3:
+                logger.warning(
+                    f"Re-orchestration cap (3) reached after {re_orch_count} attempt(s); "
+                    f"proceeding to finalize despite flagged tasks: {re_execute_ids}"
+                )
+            else:
+                logger.info(
+                    f"Composition review flagged {len(re_execute_ids)} tasks "
+                    f"for re-execution (attempt {re_orch_count + 1}/3): {re_execute_ids}"
+                )
+                return "prune_after_orchestrate"
 
         completeness = state.get("completeness", {})
         decision = completeness.get("approval_decision", "approve")
@@ -474,6 +486,13 @@ class PlanEngine(BaseWorkflowEngine):
         for phase_name in cleared_phases:
             for key in self._PHASE_DATA_KEYS.get(PlanPhase(phase_name), []):
                 update[key] = {}
+
+        # Clear composition-review re-orchestration flags when assembly is cleared.
+        # These are top-level bool/list fields not covered by _PHASE_DATA_KEYS, and
+        # stale True values would cause _route_after_assembly to loop indefinitely.
+        if "assembly" in cleared_phases:
+            update["needs_re_orchestrate"] = False
+            update["re_execute_task_ids"] = []
 
         logger.info(
             "PlanEngine.navigate_to_phase: selective cascade",

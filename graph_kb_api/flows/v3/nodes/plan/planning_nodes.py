@@ -85,8 +85,15 @@ class RoadmapNode(SubgraphAwareNode[PlanningSubgraphState]):
         if not llm:
             raise RuntimeError("RoadmapNode requires an LLM but none was provided in config.")
 
+        workflow_context: WorkflowContext | None = configurable.get("context")
+        tools = []
+        if workflow_context and workflow_context.app_context:
+            from graph_kb_api.flows.v3.tools import get_all_tools
+            tools = get_all_tools(workflow_context.app_context.get_retrieval_settings())
+
         prompt: str = self._build_roadmap_prompt(context, research)
-        response: AIMessage = await llm.ainvoke(prompt)
+        llm_with_tools = llm.bind_tools(tools) if tools else llm
+        response: AIMessage = await llm_with_tools.ainvoke(prompt)
         raw_content = response.content if hasattr(response, "content") else str(response)
         content: str = str(raw_content) if not isinstance(raw_content, str) else raw_content
         roadmap = self._parse_roadmap(content)
@@ -161,8 +168,15 @@ class FeasibilityNode(SubgraphAwareNode[PlanningSubgraphState]):
         if not llm:
             raise RuntimeError("FeasibilityNode requires an LLM but none was provided in config.")
 
+        workflow_context: WorkflowContext | None = configurable.get("context")
+        tools = []
+        if workflow_context and workflow_context.app_context:
+            from graph_kb_api.flows.v3.tools import get_all_tools
+            tools = get_all_tools(workflow_context.app_context.get_retrieval_settings())
+
         prompt: str = self._build_feasibility_prompt(context, planning, research=state.get("research", {}))
-        response: AIMessage = await llm.ainvoke(prompt)
+        llm_with_tools = llm.bind_tools(tools) if tools else llm
+        response: AIMessage = await llm_with_tools.ainvoke(prompt)
         raw_content = response.content if hasattr(response, "content") else str(response)
         content: str = str(raw_content) if not isinstance(raw_content, str) else raw_content
         feasibility: dict[str, Any] = self._parse_feasibility(content)

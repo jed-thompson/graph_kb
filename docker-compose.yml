@@ -64,7 +64,7 @@ services:
       # Suppress noisy flash_attn advisory warnings from transformers
       - TRANSFORMERS_NO_ADVISORY_WARNINGS=1
       # LLM
-      - OPENAI_MODEL=gpt-5.2
+      - OPENAI_MODEL=gpt-5.4
       - LLM_TEMPERATURE=0.0
       # Tuning (transposed from Chainlit settings.yaml)
       - MAX_DEPTH=25

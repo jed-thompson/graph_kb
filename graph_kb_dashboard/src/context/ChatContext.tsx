@@ -10,6 +10,7 @@ import { useWebSocket } from '@/context/WebSocketContext';
 import type { AttachedFile } from '@/context/AttachmentContext';
 import { useChatStore, useActiveSessionMessages, useChatStoreHydrated } from '@/lib/store/chatStore';
 import type { ChatSessionMeta } from '@/lib/store/chatStore';
+import { useResearchStore } from '@/lib/store/researchStore';
 
 export const ChatContext = createContext<ChatState | null>(null);
 
@@ -63,6 +64,9 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
   const [selectedContexts, setSelectedContexts] = useState<string[]>([]);
   const [repositories, setRepositories] = useState<Repository[]>([]);
   const [selectedRepoId, setSelectedRepoId] = useState<string | null>(null);
+
+  // Multi-repo targeting from the research store
+  const selectedRepoIds = useResearchStore((s) => s.selectedRepoIds);
 
   // Track active stream abort controller so we can cancel on unmount
   const streamControllerRef = useRef<AbortController | null>(null);
@@ -687,10 +691,17 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
       mimeType: f.mimeType,
     }));
 
+    // When 2+ repos are selected in the research panel, use multi-repo mode
+    const multiRepo = selectedRepoIds.length >= 2;
     const controller = askCodeStream(
       {
-        ...(selectedRepoId ? { repo_id: selectedRepoId } : {}),
+        ...(multiRepo
+          ? { repo_ids: selectedRepoIds }
+          : selectedRepoId
+          ? { repo_id: selectedRepoId }
+          : {}),
         query: trimmedInput,
+        conversation_id: activeSessionId ?? undefined,
         ...(streamContextFiles && streamContextFiles.length > 0 ? { context_files: streamContextFiles } : {}),
       },
       {
@@ -823,7 +834,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
 
     streamControllerRef.current = controller;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [input, selectedRepoId, currentModel, handleCommand, addMessage, updateMessage]);
+  }, [input, selectedRepoId, selectedRepoIds, currentModel, handleCommand, addMessage, updateMessage]);
 
   // ---------------------------------------------------------------------------
   // Context helpers (unchanged)

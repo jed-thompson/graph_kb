@@ -23,6 +23,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { MessageSquare, Sparkles, Trash2, Bot, GitBranch, Loader2, Paperclip, X as XIcon, ChevronLeft, ChevronRight } from 'lucide-react';
 import Link from 'next/link';
 import { ChatHistory } from '@/components/chat/ChatHistory';
+import { ResearchControls } from '@/components/research/ResearchControls';
 import { cn } from '@/lib/utils';
 
 function ChatPageContent() {
@@ -54,6 +55,7 @@ function ChatPageContent() {
   const { files: attachedFiles, addFile, removeFile, clearAll: clearAttachments } = useAttachments();
 
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isResearchPanelOpen, setIsResearchPanelOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -188,6 +190,7 @@ function ChatPageContent() {
                   </TooltipProvider>
                 ))}
               </div>
+
             </div>
 
             <div className="p-3 border-t border-border">
@@ -266,6 +269,15 @@ function ChatPageContent() {
               <h1 className="text-lg font-semibold">Chat</h1>
               <p className="text-sm text-muted-foreground hidden sm:block">Ask questions about your codebase</p>
             </div>
+            <Button
+              variant={isResearchPanelOpen ? 'default' : 'outline'}
+              size="sm"
+              className="h-9 gap-2 shrink-0"
+              onClick={() => setIsResearchPanelOpen((o) => !o)}
+            >
+              <GitBranch className="h-4 w-4" />
+              <span className="hidden sm:inline">Repos</span>
+            </Button>
             <Select value={selectedRepoId || ''} onValueChange={setSelectedRepoId}>
               <SelectTrigger className="w-48 lg:w-56 h-9">
                 <GitBranch className="h-4 w-4 mr-2" />
@@ -411,6 +423,40 @@ function ChatPageContent() {
             />
           </div>
         </div>
+      </div>
+
+      {/* Right research panel */}
+      <div className={cn(
+        'border-l border-border bg-card/50 backdrop-blur-sm flex flex-col min-h-0 transition-all duration-300 overflow-hidden',
+        isResearchPanelOpen ? 'w-80' : 'w-0'
+      )}>
+        {isResearchPanelOpen && (
+          <>
+            <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 border-b border-border">
+              <div className="flex items-center gap-2">
+                <GitBranch className="h-4 w-4 text-primary" />
+                <span className="font-semibold text-sm">Repos</span>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={() => setIsResearchPanelOpen(false)}
+              >
+                <XIcon className="h-4 w-4" />
+              </Button>
+            </div>
+            <ScrollArea className="flex-1 min-h-0">
+              <ResearchControls
+                repositories={repositories.map((r) => ({
+                  id: r.id,
+                  name: r.git_url.split('/').pop() || r.id,
+                  status: r.status,
+                }))}
+              />
+            </ScrollArea>
+          </>
+        )}
       </div>
 
       {/* Plan name prompt dialog */}

@@ -67,7 +67,7 @@ class ResultAggregationNode(BaseWorkflowNodeV3):
                 aggregated = self._merge_outputs(agent_outputs)
 
             # Build attribution summary
-            attribution = self._build_attribution(agent_outputs)
+            attribution = self._build_attribution(agent_outputs, state)
 
             logger.info(
                 "Result aggregation completed",
@@ -201,7 +201,7 @@ class ResultAggregationNode(BaseWorkflowNodeV3):
 
         return merged
 
-    def _build_attribution(self, agent_outputs: Dict[str, Any]) -> str:
+    def _build_attribution(self, agent_outputs: Dict[str, Any], state: Dict[str, Any]) -> str:
         """
         Build attribution summary for merged results.
 
@@ -229,6 +229,6 @@ class ResultAggregationNode(BaseWorkflowNodeV3):
 
             lines.append(f"\n**{agent_type}**")
             lines.append(f"- Tasks handled: {tasks_handled}")
-            lines.append(f"- Output: {str(output)[:200] if len(output) > 200 else output}")
+            lines.append(f"- Output: {output}")
 
         return "\n".join(lines)

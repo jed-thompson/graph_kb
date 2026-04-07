@@ -13,26 +13,20 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError
 
-from graph_kb_api.flows.v3.tools.websearch import fetch_url_content
+from graph_kb_api.flows.v3.models.research_models import ResearchReviewResult
 from graph_kb_api.websocket.handlers.base import logger
+from graph_kb_api.websocket.handlers.multi_repo_orchestrator import MultiRepoOrchestrator
+from graph_kb_api.websocket.handlers.research_runner import run_single_repo_research
 from graph_kb_api.websocket.manager import manager
 from graph_kb_api.websocket.research_events import (
-    ResearchContextCard,
-    ResearchFindings,
-    ResearchGap,
+    MultiRepoResearchStartPayload,
     ResearchGapAnswerPayload,
-    ResearchReviewResult,
+    ResearchHitlResponsePayload,
     ResearchReviewStartPayload,
-    ResearchRisk,
     ResearchStartPayload,
-    emit_context_found,
-    emit_gap_detected,
-    emit_research_complete,
     emit_research_error,
-    emit_research_progress,
     emit_research_started,
     emit_review_complete,
-    emit_url_fetched,
     set_research_ws_manager,
 )
 
@@ -76,7 +70,23 @@ async def handle_research_start(
     workflow_id: str,
     payload: Dict[str, Any],
 ) -> None:
-    """Handle research.start - initiate a new research session."""
+    """Handle research.start — routes to single-repo or multi-repo flow."""
+    # Multi-repo path: payload contains repo_ids (list)
+    if "repo_ids" in payload:
+        try:
+            data = MultiRepoResearchStartPayload(**payload)
+        except ValidationError as e:
+            await manager.send_event(
+                client_id=client_id,
+                event_type="research.error",
+                workflow_id=workflow_id,
+                data={"message": f"Invalid payload: {e}", "code": "VALIDATION_ERROR"},
+            )
+            return
+        await _run_multi_repo_research(client_id, workflow_id, data)
+        return
+
+    # Single-repo path (backward compat): payload contains repo_id (string)
     try:
         data = ResearchStartPayload(**payload)
     except ValidationError as e:
@@ -89,8 +99,6 @@ async def handle_research_start(
         return
 
     session_id = str(uuid.uuid4())
-
-    # Create session
     session: Dict[str, Any] = {
         "session_id": session_id,
         "client_id": client_id,
@@ -108,131 +116,116 @@ async def handle_research_start(
 
     await emit_research_started(session_id, client_id)
 
-    # Start research task in background
-    task = asyncio.create_task(_run_research(session_id, client_id))
+    task = asyncio.create_task(run_single_repo_research(session, data.repo_id, client_id))
     session["running_task"] = task
 
 
-async def _run_research(session_id: str, client_id: str) -> None:
-    """Execute the research workflow."""
-    session = _get_session(session_id)
+async def _run_multi_repo_research(
+    client_id: str,
+    workflow_id: str,
+    data: MultiRepoResearchStartPayload,
+) -> None:
+    """Route multi-repo research to the MultiRepoOrchestrator."""
+    session_id = str(uuid.uuid4())
+
+    # Deduplicate repo_ids
+    repo_ids = list(dict.fromkeys(data.repo_ids))
+
+    # Validate: all repos in relationships must be in repo_ids
+    for rel in data.relationships:
+        if rel.source_repo_id not in repo_ids or rel.target_repo_id not in repo_ids:
+            await manager.send_event(
+                client_id=client_id,
+                event_type="research.error",
+                workflow_id=workflow_id,
+                data={
+                    "message": (
+                        f"Relationship references repo not in repo_ids: "
+                        f"{rel.source_repo_id} -> {rel.target_repo_id}"
+                    ),
+                    "code": "VALIDATION_ERROR",
+                },
+            )
+            return
+
+    # Single-repo shortcut: no synthesis needed
+    if len(repo_ids) == 1:
+        session: Dict[str, Any] = {
+            "session_id": session_id,
+            "client_id": client_id,
+            "repo_id": repo_ids[0],
+            "web_urls": data.web_urls,
+            "document_ids": data.document_ids,
+            "query": data.query,
+            "context_cards": [],
+            "gaps": [],
+            "findings": None,
+            "status": "running",
+            "started_at": datetime.utcnow().isoformat(),
+        }
+        _sessions[session_id] = session
+        await emit_research_started(session_id, client_id)
+        task = asyncio.create_task(run_single_repo_research(session, repo_ids[0], client_id))
+        session["running_task"] = task
+        return
+
+    session = {
+        "session_id": session_id,
+        "client_id": client_id,
+        "repo_ids": repo_ids,
+        "relationships": [r.model_dump() for r in data.relationships],
+        "strategy": data.strategy,
+        "web_urls": data.web_urls,
+        "document_ids": data.document_ids,
+        "query": data.query,
+        "context_cards": [],
+        "gaps": [],
+        "findings": None,
+        "per_repo_findings": {},
+        "hitl_events": {},
+        "status": "running",
+        "started_at": datetime.utcnow().isoformat(),
+    }
+    _sessions[session_id] = session
+
+    await emit_research_started(session_id, client_id)
+
+    orchestrator = MultiRepoOrchestrator(session, client_id)
+    if data.strategy == "dependency_aware":
+        task = asyncio.create_task(orchestrator.run_dependency_aware())
+    else:
+        task = asyncio.create_task(orchestrator.run_parallel_merge())
+    session["running_task"] = task
+
+
+async def handle_research_hitl_response(
+    client_id: str,
+    workflow_id: str,
+    payload: Dict[str, Any],
+) -> None:
+    """Handle research.hitl.response — routes user decision back to waiting orchestrator."""
+    try:
+        data = ResearchHitlResponsePayload(**payload)
+    except ValidationError as e:
+        await manager.send_event(
+            client_id=client_id,
+            event_type="research.error",
+            workflow_id=workflow_id,
+            data={"message": f"Invalid payload: {e}", "code": "VALIDATION_ERROR"},
+        )
+        return
+
+    session = _get_session(data.session_id)
     if not session:
         return
 
-    repo_id = session.get("repo_id", "")
-    web_urls: List[str] = session.get("web_urls", [])
-
-    try:
-        # Phase 1: Setup
-        await emit_research_progress(session_id, "setup", "Initializing research session", 0.1, client_id)
-
-        # Phase 2: Fetch web URLs
-        if web_urls:
-            await emit_research_progress(session_id, "web_fetch", f"Fetching {len(web_urls)} web URLs", 0.2, client_id)
-            for i, url in enumerate(web_urls):
-                try:
-                    # Fetch URL content directly
-                    result = await fetch_url_content(url)
-
-                    # Create context card
-                    card = ResearchContextCard(
-                        id=str(uuid.uuid4()),
-                        source_type="web",
-                        source_url=url,
-                        source_name=url.split("//")[-1].split("/")[0],
-                        title=f"Content from {url}",
-                        content=result[:5000] if result else "No content extracted",
-                        relevance_score=0.8,
-                        tags=["web", "fetched"],
-                        created_at=datetime.utcnow().isoformat(),
-                    )
-                    session["context_cards"].append(card.model_dump())
-                    await emit_context_found(session_id, card, client_id)
-                    await emit_url_fetched(session_id, url, card.title[:100], True, client_id)
-                except Exception as e:
-                    logger.warning("Failed to fetch URL %s: %s", url, e)
-                    await emit_url_fetched(session_id, url, str(e), False, client_id)
-
-                # Update progress
-                progress = 0.2 + (0.3 * (i + 1) / len(web_urls))
-                await emit_research_progress(
-                    session_id, "web_fetch", f"Fetched {i + 1}/{len(web_urls)} URLs", progress, client_id
-                )
-
-        # Phase 3: Repository analysis (placeholder - would integrate with graph_store)
-        await emit_research_progress(session_id, "repo_analysis", f"Analyzing repository {repo_id}", 0.5, client_id)
-
-        # Create a placeholder context card for repository
-        repo_card = ResearchContextCard(
-            id=str(uuid.uuid4()),
-            source_type="repository",
-            source_name=repo_id,
-            title=f"Repository Analysis: {repo_id}",
-            content=(
-                "## Repository Overview\n\nAnalyzed repository structure and code patterns."
-                "\n\n```mermaid\ngraph TD\n    A[Repository] --> B[Modules]"
-                "\n    A --> C[Components]\n    A --> D[Services]\n```"
-            ),
-            relevance_score=0.9,
-            tags=["repository", "codebase"],
-            created_at=datetime.utcnow().isoformat(),
-        )
-        session["context_cards"].append(repo_card.model_dump())
-        await emit_context_found(session_id, repo_card, client_id)
-
-        # Phase 4: Detect gaps
-        await emit_research_progress(session_id, "gap_detection", "Analyzing for knowledge gaps", 0.7, client_id)
-
-        # Create sample gap
-        gap = ResearchGap(
-            id=str(uuid.uuid4()),
-            category="technical",
-            question="What are the specific technical constraints for this feature?",
-            context="The repository analysis revealed potential technical constraints that need clarification.",
-            suggested_answers=["Performance requirements", "Security constraints", "Compatibility requirements"],
-            impact="high",
-        )
-        session["gaps"].append(gap.model_dump())
-        await emit_gap_detected(session_id, gap, client_id)
-
-        # Phase 5: Generate findings
-        await emit_research_progress(session_id, "synthesis", "Synthesizing research findings", 0.9, client_id)
-
-        findings = ResearchFindings(
-            summary="Research completed. Found relevant context from web sources and repository analysis.",
-            confidence_score=0.75,
-            key_insights=[
-                "Repository has modular architecture",
-                "Web sources provide additional context",
-                "Some knowledge gaps require clarification",
-            ],
-            related_modules=[
-                {"name": "Core Module", "path": "src/core", "reason": "Primary functionality"},
-            ],
-            risks=[
-                ResearchRisk(
-                    id=str(uuid.uuid4()),
-                    category="technical",
-                    description="Integration complexity with existing modules",
-                    severity="medium",
-                    mitigation="Incremental integration with testing",
-                )
-            ],
-        )
-        session["findings"] = findings.model_dump()
-
-        # Complete
-        await emit_research_progress(session_id, "complete", "Research complete", 1.0, client_id)
-        await emit_research_complete(session_id, findings, client_id)
-        session["status"] = "complete"
-
-    except asyncio.CancelledError:
-        logger.info("Research cancelled for session %s", session_id)
-        session["status"] = "cancelled"
-    except Exception as e:
-        logger.exception("Research failed for session %s", session_id)
-        await emit_research_error(session_id, str(e), "RESEARCH_ERROR", client_id)
-        session["status"] = "error"
+    hitl_events: Dict[str, asyncio.Event] = session.get("hitl_events", {})
+    # The orchestrator registers an event keyed by repo_id; we signal the latest one
+    for event_obj in hitl_events.values():
+        if not event_obj.is_set():
+            session["hitl_choice"] = data.choice
+            event_obj.set()
+            break
 
 
 async def handle_research_review_start(
@@ -371,6 +364,7 @@ _HANDLER_MAP: Dict[str, Any] = {
     "research.start": handle_research_start,
     "research.review.start": handle_research_review_start,
     "research.gap.answer": handle_research_gap_answer,
+    "research.hitl.response": handle_research_hitl_response,
 }
 
 

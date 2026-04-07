@@ -280,6 +280,7 @@ class PlanState(TypedDict):
     # Re-orchestration flags (set by CompositionReviewNode, consumed by PlanEngine).
     needs_re_orchestrate: NotRequired[bool]
     re_execute_task_ids: NotRequired[list[str]]
+    re_orchestration_count: NotRequired[int]
     session_id: NotRequired[str]
     workflow_status: Annotated[Literal["idle", "running", "paused", "completed", "error", "budget_exhausted", "rejected"], _workflow_status_reducer]
     error: NotRequired[Dict[str, Any]]
@@ -387,6 +388,7 @@ class AssemblySubgraphState(TypedDict):
     # Re-orchestration flags (set by CompositionReviewNode, consumed by PlanEngine).
     needs_re_orchestrate: NotRequired[bool]
     re_execute_task_ids: NotRequired[list[str]]
+    re_orchestration_count: NotRequired[int]
     session_id: NotRequired[str]
     workflow_status: Annotated[Literal["idle", "running", "paused", "completed", "error", "budget_exhausted", "rejected"], _workflow_status_reducer]
     paused_phase: NotRequired[str]

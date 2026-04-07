@@ -4,7 +4,9 @@ Provides endpoints for listing, retrieving, and deleting plan sessions
 so the frontend can show a session picker for browser-close resume.
 """
 
+import asyncio
 import hashlib
+import io
 import logging
 import re
 import uuid
@@ -50,17 +52,20 @@ def _get_repo(db: AsyncSession = Depends(get_db_session)) -> PlanSessionReposito
 
 @router.get("", response_model=PlanSessionListResponse)
 async def list_plan_sessions(
-    user_id: str = Query(..., description="User ID to filter sessions"),
+    user_id: str | None = Query(None, description="User ID to filter sessions (omit for all)"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     repo: PlanSessionRepository = Depends(_get_repo),
 ) -> PlanSessionListResponse:
-    """List plan sessions for a user, most recently updated first."""
-    sessions: list[PlanSession] = await repo.list_by_user(user_id, limit=limit, offset=offset)
-    # Count total for pagination
-    total_result = await repo._execute(
-        select(func.count(PlanSession.id)).where(PlanSession.user_id == user_id),
-    )
+    """List plan sessions, optionally filtered by user_id."""
+    if user_id:
+        sessions: list[PlanSession] = await repo.list_by_user(user_id, limit=limit, offset=offset)
+        total_result = await repo._execute(
+            select(func.count(PlanSession.id)).where(PlanSession.user_id == user_id),
+        )
+    else:
+        sessions = await repo.list_all(limit=limit, offset=offset)
+        total_result = await repo._execute(select(func.count(PlanSession.id)))
     total = total_result.scalar_one()
     return PlanSessionListResponse(
         sessions=[PlanSessionDetailResponse.model_validate(s) for s in sessions],
@@ -271,6 +276,23 @@ async def upload_plan_document(
         )
 
 
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    """Extract plain text from PDF bytes using pypdf.
+
+    Runs synchronously — callers should use ``run_in_executor`` to avoid
+    blocking the event loop.
+    """
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts: list[str] = []
+    for page in reader.pages:
+        text = page.extract_text()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
 async def _upload_plan_document_impl(
     session_id: str,
     file: UploadFile,
@@ -294,8 +316,33 @@ async def _upload_plan_document_impl(
             detail=f"File size exceeds maximum of {MAX_PLAN_FILE_SIZE // (1024 * 1024)}MB",
         )
 
-    # Compute SHA-256 hash for deduplication
+    # Compute SHA-256 hash for deduplication (always from original bytes)
     file_hash: str = hashlib.sha256(contents).hexdigest()
+
+    # Extract text from PDFs at upload time so downstream readers can use the content
+    effective_mime: str = file.content_type or "application/octet-stream"
+    filename_lower = (file.filename or "").lower()
+    if effective_mime == "application/pdf" or filename_lower.endswith(".pdf"):
+        try:
+            loop = asyncio.get_event_loop()
+            extracted = await loop.run_in_executor(None, _extract_pdf_text, contents)
+            if extracted.strip():
+                contents = extracted.encode("utf-8")
+                effective_mime = "text/plain"
+                logger.info(
+                    "PDF text extraction: %s → %d chars", file.filename, len(extracted)
+                )
+            else:
+                logger.warning(
+                    "PDF text extraction yielded no text for %s — storing original",
+                    file.filename,
+                )
+        except Exception as exc:
+            logger.warning(
+                "PDF text extraction failed for %s: %s — storing original",
+                file.filename,
+                exc,
+            )
 
     # Check for duplicate in this session (single JOIN query)
     doc_repo = DocumentRepository(db)
@@ -334,14 +381,14 @@ async def _upload_plan_document_impl(
     await storage.backend.store(
         path=storage_key,
         content=contents,
-        content_type=file.content_type or "application/octet-stream",
+        content_type=effective_mime,
     )
 
     # Create document record
     document = await doc_repo.create(
         storage_key=storage_key,
         original_filename=file.filename or "unnamed",
-        mime_type=file.content_type or "application/octet-stream",
+        mime_type=effective_mime,
         file_size=len(contents),
         file_hash=file_hash,
         document_type=document_type,

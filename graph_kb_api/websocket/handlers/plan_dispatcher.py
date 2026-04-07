@@ -991,6 +991,25 @@ class PlanDispatcher:
     ) -> bool:
         merged_state = cls._merge_runtime_state(state, result)
         workflow_status = merged_state.get("workflow_status")
+
+        # Re-emit plan.complete for already-completed sessions that have a document.
+        # This handles the "View" flow where the client reconnects after missing the
+        # original completion event (e.g. browser closed, navigated away).
+        if workflow_status == "completed" and cls._has_document_output(merged_state):
+            spec_document_url = cls._resolve_spec_document_url(merged_state)
+            manifest = merged_state.get("document_manifest")
+            await emit_complete(
+                session_id=session_id,
+                document_manifest=manifest if isinstance(manifest, dict) else None,
+                spec_document_url=spec_document_url,
+                client_id=client_id,
+            )
+            logger.info(
+                "Re-emitted plan.complete for already-completed session on resume/reconnect",
+                extra={"session_id": session_id, "workflow_id": workflow_id},
+            )
+            return True
+
         if workflow_status == "completed":
             return False
 
@@ -1605,13 +1624,34 @@ class PlanDispatcher:
             return False
 
         if persisted.user_id != client_id:
-            await self._emit_plan_error(
+            # client_id is an ephemeral WebSocket identity, not an authenticated
+            # user. Allow takeover on cold resume unless another connected client
+            # currently holds this session (concurrent-access protection).
+            active_holder = manager._session_to_client.get(session_id)
+            if active_holder and active_holder != client_id and active_holder in manager.active_connections:
+                await self._emit_plan_error(
+                    client_id,
+                    workflow_id,
+                    f"Plan session is owned by a different client: {session_id}",
+                    "SESSION_OWNER_MISMATCH",
+                )
+                return False
+            logger.info(
+                "plan._ensure_session_owner: allowing cold-resume takeover of %s by %s (prev owner %s inactive)",
+                session_id,
                 client_id,
-                workflow_id,
-                f"Plan session is owned by a different client: {session_id}",
-                "SESSION_OWNER_MISMATCH",
+                persisted.user_id,
             )
-            return False
+            # Update DB ownership and WebSocket routing so events reach the new client.
+            # Without this, _session_to_client still maps to the old client and subsequent
+            # ownership checks will re-evaluate the takeover on every call.
+            try:
+                async with get_session() as db:
+                    repo = PlanSessionRepository(db)
+                    await repo.update(session_id, user_id=client_id)
+            except Exception:
+                logger.warning("Failed to update session owner after cold-resume takeover", exc_info=True)
+            manager.register_session(session_id, client_id)
 
         return True
 
