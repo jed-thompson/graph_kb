@@ -293,6 +293,10 @@ class OrchestrateData(TypedDict, total=False):
     # Critique loop counter
     iteration_count: int  # Incremented by CritiqueNode per task
 
+    # DAG emission tracking
+    dag_emitted: bool  # True after emit_tasks_dag has been sent to the frontend
+    stalled_tasks: List[str]  # Task IDs that cannot proceed due to unmet dependencies
+
     # Overall status
     all_complete: bool
 
