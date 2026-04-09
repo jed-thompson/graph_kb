@@ -165,12 +165,12 @@ class PlanEngine(BaseWorkflowEngine):
     def _should_halt(state: dict) -> bool:
         """Check if workflow_status indicates the graph should stop.
 
-        Handles budget_exhausted, paused, rejected, and error statuses
-        that nodes return as NodeExecutionResult.success but which
-        should prevent further execution.
+        Handles paused, rejected, and error statuses that nodes return
+        as NodeExecutionResult.success but which should prevent further
+        execution.
         """
         status = state.get("workflow_status", "running")
-        return status in ("budget_exhausted", "paused", "rejected", "error")
+        return status in ("paused", "rejected", "error")
 
     @staticmethod
     def _route_after_context(state: dict) -> str:
@@ -486,6 +486,26 @@ class PlanEngine(BaseWorkflowEngine):
         if "assembly" in cleared_phases:
             update["needs_re_orchestrate"] = False
             update["re_execute_task_ids"] = []
+
+            # Reset manifest entry statuses so GenerateNode and AssembleNode
+            # re-process them instead of skipping "final" entries.
+            state = await self.get_workflow_state(config)
+            if state:
+                manifest = state.get("document_manifest")
+                if manifest and manifest.get("entries"):
+                    reset_entries = [
+                        {**e, "status": "reviewed", "composed_at": None}
+                        if e.get("status") == "final"
+                        else e
+                        for e in manifest["entries"]
+                    ]
+                    update["document_manifest"] = {**manifest, "entries": reset_entries}
+
+                # Clear the assembled spec artifact so AssembleNode re-runs LLM assembly
+                artifacts = dict(state.get("artifacts", {}))
+                if "output.spec" in artifacts:
+                    artifacts.pop("output.spec")
+                    update["artifacts"] = artifacts
 
         logger.info(
             "PlanEngine.navigate_to_phase: selective cascade",

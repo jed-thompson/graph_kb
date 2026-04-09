@@ -427,12 +427,31 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
               const meta = existingMsg.metadata.planPanel as Record<string, unknown>;
               const _rawPhases = existingMsg.metadata?.planPhases as Record<string, { status: string; data?: Record<string, unknown>; result?: Record<string, unknown> }> | undefined;
               const existingPhases = _rawPhases && Object.keys(_rawPhases).length > 0 ? { ..._rawPhases } : buildDefaultPlanPhases();
-              existingPhases[phase] = { ...existingPhases[phase], status: 'in_progress' };
-              const steps = [...((meta.thinkingSteps as Array<unknown>) || []), { timestamp: Date.now(), phase, message: `Starting ${phase} phase` }];
+              // Clear phase data (prompt/approval form) so the UI transitions
+              // from the approval form to the progress/thinking-steps view.
+              // This is critical for revision loops where the phase re-enters
+              // after the user clicked "Request Revisions".
+              // Preserve context_items from the old phase data so the context
+              // panel survives phase re-entry.
+              const oldPhaseData = existingPhases[phase]?.data as Record<string, unknown> | undefined;
+              const preservedContextItems = oldPhaseData?.context_items;
+              existingPhases[phase] = preservedContextItems
+                ? { status: 'in_progress', data: { context_items: preservedContextItems } }
+                : { status: 'in_progress' };
+              const steps = [{ timestamp: Date.now(), phase, message: `Starting ${phase} phase` }];
               chatState.updateMessage(panelMsgId, {
                 metadata: {
                   ...existingMsg.metadata,
-                  planPanel: { ...meta, currentPhase: phase, phases: existingPhases, agentContent: undefined, thinkingSteps: steps },
+                  planPanel: {
+                    ...meta,
+                    currentPhase: phase,
+                    phases: existingPhases,
+                    agentContent: undefined,
+                    thinkingSteps: steps,
+                    // Explicitly preserve context items and artifacts at panel level
+                    planContextItems: meta.planContextItems ?? null,
+                    planArtifacts: meta.planArtifacts ?? undefined,
+                  },
                   planCurrentPhase: phase,
                   planPhases: existingPhases,
                   timestamp: new Date(),

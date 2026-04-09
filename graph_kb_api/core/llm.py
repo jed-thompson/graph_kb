@@ -32,11 +32,19 @@ MAX_RETRIES: int = 3
 INITIAL_BACKOFF_SECONDS: float = 1.0
 BACKOFF_MULTIPLIER: float = 2.0
 
+# Error codes from OpenAI that should NOT be retried
+_NON_RETRYABLE_CODES = {"insufficient_quota", "invalid_api_key", "account_deactivated"}
+
 RETRIEVAL_ONLY_DISCLAIMER = (
     "⚠️ The LLM service is currently unavailable. "
     "The following answer is based solely on code retrieval results "
     "and has not been processed by the language model."
 )
+
+
+class LLMQuotaExhaustedError(Exception):
+    """Raised when the LLM provider returns a non-retryable billing/quota error."""
+    pass
 
 
 class LLMService(BaseChatModel):
@@ -275,6 +283,14 @@ class LLMService(BaseChatModel):
                 generation = ChatGeneration(message=cast(BaseMessage, response))
                 return ChatResult(generations=[generation])
             except Exception as exc:
+                # Detect non-retryable billing/quota errors and fail immediately
+                if self._is_quota_error(exc):
+                    logger.error("LLM quota exhausted (not retryable): %s", exc)
+                    raise LLMQuotaExhaustedError(
+                        "LLM API quota exhausted. Please check your billing and plan details "
+                        "at https://platform.openai.com/account/billing"
+                    ) from exc
+
                 last_error = exc
                 logger.warning(
                     "Async LLM call attempt %d/%d failed: %s",
@@ -288,6 +304,22 @@ class LLMService(BaseChatModel):
 
         logger.error("Async LLM call failed after %d retries: %s", MAX_RETRIES, last_error)
         raise last_error  # type: ignore[misc]
+
+    @staticmethod
+    def _is_quota_error(exc: Exception) -> bool:
+        """Check if an exception is a non-retryable quota/billing error."""
+        # OpenAI RateLimitError with insufficient_quota code
+        exc_str = str(exc)
+        for code in _NON_RETRYABLE_CODES:
+            if code in exc_str:
+                return True
+        # Also check the error attribute if it's an OpenAI error object
+        error_body = getattr(exc, "body", None)
+        if isinstance(error_body, dict):
+            error_code = error_body.get("error", {}).get("code", "")
+            if error_code in _NON_RETRYABLE_CODES:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Convenience methods (backwards compatibility)

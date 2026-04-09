@@ -55,6 +55,28 @@ from graph_kb_api.websocket.plan_events import emit_complete, emit_error, emit_p
 logger = logging.getLogger(__name__)
 
 
+def _unwrap_json_document(content: str) -> str:
+    """Extract markdown from a JSON wrapper if the LLM returned JSON instead of raw markdown.
+
+    Some LLMs wrap the assembled document in a JSON object like:
+    {"assembled_document": "# Title...", "sections_included": [...], ...}
+
+    This detects that pattern and extracts just the markdown content.
+    """
+    if not isinstance(content, str) or not content.strip().startswith("{"):
+        return content
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict) and "assembled_document" in parsed:
+            doc = parsed["assembled_document"]
+            if isinstance(doc, str) and len(doc) > 50:
+                logger.info("_unwrap_json_document: extracted assembled_document from JSON wrapper")
+                return doc
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return content
+
+
 class CompletenessNode(SubgraphAwareNode[AssemblySubgraphState]):
     """Checks completeness of generated content before assembly.
 
@@ -852,8 +874,111 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         # Multi-document path (Step 18)
         if manifest and manifest.get("entries"):
-            composed_url = ""
+            # Hydrate deliverable sections from blob storage for LLM assembly
+            hydrated_sections: Dict[str, str] = {}
             if artifact_svc:
+                seen_sections: set[str] = set()
+                for entry in manifest.get("entries", []):
+                    if entry.get("status") in ("failed", "error"):
+                        continue
+                    ref: ArtifactRef | None = entry.get("artifact_ref")
+                    if not ref:
+                        continue
+                    section_key = entry.get("spec_section", entry.get("task_id", ""))
+                    # Deduplicate: skip if we already have this section
+                    if section_key in seen_sections:
+                        continue
+                    seen_sections.add(section_key)
+                    try:
+                        content = await artifact_svc.retrieve(ref)
+                        if content:
+                            # Strip YAML frontmatter from deliverable content
+                            content = self._strip_frontmatter(content)
+                            hydrated_sections[section_key] = content
+                    except Exception as e:
+                        logger.warning("AssembleNode: failed to hydrate %s: %s", entry.get("task_id"), e)
+
+            # Run LLM assembly to produce a single cohesive document
+            workflow_context: WorkflowContext | None = configurable.get("context")
+            assembled_document = ""
+            flow_score = 0.5
+
+            if hydrated_sections and workflow_context:
+                try:
+                    BudgetGuard.check(budget)
+                    agent = DocumentAssemblyAgent()
+                    agent_task: AgentTask = {
+                        "description": f"Assemble document: {spec_name}",
+                        "task_id": f"assembly_{session_id}_{uuid.uuid4().hex[:8]}",
+                        "context": {
+                            "sections": hydrated_sections,
+                            "spec_name": spec_name,
+                            "user_explanation": context.get("user_explanation", ""),
+                            "constraints": context.get("constraints", {}),
+                            "research_summary": research.get("findings", {}).get("summary", ""),
+                            "key_insights": research.get("findings", {}).get("key_insights", []),
+                        },
+                    }
+                    try:
+                        await emit_phase_progress(
+                            session_id=session_id,
+                            phase="assembly",
+                            step="assemble",
+                            message="Running LLM assembly to produce final document...",
+                            progress_pct=0.75,
+                            client_id=client_id,
+                        )
+                    except Exception:
+                        pass
+
+                    result: AgentResult = await agent.execute(
+                        task=agent_task,
+                        state=cast("UnifiedSpecState", {}),
+                        workflow_context=workflow_context,
+                    )
+                    output_data = result.get("output", {})
+                    if isinstance(output_data, dict):
+                        assembled_document = output_data.get("assembled_document", "")
+                        flow_score = output_data.get("flow_score", 0.5)
+                    else:
+                        assembled_document = result.get("assembled_document", "")
+                        flow_score = result.get("flow_score", 0.5)
+
+                    # Safety: if assembled_document is a JSON wrapper, extract the markdown
+                    assembled_document = _unwrap_json_document(assembled_document)
+                    llm_calls = 1
+                    tokens_used = get_token_estimator().count_tokens(assembled_document) if assembled_document else 0
+                    logger.info("AssembleNode: LLM assembly completed with flow_score=%.2f", flow_score)
+                except Exception as e:
+                    logger.warning("AssembleNode: LLM assembly failed, falling back to concatenation: %s", e)
+                    # Fallback: concatenate sections
+                    parts = [f"# {spec_name}\n"]
+                    for section_name, content in hydrated_sections.items():
+                        parts.append(f"## {section_name}\n\n{content}")
+                    assembled_document = "\n\n".join(parts)
+
+            if not assembled_document and hydrated_sections:
+                # Fallback if no workflow_context
+                parts = [f"# {spec_name}\n"]
+                for section_name, content in hydrated_sections.items():
+                    parts.append(f"## {section_name}\n\n{content}")
+                assembled_document = "\n\n".join(parts)
+
+            spec_document_path = ""
+            if artifact_svc:
+                # Store assembled document
+                if assembled_document:
+                    spec_ref = await artifact_svc.store(
+                        "output",
+                        "spec.md",
+                        assembled_document,
+                        f"Assembled specification for {spec_name}",
+                        content_type="text/markdown",
+                    )
+                    artifacts_output["output.spec"] = spec_ref
+                    spec_document_path = spec_ref.get("key", "") if isinstance(spec_ref, dict) else ""
+
+                # Store index and manifest
                 composed_index = self._build_composed_index(manifest, spec_name, sections)
                 index_ref = await artifact_svc.store(
                     "output",
@@ -862,7 +987,6 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                     f"Composed document index for {spec_name}",
                 )
                 artifacts_output["output.index"] = index_ref
-                composed_url = index_ref.get("key", "") if isinstance(index_ref, dict) else ""
 
                 manifest = {**manifest, "composed_index_ref": index_ref}
                 manifest_output = {"document_manifest": manifest}
@@ -873,11 +997,14 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                     json.dumps(manifest, indent=2, default=str),
                     f"Document manifest for {spec_name}",
                 )
-            await _persist_assembly_completion_to_db(session_id, composed_url)
+
+            new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+            await _persist_assembly_completion_to_db(session_id, spec_document_path)
             return NodeExecutionResult.success(
                 output={
-                    "generate": {**generate_data, "flow_score": 1.0},
+                    "generate": {**generate_data, "spec_document_path": spec_document_path, "flow_score": flow_score},
                     "artifacts": artifacts_output,
+                    "budget": new_budget,
                     **manifest_output,
                 }
             )
@@ -908,8 +1035,16 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
             task=agent_task, state=cast("UnifiedSpecState", {}), workflow_context=workflow_context
         )
 
-        document = result.get("assembled_document", "")
-        flow_score = result.get("flow_score", 0.5)
+        output_data = result.get("output", {})
+        if isinstance(output_data, dict):
+            document = output_data.get("assembled_document", "")
+            flow_score = output_data.get("flow_score", 0.5)
+        else:
+            document = result.get("assembled_document", "")
+            flow_score = result.get("flow_score", 0.5)
+
+        # Safety: if document is a JSON wrapper, extract the markdown
+        document = _unwrap_json_document(document)
         llm_calls = 1
         tokens_used: int = get_token_estimator().count_tokens(document) if document else 0
 
@@ -921,6 +1056,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                 "spec.md",
                 document,
                 f"Specification for {spec_name}",
+                content_type="text/markdown",
             )
             artifacts_output["output.spec"] = ref
             spec_document_path = ref.key if hasattr(ref, "key") else "output/spec.md"
@@ -976,6 +1112,34 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                 )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _strip_frontmatter(content: str) -> str:
+        """Strip YAML frontmatter blocks from deliverable content.
+
+        Deliverables from the orchestrate phase often contain metadata
+        blocks like:
+            ---
+            task_id: ...
+            status: reviewed
+            ---
+        These confuse the LLM assembly agent. This method removes them
+        while preserving the actual document content.
+        """
+        # Match YAML frontmatter at the start of content or after a heading
+        stripped = re.sub(
+            r"^---\s*\n(?:[\w_]+:.*\n)*---\s*\n",
+            "",
+            content,
+            flags=re.MULTILINE,
+        )
+        # Also strip frontmatter that appears mid-document (after ## heading)
+        stripped = re.sub(
+            r"\n---\s*\n(?:[\w_]+:.*\n)*---\s*\n",
+            "\n",
+            stripped,
+        )
+        return stripped.strip()
 
 
 class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
@@ -1298,6 +1462,21 @@ class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
                 pass  # fire-and-forget
         elif decision == "revise":
             output["completeness"]["needs_revision"] = True
+            # Reset manifest entry statuses so GenerateNode and AssembleNode
+            # re-process them on the revise loop instead of skipping.
+            manifest: DocumentManifest | None = state.get("document_manifest")
+            if manifest and manifest.get("entries"):
+                reset_entries = [
+                    {**e, "status": "reviewed", "composed_at": None}
+                    if e.get("status") == "final"
+                    else e
+                    for e in manifest["entries"]
+                ]
+                output["document_manifest"] = {**manifest, "entries": reset_entries}
+            # Clear the assembled spec artifact ref so AssembleNode re-runs LLM assembly
+            existing_artifacts: Dict[str, ArtifactRef] = dict(state.get("artifacts", {}))
+            existing_artifacts.pop("output.spec", None)
+            output["artifacts"] = existing_artifacts
         elif decision == "reject":
             output["completeness"]["rejected"] = True
             output["workflow_status"] = "rejected"
@@ -1330,51 +1509,15 @@ class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
         max_preview_tokens = 40_000
         estimator = get_token_estimator()
 
-        # Multi-document manifest path
-        if manifest and manifest.get("entries") and artifact_svc:
-            parts: list[str] = []
-            tokens_used = 0
-            spec_name = manifest.get("spec_name", "Document")
-            parts.append(f"# {spec_name}\n")
-
-            for entry in manifest.get("entries", []):
-                if entry.get("status") in ("failed", "error"):
-                    section = entry.get("spec_section", entry.get("task_id", ""))
-                    err = entry.get("error_message", "Generation failed")
-                    parts.append(f"## {section}\n\n*Section failed: {err}*\n")
-                    continue
-
-                ref: ArtifactRef | None = entry.get("artifact_ref")
-                if not ref:
-                    continue
-
-                section_heading = entry.get("spec_section", entry.get("task_id", "Section"))
-                try:
-                    content = await artifact_svc.retrieve(ref)
-                    if content:
-                        content_tokens = estimator.count_tokens(content)
-                        remaining = max_preview_tokens - tokens_used
-                        if remaining <= 0:
-                            parts.append(f"## {section_heading}\n\n*[Content truncated — budget exceeded]*\n")
-                            continue
-                        if content_tokens > remaining:
-                            content = truncate_to_tokens(content, remaining)
-                            content += "\n\n*[Section truncated for preview]*"
-                        parts.append(f"## {section_heading}\n\n{content}\n")
-                        tokens_used += min(content_tokens, remaining)
-                except Exception as e:
-                    logger.warning("AssemblyApprovalNode: failed to hydrate %s: %s", entry.get("task_id"), e)
-                    parts.append(f"## {section_heading}\n\n*[Could not load content]*\n")
-
-            return "\n".join(parts) if len(parts) > 1 else ""
-
-        # Legacy single-document path: load the final assembled doc from artifacts
+        # Primary: load the LLM-assembled document from output.spec (both paths store it)
         if artifact_svc and artifacts:
             spec_ref: ArtifactRef | None = artifacts.get("output.spec")
             if spec_ref:
                 try:
                     assembled = await artifact_svc.retrieve(spec_ref)
                     if assembled:
+                        # Unwrap JSON wrapper if the stored content is a JSON envelope
+                        assembled = _unwrap_json_document(assembled)
                         if estimator.count_tokens(assembled) > max_preview_tokens:
                             assembled = truncate_to_tokens(assembled, max_preview_tokens)
                             assembled += "\n\n*[Document truncated for preview]*"

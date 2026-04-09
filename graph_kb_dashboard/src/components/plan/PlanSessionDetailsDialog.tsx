@@ -14,6 +14,8 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { ContextItemsPanel, type ContextItems } from '@/components/plan/shared/ContextItemsPanel';
 import { GeneratedArtifactsPanel } from '@/components/plan/shared/GeneratedArtifactsPanel';
+import { PlanDocumentDownload } from '@/components/plan/PlanDocumentDownload';
+import type { DocumentManifestEntry } from '@/lib/store/planStore';
 import { getPlanSession, type PlanSessionDetail, type PlanSessionSummary } from '@/lib/api/planSessions';
 import { listPlanArtifacts } from '@/lib/api/planArtifacts';
 import type { PlanArtifactManifestEntry } from '@shared/websocket-events';
@@ -116,6 +118,24 @@ export function PlanSessionDetailsDialog({
     [artifacts],
   );
 
+  // Build manifest entries from deliverable artifacts for PlanDocumentDownload
+  const deliverableEntries: DocumentManifestEntry[] = useMemo(() => {
+    return artifacts
+      .filter((a) => a.key.startsWith('deliverables/'))
+      .map((a) => {
+        const parts = a.key.split('/');
+        const taskId = parts[1] || a.key;
+        return {
+          taskId,
+          specSection: a.summary || taskId,
+          filename: `${a.summary || taskId}.md`,
+          status: 'final' as const,
+          tokenCount: a.size_bytes ? Math.round(a.size_bytes / 4) : 0,
+          downloadUrl: a.key,
+        };
+      });
+  }, [artifacts]);
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] max-w-5xl overflow-y-auto">
@@ -166,6 +186,15 @@ export function PlanSessionDetailsDialog({
                 ) : null}
               </div>
             </div>
+
+            {/* Document download for completed sessions */}
+            {!loading && resolvedSession.workflow_status === 'completed' && deliverableEntries.length > 0 && (
+              <PlanDocumentDownload
+                sessionId={resolvedSession.id}
+                manifestEntries={deliverableEntries}
+                specName={resolvedSession.name ?? undefined}
+              />
+            )}
 
             {loading ? (
               <div className="flex items-center justify-center py-16 text-muted-foreground">

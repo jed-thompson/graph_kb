@@ -171,6 +171,27 @@ class TaskSelectorNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         self.step_progress = 0.05
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
+        # Lazily initialize document_manifest if not yet created.
+        # (Previously done in BudgetCheckNode which has been removed.)
+        manifest_init: Dict[str, Any] = {}
+        if state.get("document_manifest") is None:
+            from datetime import UTC, datetime
+
+            from graph_kb_api.flows.v3.state.plan_state import DocumentManifest
+
+            context = state.get("context", {})
+            manifest_init["document_manifest"] = DocumentManifest(
+                session_id=state.get("session_id", ""),
+                spec_name=context.get("spec_name", "Untitled"),
+                primary_spec_ref=None,
+                entries=[],
+                composed_index_ref=None,
+                total_documents=0,
+                total_tokens=0,
+                created_at=datetime.now(UTC).isoformat(),
+                finalized_at=None,
+            )
+
         planning: PlanData = state.get("plan", {})
         orchestrate: OrchestrateData = state.get("orchestrate", {})
 
@@ -256,7 +277,7 @@ class TaskSelectorNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             except Exception as e:
                 logger.warning(f"TaskSelectorNode emit_tasks_dag failed: {e}")
 
-        return NodeExecutionResult.success(output=output)
+        return NodeExecutionResult.success(output={**manifest_init, **output})
 
 
 class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
@@ -1028,6 +1049,34 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         cls = getattr(mod, class_name)
         return cls()
 
+    @staticmethod
+    def _extract_string_content(raw_output: Any, full_result: Dict[str, Any]) -> str:
+        """Extract a markdown string from agent output.
+
+        Agents may return a plain string, or a dict with the real content
+        nested under varying keys.  This method walks the value looking for
+        the longest string — which is almost always the drafted document.
+        Falls back to JSON serialization only when no string is found.
+        """
+        if isinstance(raw_output, str) and raw_output:
+            return raw_output
+
+        if isinstance(raw_output, dict):
+            # Try well-known keys first
+            for key in ("assembled_document", "draft", "content", "summary", "document", "text", "output"):
+                val = raw_output.get(key)
+                if isinstance(val, str) and len(val) > 50:
+                    return val
+            # Fallback: pick the longest string value in the dict
+            best = ""
+            for val in raw_output.values():
+                if isinstance(val, str) and len(val) > len(best):
+                    best = val
+            if best:
+                return best
+
+        return json.dumps(full_result, indent=2, default=str)
+
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
         artifact_svc: ArtifactService | None = configurable.get("artifact_service")
@@ -1134,13 +1183,15 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             agent = self._resolve_agent(agent_type)
             result = await agent.execute(task=agent_task, state=agent_state, workflow_context=workflow_context)
 
-            # Agents return different keys — normalize to a string draft
-            output_content = (
+            # Agents return different keys — normalize to a string draft.
+            # Some agents return {"output": {"assembled_document": "...", ...}}
+            # so we must unwrap dicts to extract the actual markdown content.
+            raw_output = (
                 result.get("agent_draft")
                 or result.get("output")
                 or result.get("research_findings", {}).get("summary", "")
-                or json.dumps(result, indent=2, default=str)
             )
+            output_content = self._extract_string_content(raw_output, result)
         except Exception as e:
             logger.warning(f"WorkerNode agent dispatch failed for {task_id} (agent_type={agent_type}): {e}")
             task_status = "failed"

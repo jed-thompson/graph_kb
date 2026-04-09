@@ -167,6 +167,7 @@ export function BasePhaseContent({
     }
 
     // Optimistic processing state after form submission
+    // Must come before promptData check so revision loops show progress
     if (isSubmitting) {
         return (
             <div className="w-full min-w-0 space-y-4">
@@ -226,17 +227,23 @@ export function BasePhaseContent({
                         onSubmit={onSubmit}
                     />
                 ) : promptData.type === 'approval' ? (
-                    <PhaseApprovalForm
-                        phase={phase}
-                        title={phaseInfo.title}
-                        description={phaseInfo.description}
-                        summary={promptData.summary}
-                        options={promptData.options}
-                        message={promptData.message}
-                        tasks={promptData.tasks}
-                        onSubmit={onSubmit}
-                        sessionId={sessionId}
-                    />
+                    <>
+                        <PhaseApprovalForm
+                            phase={phase}
+                            title={phaseInfo.title}
+                            description={phaseInfo.description}
+                            summary={promptData.summary}
+                            options={promptData.options}
+                            message={promptData.message}
+                            tasks={promptData.tasks}
+                            onSubmit={onSubmit}
+                            sessionId={sessionId}
+                            onNavigateToPhase={onNavigateToPhase}
+                        />
+                        {thinkingSteps && thinkingSteps.length > 0 && (
+                            <ThinkingStepsPanel steps={thinkingSteps} />
+                        )}
+                    </>
                 ) : (promptData as Record<string, unknown>).type === 'task_context_input' ? (
                     <TaskContextInputForm
                         taskName={(promptData as Record<string, unknown>).task_name as string | undefined}

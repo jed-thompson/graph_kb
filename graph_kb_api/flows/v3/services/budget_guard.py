@@ -81,25 +81,15 @@ class BudgetGuard:
 
     @staticmethod
     def check(budget: BudgetState) -> None:
-        """Raise ``BudgetExhaustedError`` if any limit is exceeded.
+        """No-op — budget enforcement disabled.
 
-        Checks remaining LLM calls, token usage, and wall-clock time.
-        Returns ``None`` without mutation when all limits have capacity.
-        Skips checks for fields that are absent from a partial BudgetState.
+        Previously raised ``BudgetExhaustedError`` when limits were exceeded.
+        Disabled because the HITL interrupt/resume cycle for budget exhaustion
+        cannot reliably recover after cold restarts (subgraph checkpointer is
+        in-memory only).  Budget tracking (decrement/tokens_used) still works;
+        only enforcement is removed.
         """
-        if budget.get("remaining_llm_calls", BudgetGuard._NO_LIMIT) <= 0:
-            raise BudgetExhaustedError("LLM call limit reached")
-        max_tokens = budget.get("max_tokens")
-        tokens_used = budget.get("tokens_used", 0)
-        if max_tokens is not None and tokens_used >= max_tokens:
-            raise BudgetExhaustedError("Token limit reached")
-        started_at = budget.get("started_at")
-        max_wall = budget.get("max_wall_clock_s")
-        if started_at and max_wall is not None:
-            start = datetime.fromisoformat(started_at)
-            elapsed = (datetime.now(UTC) - start).total_seconds()
-            if elapsed >= max_wall:
-                raise BudgetExhaustedError("Wall-clock limit reached")
+        return
 
     @staticmethod
     def decrement(

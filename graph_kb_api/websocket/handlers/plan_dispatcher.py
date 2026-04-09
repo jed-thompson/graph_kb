@@ -2114,6 +2114,7 @@ class PlanDispatcher:
                 return
 
         decision = (validated.data or {}).get("decision")
+
         allowed_option_ids = self._get_interrupt_option_ids(current_interrupt)
         if isinstance(decision, str) and allowed_option_ids and decision not in allowed_option_ids:
             logger.warning(
@@ -2510,8 +2511,32 @@ class PlanDispatcher:
             # Use restart_from_phase which updates state with Command(goto=...)
             # then invokes the graph from the target phase — not from the
             # previous interrupt point (which was the old broken behavior).
-            result = await engine.restart_from_phase(target_phase, config)
-            session["running_task"] = None
+            # Inject user feedback into state so assembly nodes can use it.
+            if validated.feedback or validated.context_file_id:
+                feedback_update: dict[str, Any] = {}
+                existing_completeness = state.get("completeness", {})
+                completeness_patch = {**existing_completeness}
+                if validated.feedback:
+                    completeness_patch["approval_feedback"] = validated.feedback
+                if validated.context_file_id:
+                    completeness_patch["context_file_id"] = validated.context_file_id
+                feedback_update["completeness"] = completeness_patch
+                # Also store in context for the assembly agent to pick up
+                existing_context = state.get("context", {})
+                if validated.feedback:
+                    prev = existing_context.get("user_explanation", "")
+                    revision_note = f"\n\n[Revision feedback]: {validated.feedback}"
+                    feedback_update["context"] = {
+                        **existing_context,
+                        "user_explanation": (prev + revision_note) if prev else validated.feedback,
+                    }
+                await engine.workflow.aupdate_state(config, feedback_update)
+
+            session["running_task"] = asyncio.current_task()
+            try:
+                result = await engine.restart_from_phase(target_phase, config)
+            finally:
+                session["running_task"] = None
             idata = await self._extract_interrupt_from_state(engine, config)
             if idata:
                 idata.setdefault("session_id", validated.session_id)
@@ -2893,8 +2918,25 @@ class PlanDispatcher:
                         "workflow_status": workflow_status,
                     },
                 )
+
+                # Emit plan.phase.enter so the frontend transitions from
+                # "Resuming plan session..." to the active phase UI with
+                # a spinner/thinking-steps panel while the subgraph runs.
                 try:
+                    from graph_kb_api.websocket.plan_events import emit_phase_enter
+                    await emit_phase_enter(
+                        session_id=validated.session_id,
+                        phase=recovery_phase,
+                        expected_steps=1,
+                        client_id=client_id,
+                    )
+                except Exception:
+                    pass  # fire-and-forget
+
+                try:
+                    session["running_task"] = asyncio.current_task()
                     result = await engine.restart_from_phase(recovery_phase, config)
+                    session["running_task"] = None
                     await self._persist_runtime_snapshot(
                         validated.session_id,
                         session.get("thread_id", f"plan-{validated.session_id}"),
@@ -2945,6 +2987,7 @@ class PlanDispatcher:
                     )
                     return
                 except Exception as e:
+                    session["running_task"] = None
                     logger.error(f"Plan resume recovery failed: {e}", exc_info=True)
                     await self._emit_plan_error(
                         client_id,
@@ -3367,9 +3410,97 @@ class PlanDispatcher:
             )
 
             # Re-emit the current interrupt prompt if the workflow is paused
-            if idata:
-                idata.setdefault("session_id", validated.session_id)
-                await self._emit_phase_prompt(client_id, workflow_id, idata)
+            # and not actively running (e.g. a revision in progress).
+            # Skip if: a task is running, or the interrupt's phase doesn't match
+            # the current workflow phase (stale interrupt from a previous phase).
+            is_running = session.get("running_task") is not None
+            prompt_emitted = False
+            if idata and not is_running:
+                interrupt_phase = idata.get("phase")
+                if interrupt_phase and current_phase and interrupt_phase != current_phase:
+                    logger.info(
+                        "handle_reconnect: skipping stale interrupt from phase=%s (current=%s)",
+                        interrupt_phase,
+                        current_phase,
+                    )
+                else:
+                    idata.setdefault("session_id", validated.session_id)
+                    await self._emit_phase_prompt(client_id, workflow_id, idata)
+                    prompt_emitted = True
+
+            # No valid interrupt was emitted, no running task, non-terminal status —
+            # the workflow was likely killed mid-execution (server restart, OOM, etc.).
+            # Auto-restart from the first incomplete phase so the user doesn't
+            # have to manually click Resume.
+            if (
+                not prompt_emitted
+                and not is_running
+                and not self._is_terminal_status(workflow_status)
+                and workflow_status not in ("budget_exhausted", "paused")
+            ):
+                recovery_phase = self._resolve_current_phase(effective_state)
+                logger.warning(
+                    "handle_reconnect: stale non-terminal state with no valid interrupt "
+                    "and no running task; auto-restarting from '%s'",
+                    recovery_phase,
+                    extra={
+                        "session_id": validated.session_id,
+                        "workflow_status": workflow_status,
+                    },
+                )
+                try:
+                    from graph_kb_api.websocket.plan_events import emit_phase_enter
+                    await emit_phase_enter(
+                        session_id=validated.session_id,
+                        phase=recovery_phase,
+                        expected_steps=1,
+                        client_id=client_id,
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    session["running_task"] = asyncio.current_task()
+                    result = await engine.restart_from_phase(recovery_phase, config)
+                    session["running_task"] = None
+                    await self._persist_runtime_snapshot(
+                        validated.session_id,
+                        session.get("thread_id", f"plan-{validated.session_id}"),
+                        session.get("user_id", client_id),
+                        engine,
+                        config,
+                        fallback_phase=recovery_phase,
+                        result=result,
+                    )
+                    if await self._check_and_emit_error(
+                        result, client_id, workflow_id, validated.session_id,
+                    ):
+                        return
+                    recovered_interrupt = await self._extract_interrupt_from_state(engine, config)
+                    if recovered_interrupt:
+                        recovered_interrupt.setdefault("session_id", validated.session_id)
+                        await self._emit_phase_prompt(client_id, workflow_id, recovered_interrupt)
+                        return
+                    if await self._recover_stale_terminal_completion(
+                        session_id=validated.session_id,
+                        thread_id=session.get("thread_id", f"plan-{validated.session_id}"),
+                        user_id=session.get("user_id", client_id),
+                        client_id=client_id,
+                        workflow_id=workflow_id,
+                        engine=engine,
+                        config=config,
+                        state=await engine.get_workflow_state(config),
+                        result=result,
+                    ):
+                        return
+                except Exception as e:
+                    session["running_task"] = None
+                    logger.error(f"handle_reconnect: auto-restart failed: {e}", exc_info=True)
+                    await self._emit_plan_error(
+                        client_id, workflow_id,
+                        f"Failed to auto-restart plan session: {e}",
+                        "ENGINE_ERROR",
+                    )
         except Exception as e:
             logger.error(f"Plan reconnect failed: {e}", exc_info=True)
             await self._emit_plan_error(

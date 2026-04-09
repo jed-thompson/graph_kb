@@ -564,6 +564,20 @@ export const Message = memo(function Message({ message, isStreaming }: MessagePr
         ?? null;
       const planSessionId = (message.metadata?.planPanel as Record<string, unknown> | undefined)?.sessionId as string | undefined;
 
+      const handleRequestRevisions = planSessionId ? () => {
+        const socket = getWebSocket();
+        if (socket) {
+          socket.send({
+            type: 'plan.navigate',
+            payload: {
+              session_id: planSessionId,
+              target_phase: 'assembly',
+              confirm_cascade: true,
+            },
+          });
+        }
+      } : undefined;
+
       if (manifestPayload) {
         // New format: documentManifest with entries array
         const manifest = manifestPayload as Record<string, unknown>;
@@ -575,6 +589,7 @@ export const Message = memo(function Message({ message, isStreaming }: MessagePr
               manifestEntries={entries}
               composedIndexUrl={manifest.composedIndexUrl as string | undefined}
               specName={manifest.specName as string | undefined}
+              onRequestRevisions={handleRequestRevisions}
             />
           );
         }
@@ -585,6 +600,7 @@ export const Message = memo(function Message({ message, isStreaming }: MessagePr
             <PlanDocumentDownload
               sessionId={planSessionId}
               specDocumentUrl={specUrl}
+              onRequestRevisions={handleRequestRevisions}
             />
           );
         }

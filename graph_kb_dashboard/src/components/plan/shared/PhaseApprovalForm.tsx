@@ -7,19 +7,27 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
 import { Textarea } from '@/components/ui/textarea';
-import { Loader2, ChevronDown, ChevronUp, Upload, X, FileText, MessageSquarePlus, AlertTriangle, Coins, Eye } from 'lucide-react';
+import { Loader2, ChevronDown, ChevronUp, Upload, X, FileText, MessageSquarePlus, AlertTriangle, Coins, Eye, CheckCircle2, XCircle } from 'lucide-react';
 import type { PlanPhaseId, DocumentManifestEntry } from '@/lib/store/planStore';
 import { useFileUpload, ACCEPTED_EXTENSIONS } from '@/hooks/useFileUpload';
+import { getWebSocket } from '@/lib/api/websocket';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
 import { PlanDocumentDownload } from '../PlanDocumentDownload';
 import { ResultValueRenderer } from './ResultValueRenderer';
 import { TaskListRenderer } from './TaskListRenderer';
 import { cleanAIText } from '@/lib/utils/cleanAIText';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import type { TaskItem } from '../PlanContext';
 import type { ItemFeedback } from './ArchitectureFeedbackItem';
 
-/** Summary keys to hide from the rendered display. */
-const HIDDEN_SUMMARY_KEYS = new Set(['evaluation_method', 'budget_exhausted', 'remaining_llm_calls', 'tokens_used', 'max_llm_calls', 'max_tokens', 'reason', 'document_preview', 'manifest_entries']);
+/** Summary keys to hide from the generic key-value display. */
+const HIDDEN_SUMMARY_KEYS = new Set([
+    'evaluation_method', 'budget_exhausted', 'remaining_llm_calls', 'tokens_used',
+    'max_llm_calls', 'max_tokens', 'reason', 'document_preview', 'manifest_entries',
+    // Rendered by dedicated components instead of raw key-value
+    'errors', 'warnings', 'errors_count', 'warnings_count',
+    'spec_document_path', 'is_valid',
+]);
 
 interface BudgetSummary {
     budget_exhausted: boolean;
@@ -43,9 +51,11 @@ export interface PhaseApprovalFormProps {
     initialDismissedGaps?: Set<string>;
     /** Plan session ID for artifact downloads. */
     sessionId?: string | null;
+    /** Callback to navigate to a phase (used for assembly revise via plan.navigate). */
+    onNavigateToPhase?: (targetPhase: string) => void;
 }
 
-export function PhaseApprovalForm({ phase, title, description, summary, options, message, tasks, onSubmit, initialDismissedGaps, sessionId }: PhaseApprovalFormProps) {
+export function PhaseApprovalForm({ phase, title, description, summary, options, message, tasks, onSubmit, initialDismissedGaps, sessionId, onNavigateToPhase }: PhaseApprovalFormProps) {
     const [isSubmitting, setIsSubmitting] = useState<string | null>(null);
     const [showContextInput, setShowContextInput] = useState(false);
     const [contextText, setContextText] = useState('');
@@ -93,6 +103,31 @@ export function PhaseApprovalForm({ phase, title, description, summary, options,
     };
 
     const handleOptionSubmit = (optionId: string) => {
+        // For assembly revise, use navigate instead of phase input
+        // so the workflow re-enters assembly from scratch (reset state, re-run LLM).
+        // Use confirm_cascade:true since assembly has no downstream phases.
+        console.log('[PhaseApprovalForm] handleOptionSubmit', { optionId, phase, sessionId: sessionId ?? 'NULL' });
+        if (optionId === 'revise' && phase === 'assembly' && sessionId) {
+            setIsSubmitting(optionId);
+
+            const socket = getWebSocket();
+            if (socket) {
+                const navigatePayload: Record<string, unknown> = {
+                    session_id: sessionId,
+                    target_phase: 'assembly',
+                    confirm_cascade: true,
+                };
+                if (contextText.trim()) navigatePayload.feedback = contextText.trim();
+                if (uploadedFile) navigatePayload.context_file_id = uploadedFile.id;
+
+                socket.send({
+                    type: 'plan.navigate',
+                    payload: navigatePayload,
+                });
+            }
+            return;
+        }
+
         setIsSubmitting(optionId);
         try {
             const payload: Record<string, unknown> = { decision: optionId };
@@ -224,6 +259,22 @@ export function PhaseApprovalForm({ phase, title, description, summary, options,
                 )}
 
                 {tasksSection}
+
+                {/* Validation errors and warnings */}
+                {summary && (
+                    (summary.errors as unknown[])?.length > 0
+                    || (summary.warnings as unknown[])?.length > 0
+                    || (summary.errors_count as number) > 0
+                    || (summary.warnings_count as number) > 0
+                ) && (
+                    <ValidationSummary
+                        isValid={summary.is_valid as boolean ?? true}
+                        errors={summary.errors as Array<Record<string, unknown>> | string[] | undefined}
+                        warnings={summary.warnings as Array<Record<string, unknown>> | string[] | undefined}
+                        errorsCount={(summary.errors_count as number) || 0}
+                        warningsCount={(summary.warnings_count as number) || 0}
+                    />
+                )}
 
                 {/* Assembly document preview + download */}
                 {assemblyPreview}
@@ -377,6 +428,124 @@ export function PhaseApprovalForm({ phase, title, description, summary, options,
     );
 }
 
+// ── Validation Summary ───────────────────────────────────────────────
+
+interface ValidationSummaryProps {
+    isValid: boolean;
+    errors?: Array<Record<string, unknown>> | string[];
+    warnings?: Array<Record<string, unknown>> | string[];
+    errorsCount: number;
+    warningsCount: number;
+}
+
+function ValidationSummary({ isValid, errors, warnings, errorsCount, warningsCount }: ValidationSummaryProps) {
+    const actualErrorCount = errors?.length ?? errorsCount;
+    const actualWarningCount = warnings?.length ?? warningsCount;
+    const hasErrorDetails = errors && errors.length > 0;
+    const hasWarningDetails = warnings && warnings.length > 0;
+
+    const [errorsExpanded, setErrorsExpanded] = useState(actualErrorCount > 0);
+    const [warningsExpanded, setWarningsExpanded] = useState(false);
+
+    const formatItem = (item: Record<string, unknown> | string): string => {
+        if (typeof item === 'string') return item;
+        return (item.message as string) || (item.description as string) || (item.rule as string) || JSON.stringify(item);
+    };
+
+    const sectionOf = (item: Record<string, unknown> | string): string | null => {
+        if (typeof item === 'string') return null;
+        return (item.section as string) || (item.location as string) || null;
+    };
+
+    return (
+        <div className="space-y-2">
+            {/* Status badge */}
+            <div className="flex items-center gap-2">
+                {isValid
+                    ? <CheckCircle2 className="h-4 w-4 text-green-500" />
+                    : <XCircle className="h-4 w-4 text-red-500" />}
+                <span className={`text-sm font-medium ${isValid ? 'text-green-700 dark:text-green-400' : 'text-red-700 dark:text-red-400'}`}>
+                    {isValid ? 'Validation passed' : 'Validation issues found'}
+                </span>
+            </div>
+
+            {/* Errors */}
+            {actualErrorCount > 0 && (
+                <div className="rounded-lg border border-red-200 dark:border-red-900 overflow-hidden">
+                    <button
+                        type="button"
+                        onClick={() => hasErrorDetails && setErrorsExpanded(!errorsExpanded)}
+                        className={`w-full flex items-center gap-2 px-3 py-2 text-xs font-medium bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-400 ${hasErrorDetails ? 'hover:bg-red-100 dark:hover:bg-red-950/50 cursor-pointer' : 'cursor-default'} transition-colors`}
+                    >
+                        <AlertTriangle className="h-3.5 w-3.5" />
+                        <span>{actualErrorCount} {actualErrorCount === 1 ? 'error' : 'errors'}</span>
+                        {hasErrorDetails && (
+                            errorsExpanded
+                                ? <ChevronUp className="h-3.5 w-3.5 ml-auto" />
+                                : <ChevronDown className="h-3.5 w-3.5 ml-auto" />
+                        )}
+                        {!hasErrorDetails && (
+                            <span className="ml-auto text-[10px] text-red-400">re-run to see details</span>
+                        )}
+                    </button>
+                    {errorsExpanded && hasErrorDetails && (
+                        <ul className="px-3 py-2 space-y-1.5 text-xs">
+                            {errors.map((err, i) => (
+                                <li key={i} className="flex gap-2">
+                                    <span className="text-red-400 shrink-0 pt-0.5">•</span>
+                                    <div>
+                                        <span className="text-foreground">{formatItem(err)}</span>
+                                        {sectionOf(err) && (
+                                            <span className="text-muted-foreground ml-1">({sectionOf(err)})</span>
+                                        )}
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+            )}
+
+            {/* Warnings */}
+            {actualWarningCount > 0 && (
+                <div className="rounded-lg border border-amber-200 dark:border-amber-900 overflow-hidden">
+                    <button
+                        type="button"
+                        onClick={() => hasWarningDetails && setWarningsExpanded(!warningsExpanded)}
+                        className={`w-full flex items-center gap-2 px-3 py-2 text-xs font-medium bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 ${hasWarningDetails ? 'hover:bg-amber-100 dark:hover:bg-amber-950/50 cursor-pointer' : 'cursor-default'} transition-colors`}
+                    >
+                        <AlertTriangle className="h-3.5 w-3.5" />
+                        <span>{actualWarningCount} {actualWarningCount === 1 ? 'warning' : 'warnings'}</span>
+                        {hasWarningDetails && (
+                            warningsExpanded
+                                ? <ChevronUp className="h-3.5 w-3.5 ml-auto" />
+                                : <ChevronDown className="h-3.5 w-3.5 ml-auto" />
+                        )}
+                        {!hasWarningDetails && (
+                            <span className="ml-auto text-[10px] text-amber-400">re-run to see details</span>
+                        )}
+                    </button>
+                    {warningsExpanded && hasWarningDetails && (
+                        <ul className="px-3 py-2 space-y-1.5 text-xs">
+                            {warnings.map((warn, i) => (
+                                <li key={i} className="flex gap-2">
+                                    <span className="text-amber-400 shrink-0 pt-0.5">•</span>
+                                    <div>
+                                        <span className="text-foreground">{formatItem(warn)}</span>
+                                        {sectionOf(warn) && (
+                                            <span className="text-muted-foreground ml-1">({sectionOf(warn)})</span>
+                                        )}
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
 // ── Assembly Document Preview ────────────────────────────────────────
 
 interface AssemblyDocumentPreviewProps {
@@ -392,7 +561,21 @@ function AssemblyDocumentPreview({
     specName,
     sessionId,
 }: AssemblyDocumentPreviewProps) {
-    const [expanded, setExpanded] = useState(true);
+    const [previewOpen, setPreviewOpen] = useState(false);
+
+    // Unwrap JSON envelope if the stored preview is a JSON wrapper
+    const resolvedPreview = React.useMemo(() => {
+        if (!documentPreview) return documentPreview;
+        const trimmed = documentPreview.trim();
+        if (!trimmed.startsWith('{')) return documentPreview;
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (parsed && typeof parsed === 'object' && typeof parsed.assembled_document === 'string' && parsed.assembled_document.length > 50) {
+                return parsed.assembled_document as string;
+            }
+        } catch { /* not JSON */ }
+        return documentPreview;
+    }, [documentPreview]);
 
     // Convert backend manifest entries to frontend DocumentManifestEntry format
     const downloadEntries: DocumentManifestEntry[] | undefined = manifestEntries?.map(e => ({
@@ -407,39 +590,39 @@ function AssemblyDocumentPreview({
 
     return (
         <div className="space-y-3 border-t pt-4">
-            <button
-                type="button"
-                onClick={() => setExpanded(!expanded)}
-                className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-foreground/80 transition-colors w-full"
-            >
-                <Eye className="h-4 w-4" />
-                <span>Document Preview</span>
-                {expanded
-                    ? <ChevronUp className="h-4 w-4 ml-auto" />
-                    : <ChevronDown className="h-4 w-4 ml-auto" />}
-            </button>
+            {/* Section downloads (always visible) */}
+            {downloadEntries && downloadEntries.length > 0 && (
+                <PlanDocumentDownload
+                    sessionId={sessionId}
+                    manifestEntries={downloadEntries}
+                    specName={specName}
+                    isPreview
+                />
+            )}
 
-            {expanded && (
-                <div className="animate-in fade-in slide-in-from-top-1 duration-200 space-y-3">
-                    {/* Download links */}
-                    {downloadEntries && downloadEntries.length > 0 && (
-                        <PlanDocumentDownload
-                            sessionId={sessionId}
-                            manifestEntries={downloadEntries}
-                            specName={specName}
-                            isPreview
-                        />
-                    )}
+            {/* Full document preview — opens as overlay */}
+            {resolvedPreview && (
+                <>
+                    <button
+                        type="button"
+                        onClick={() => setPreviewOpen(true)}
+                        className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-foreground/80 transition-colors w-full border-t pt-3"
+                    >
+                        <Eye className="h-4 w-4" />
+                        <span>Full Document Preview</span>
+                    </button>
 
-                    {/* Markdown preview */}
-                    {documentPreview && (
-                        <div className="bg-muted/30 rounded-lg border max-h-[500px] overflow-y-auto">
-                            <div className="p-4">
-                                <MarkdownRenderer content={documentPreview} />
+                    <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+                        <DialogContent className="max-w-4xl w-[90vw] h-[85vh] flex flex-col p-0">
+                            <DialogHeader className="px-6 pt-6 pb-3 border-b shrink-0">
+                                <DialogTitle>{specName || 'Document Preview'}</DialogTitle>
+                            </DialogHeader>
+                            <div className="flex-1 overflow-y-auto px-6 py-4">
+                                <MarkdownRenderer content={resolvedPreview} />
                             </div>
-                        </div>
-                    )}
-                </div>
+                        </DialogContent>
+                    </Dialog>
+                </>
             )}
         </div>
     );

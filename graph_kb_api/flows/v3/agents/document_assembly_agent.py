@@ -11,10 +11,10 @@ Used by AssembleNode in the plan workflow assembly phase.
 """
 
 from __future__ import annotations
-from graph_kb_api.flows.v3.state import UnifiedSpecState
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, Dict, List, Optional
@@ -26,6 +26,7 @@ from graph_kb_api.flows.v3.agents.base_agent import AgentCapability, BaseAgent
 from graph_kb_api.flows.v3.agents.personas import get_agent_prompt_manager
 from graph_kb_api.flows.v3.models.types import AgentResult, AgentTask
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
+from graph_kb_api.flows.v3.state import UnifiedSpecState
 from graph_kb_api.flows.v3.state.workflow_state import GenerateData  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -106,12 +107,18 @@ class DocumentAssemblyAgent(BaseAgent):
         """
         assert workflow_context is not None, "DocumentAssemblyAgent requires a WorkflowContext"
 
-        sections = task.get("sections", {})
-        template = task.get("template", "")
+        ctx = task.get("context", {}) if isinstance(task.get("context"), dict) else {}
+        sections = ctx.get("sections", task.get("sections", {}))
+        template = ctx.get("template", task.get("template", ""))
+        spec_name = ctx.get("spec_name", "")
+        user_explanation = ctx.get("user_explanation", "")
 
         try:
             # Run assembly
-            result: AssemblyResult = await self._assemble_document(sections, template, workflow_context)
+            result: AssemblyResult = await self._assemble_document(
+                sections, template, workflow_context,
+                spec_name=spec_name, user_explanation=user_explanation,
+            )
 
             return {
                 "output": self._serialize_result(result),
@@ -120,6 +127,14 @@ class DocumentAssemblyAgent(BaseAgent):
             }
 
         except Exception as e:
+            # Re-raise quota exhaustion so the node-level handler can emit
+            # a proper error to the UI instead of silently degrading
+            from graph_kb_api.core.llm import LLMQuotaExhaustedError
+            if isinstance(e, LLMQuotaExhaustedError) or (
+                isinstance(e.__cause__, LLMQuotaExhaustedError) if e.__cause__ else False
+            ):
+                raise
+
             logger.error(f"DocumentAssemblyAgent failed: {e}", exc_info=True)
             fallback_doc = self._fallback_assembly(sections, template)
             section_ids = list(sections.keys()) if isinstance(sections, dict) else []
@@ -139,11 +154,16 @@ class DocumentAssemblyAgent(BaseAgent):
         sections: Dict[str, Any],
         template: str,
         workflow_context: WorkflowContext,
+        *,
+        spec_name: str = "",
+        user_explanation: str = "",
     ) -> AssemblyResult:
         """Assemble document using LLM."""
         llm: LLMService = workflow_context.require_llm
 
-        prompt = self._build_assembly_prompt(sections, template)
+        prompt = self._build_assembly_prompt(
+            sections, template, spec_name=spec_name, user_explanation=user_explanation,
+        )
 
         try:
             response: AIMessage = await llm.ainvoke(prompt)
@@ -151,6 +171,10 @@ class DocumentAssemblyAgent(BaseAgent):
             content: str = raw_content if isinstance(raw_content, str) else str(raw_content)
             return self._parse_llm_response(content, sections)
         except Exception as e:
+            # Let quota errors propagate without wrapping
+            from graph_kb_api.core.llm import LLMQuotaExhaustedError
+            if isinstance(e, LLMQuotaExhaustedError):
+                raise
             logger.error(f"LLM assembly failed: {e}")
             raise RuntimeError(f"DocumentAssemblyAgent LLM call failed: {e}") from e
 
@@ -158,53 +182,97 @@ class DocumentAssemblyAgent(BaseAgent):
         self,
         sections: Dict[str, Any],
         template: str,
+        *,
+        spec_name: str = "",
+        user_explanation: str = "",
     ) -> str:
-        """Build the assembly prompt."""
-        sections_json = json.dumps(sections, indent=2, default=str)
+        """Build the assembly prompt with sections as markdown."""
+        section_parts: list[str] = []
+        for name, content in sections.items():
+            text = str(content) if not isinstance(content, str) else content
+            section_parts.append(f"### Section: {name}\n\n{text}")
 
+        sections_text = "\n\n---\n\n".join(section_parts)
         template_section = f"\n\n## Template to Use\n```\n{template}\n```" if template else ""
 
-        return f"""{_SYSTEM_PROMPT}
+        # Build document context block so the LLM knows what it's assembling
+        context_lines: list[str] = []
+        if spec_name:
+            context_lines.append(f"**Document title:** {spec_name}")
+        if user_explanation:
+            context_lines.append(f"**Purpose:** {user_explanation}")
+        context_block = "\n".join(context_lines)
+        context_section = f"\n\n## Document Context\n\n{context_block}\n" if context_lines else ""
 
-## Sections to Assemble
-```json
-{sections_json}
-```
+        return f"""{_SYSTEM_PROMPT}
+{context_section}
+## Input Sections
+
+The following sections were independently researched and drafted. Assemble them
+into a single, coherent specification document. The sections are provided in
+their intended reading order.
+
+{sections_text}
 {template_section}
 
-Assemble these sections into a coherent document with smooth transitions.
-Return your result as JSON."""
+## Reminders
+
+- The document title should be: {spec_name or 'derive from the content'}.
+- Preserve all code blocks, tables, mermaid diagrams, and interface definitions exactly.
+- Strip YAML frontmatter, task IDs, status fields, and workflow metadata.
+- Merge overlapping content; eliminate redundancy without losing information.
+- Add concrete transitions between sections — reference specific concepts, not generic filler.
+- Return ONLY raw markdown. No JSON wrapper. No code fences around the document."""
 
     def _parse_llm_response(
         self,
         content: str,
         sections: Dict[str, Any],
     ) -> AssemblyResult:
-        """Parse LLM response into AssemblyResult."""
-        import re
+        """Parse LLM response — expects raw markdown, not JSON."""
+        cleaned = content.strip()
 
+        # Strip outer code fences if the LLM wrapped the output
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+
+        # Handle case where LLM returned JSON instead of raw markdown
+        cleaned = self._unwrap_json_if_needed(cleaned)
+
+        if not cleaned or len(cleaned) < 50:
+            raise RuntimeError("DocumentAssemblyAgent returned empty or trivial content")
+
+        section_names = list(sections.keys()) if isinstance(sections, dict) else []
+        return AssemblyResult(
+            assembled_document=cleaned,
+            sections_included=section_names,
+            transitions_generated=[],
+            flow_score=0.8,
+            summary=f"Assembled {len(section_names)} sections into cohesive document",
+        )
+
+    @staticmethod
+    def _unwrap_json_if_needed(content: str) -> str:
+        """Extract markdown from JSON wrapper if the LLM returned JSON instead of raw markdown.
+
+        Some LLMs wrap the assembled document in a JSON object like:
+        {"assembled_document": "# Title...", "sections_included": [...], ...}
+
+        This method detects that pattern and extracts just the markdown content.
+        """
+        if not content.startswith("{"):
+            return content
         try:
-            # Try to extract JSON
-            cleaned = content.strip()
-            if cleaned.startswith("```"):
-                cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
-                cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-
-            parsed = json.loads(cleaned)
-            if not isinstance(parsed, dict):
-                raise ValueError("Response is not a JSON object")
-
-            return AssemblyResult(
-                assembled_document=str(parsed.get("assembled_document", "")),
-                sections_included=list(parsed.get("sections_included", [])),
-                transitions_generated=list(parsed.get("transitions_generated", [])),
-                flow_score=float(parsed.get("flow_score", 0.5)),
-                summary=str(parsed.get("summary", "Assembly complete")),
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to parse LLM response: {e}")
-            raise RuntimeError(f"DocumentAssemblyAgent failed to parse LLM response: {e}") from e
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and "assembled_document" in parsed:
+                doc = parsed["assembled_document"]
+                if isinstance(doc, str) and len(doc) > 50:
+                    logger.info("_unwrap_json_if_needed: extracted assembled_document from JSON wrapper")
+                    return doc
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return content
 
     def _fallback_assembly_result(
         self,

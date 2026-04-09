@@ -9,7 +9,6 @@ from langgraph.graph.state import CompiledStateGraph
 
 from graph_kb_api.flows.v3.graphs.base_workflow_engine import BaseWorkflowEngine
 from graph_kb_api.flows.v3.nodes.plan_nodes import (
-    BudgetCheckNode,
     CritiqueNode,
     DispatchNode,
     FetchContextNode,
@@ -31,10 +30,9 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
     """Architect-led critique loop with task dispatch and per-task research.
 
     Conditional routing flow:
-        START -> budget_check -> (task_selector | END)
-        task_selector -> fetch_context -> task_context_input -> task_research ->
-        tool_plan -> dispatch -> worker -> critique -> (worker | progress)
-        progress -> END
+        START -> task_selector -> fetch_context -> task_context_input ->
+        task_research -> tool_plan -> dispatch -> worker -> critique ->
+        (worker | progress) -> (task_selector | END)
     """
 
     def __init__(self, workflow_context: WorkflowContext) -> None:
@@ -49,7 +47,6 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
         return []
 
     def _initialize_nodes(self) -> None:
-        self.budget_check = BudgetCheckNode()
         self.task_selector = TaskSelectorNode()
         self.fetch_context = FetchContextNode()
         self.task_context_input = TaskContextInputNode()
@@ -63,7 +60,6 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
 
     def _compile_workflow(self) -> CompiledStateGraph:
         builder = StateGraph(OrchestrateSubgraphState)
-        builder.add_node("budget_check", self.budget_check)
         builder.add_node("task_selector", self.task_selector)
         builder.add_node("fetch_context", self.fetch_context)
         builder.add_node("task_context_input", self.task_context_input)
@@ -73,12 +69,7 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
         builder.add_node("worker", self.worker)
         builder.add_node("critique", self.critique)
         builder.add_node("progress", self.progress)
-        builder.add_edge(START, "budget_check")
-        builder.add_conditional_edges(
-            "budget_check",
-            OrchestrateSubgraph._route_after_budget,
-            {"task_selector": "task_selector", "__end__": END},
-        )
+        builder.add_edge(START, "task_selector")
         builder.add_edge("task_selector", "fetch_context")
         builder.add_edge("fetch_context", "task_context_input")
         builder.add_edge("task_context_input", "task_research")
@@ -94,27 +85,11 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
         builder.add_conditional_edges(
             "progress",
             OrchestrateSubgraph._route_after_progress,
-            {"budget_check": "budget_check", "__end__": END},
+            {"task_selector": "task_selector", "__end__": END},
         )
         compiled = builder.compile(checkpointer=self.checkpointer)
         logger.info("Orchestrate subgraph compiled")
         return compiled
-
-    @staticmethod
-    def _route_after_budget(
-        state: dict,
-    ) -> Literal["task_selector", "__end__"]:
-        """Route to END when budget exhausted, else task_selector.
-
-        Checks both remaining_llm_calls and workflow_status for budget
-        exhaustion to support graceful completion (Req 28.1, 28.2).
-        """
-        if state.get("workflow_status") == "budget_exhausted":
-            return "__end__"
-        remaining = state.get("budget", {}).get("remaining_llm_calls", 0)
-        if remaining <= 0:
-            return "__end__"
-        return "task_selector"
 
     # Maximum iterations for the critique loop (Req 0g)
     MAX_CRITIQUE_ITERATIONS = 3
@@ -153,7 +128,7 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
             return "worker"
         return "progress"
 
-    # Maximum outer-loop iterations to prevent infinite cycling (budget_check → progress).
+    # Maximum outer-loop iterations to prevent infinite cycling (task_selector → progress).
     # Each cycle processes one task. If exceeded, the loop is stuck (blocked tasks,
     # repeated failures, etc.) and we force completion.
     MAX_TASK_LOOP_ITERATIONS = 500
@@ -161,8 +136,8 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
     @staticmethod
     def _route_after_progress(
         state: dict,
-    ) -> Literal["budget_check", "__end__"]:
-        """Route back to budget_check for next task, or END if all tasks complete.
+    ) -> Literal["task_selector", "__end__"]:
+        """Route back to task_selector for next task, or END if all tasks complete.
 
         Checks orchestrate.all_complete, circuit breaker, blocked state, and a
         loop guard to prevent infinite cycling when tasks are stuck or
@@ -171,8 +146,6 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
         orchestrate = state.get("orchestrate", {})
         all_complete = orchestrate.get("all_complete", False)
         if all_complete:
-            return "__end__"
-        if state.get("workflow_status") == "budget_exhausted":
             return "__end__"
         # Circuit breaker: all tasks rejected in a full cycle with 0 approvals
         if orchestrate.get("circuit_breaker_triggered", False):
@@ -195,7 +168,7 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
                 OrchestrateSubgraph.MAX_TASK_LOOP_ITERATIONS,
             )
             return "__end__"
-        return "budget_check"
+        return "task_selector"
 
 
 __all__ = ["OrchestrateSubgraph"]

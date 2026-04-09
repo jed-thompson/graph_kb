@@ -34,6 +34,17 @@ from graph_kb_api.websocket.plan_events import emit_budget_warning, emit_error, 
 
 logger = logging.getLogger(__name__)
 
+# Import lazily to avoid circular imports; used in __call__ exception handler
+_LLMQuotaExhaustedError: type | None = None
+
+
+def _get_quota_error_class() -> type:
+    global _LLMQuotaExhaustedError
+    if _LLMQuotaExhaustedError is None:
+        from graph_kb_api.core.llm import LLMQuotaExhaustedError
+        _LLMQuotaExhaustedError = LLMQuotaExhaustedError
+    return _LLMQuotaExhaustedError
+
 
 S = TypeVar("S")
 
@@ -277,6 +288,40 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
         except GraphInterrupt:
             # GraphInterrupt is raised by interrupt() for human-in-the-loop.
             # Must propagate to LangGraph so the workflow pauses correctly.
+            raise
+        except Exception as exc:
+            # Catch LLMQuotaExhaustedError without a top-level import (avoids circular deps)
+            if isinstance(exc, _get_quota_error_class()):
+                logger.error("LLM quota exhausted during %s/%s: %s", self.phase, self.step_name, exc)
+                try:
+                    session_id = state.get("session_id", "")
+                    client_id_val: str | None = configurable.get("client_id")
+                    await emit_error(
+                        session_id=session_id,
+                        message=(
+                            "LLM API quota exhausted. Please check your billing and plan details "
+                            "at your LLM provider, then retry."
+                        ),
+                        code="LLM_QUOTA_EXHAUSTED",
+                        phase=self.phase,
+                        client_id=client_id_val,
+                    )
+                except Exception:
+                    pass  # fire-and-forget
+
+                return NodeExecutionResult.success(
+                    output={
+                        "workflow_status": "error",
+                        "error": {
+                            "message": (
+                                "LLM API quota exhausted. Please add credits to your LLM provider "
+                                "account and retry."
+                            ),
+                            "code": "LLM_QUOTA_EXHAUSTED",
+                            "phase": self.phase,
+                        },
+                    }
+                )
             raise
         except (RuntimeError, ValueError) as exc:
             # Propagate node-level errors (missing LLM, invalid state, etc.)

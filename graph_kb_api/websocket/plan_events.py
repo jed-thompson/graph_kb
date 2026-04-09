@@ -150,6 +150,8 @@ class PlanNavigatePayload(BaseModel):
     session_id: str = Field(..., min_length=1)
     target_phase: PlanPhaseId
     confirm_cascade: bool = False
+    feedback: Optional[str] = Field(None, description="User feedback/context for the revision")
+    context_file_id: Optional[str] = Field(None, description="Uploaded context file ID")
 
 
 class PlanResumePayload(BaseModel):
