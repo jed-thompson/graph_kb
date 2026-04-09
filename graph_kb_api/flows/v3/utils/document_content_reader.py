@@ -11,9 +11,10 @@ requirements documents.
 
 from __future__ import annotations
 
+import io
 import logging
 import re
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal
 
 from graph_kb_api.database.base import get_db_session_ctx
 from graph_kb_api.database.document_models import UploadedDocument
@@ -101,9 +102,11 @@ async def load_uploaded_document_contents(
                 continue
 
             is_text_mime = doc.mime_type in TEXT_MIME_TYPES
-            is_text_ext = bool(doc.original_filename and doc.original_filename.lower().endswith((".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".xml")))
+            fname_lower = doc.original_filename.lower() if doc.original_filename else ""
+            is_text_ext = bool(fname_lower.endswith((".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".xml")))
+            is_pdf = doc.mime_type == "application/pdf" or fname_lower.endswith(".pdf")
 
-            if not is_text_mime and not is_text_ext:
+            if not is_text_mime and not is_text_ext and not is_pdf:
                 logger.warning(
                     "document_content_reader: skipping %s (mime_type=%s, filename=%s) — not text-parseable",
                     doc_id,
@@ -122,7 +125,39 @@ async def load_uploaded_document_contents(
                 continue
 
             raw_content: str
-            if isinstance(artifact.content, bytes):
+            if is_pdf:
+                if isinstance(artifact.content, bytes):
+                    pdf_bytes = artifact.content
+                elif isinstance(artifact.content, str):
+                    pdf_bytes = artifact.content.encode("utf-8")
+                else:
+                    pdf_bytes = bytes(artifact.content)
+                try:
+                    from pypdf import PdfReader
+
+                    reader = PdfReader(io.BytesIO(pdf_bytes))
+                    extracted = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+                    if not extracted:
+                        logger.warning(
+                            "document_content_reader: PDF %s (%s) has no extractable text, skipping",
+                            doc_id,
+                            doc.original_filename,
+                        )
+                        continue
+                    raw_content = extracted
+                    logger.info(
+                        "document_content_reader: extracted %d chars from PDF %s",
+                        len(extracted),
+                        doc.original_filename,
+                    )
+                except Exception as pdf_err:
+                    logger.warning(
+                        "document_content_reader: PDF extraction failed for %s: %s",
+                        doc_id,
+                        pdf_err,
+                    )
+                    continue
+            elif isinstance(artifact.content, bytes):
                 raw_content = artifact.content.decode("utf-8", errors="replace")
             elif isinstance(artifact.content, str):
                 raw_content = artifact.content

@@ -15,7 +15,7 @@ class SettingsResponse(BaseModel):
     model: str
     temperature: float
     auto_review: bool
-    plan_max_llm_calls: int = 200
+    plan_max_llm_calls: int = 500
     plan_max_tokens: int = 500_000
     plan_max_wall_clock_s: int = 1800
 

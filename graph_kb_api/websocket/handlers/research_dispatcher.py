@@ -47,19 +47,27 @@ def _validate_session_owner(session: Dict[str, Any], client_id: str, session_id:
     return registered_client == client_id
 
 
-def _cancel_running_task(session: Dict[str, Any]) -> bool:
+async def _cancel_running_task(session: Dict[str, Any]) -> bool:
     """Cancel the running research task in a session, if any."""
     task: Optional[asyncio.Task] = session.get("running_task")
     if task is not None and not task.done():
         task.cancel()
         try:
-            asyncio.get_event_loop().run_until_complete(task)
+            await task
         except (asyncio.CancelledError, Exception):
             pass
         session["running_task"] = None
         return True
     session["running_task"] = None
     return False
+
+
+async def _run_and_cleanup(session_id: str, coro: Any) -> None:
+    """Await *coro* then remove the session from the in-memory registry."""
+    try:
+        await coro
+    finally:
+        _sessions.pop(session_id, None)
 
 
 # ── Event Handlers ────────────────────────────────────────────────────────
@@ -116,7 +124,9 @@ async def handle_research_start(
 
     await emit_research_started(session_id, client_id)
 
-    task = asyncio.create_task(run_single_repo_research(session, data.repo_id, client_id))
+    task = asyncio.create_task(
+        _run_and_cleanup(session_id, run_single_repo_research(session, data.repo_id, client_id))
+    )
     session["running_task"] = task
 
 
@@ -165,7 +175,9 @@ async def _run_multi_repo_research(
         }
         _sessions[session_id] = session
         await emit_research_started(session_id, client_id)
-        task = asyncio.create_task(run_single_repo_research(session, repo_ids[0], client_id))
+        task = asyncio.create_task(
+            _run_and_cleanup(session_id, run_single_repo_research(session, repo_ids[0], client_id))
+        )
         session["running_task"] = task
         return
 
@@ -192,9 +204,13 @@ async def _run_multi_repo_research(
 
     orchestrator = MultiRepoOrchestrator(session, client_id)
     if data.strategy == "dependency_aware":
-        task = asyncio.create_task(orchestrator.run_dependency_aware())
+        task = asyncio.create_task(
+            _run_and_cleanup(session_id, orchestrator.run_dependency_aware())
+        )
     else:
-        task = asyncio.create_task(orchestrator.run_parallel_merge())
+        task = asyncio.create_task(
+            _run_and_cleanup(session_id, orchestrator.run_parallel_merge())
+        )
     session["running_task"] = task
 
 
@@ -357,11 +373,54 @@ async def handle_research_gap_answer(
     )
 
 
+async def handle_research_cancel(
+    client_id: str,
+    workflow_id: str,
+    payload: Dict[str, Any],
+) -> None:
+    """Handle research.cancel — stop a running research task."""
+    session_id = payload.get("session_id")
+    if not session_id:
+        await manager.send_event(
+            client_id=client_id,
+            event_type="research.error",
+            workflow_id=workflow_id,
+            data={"message": "session_id required", "code": "VALIDATION_ERROR"},
+        )
+        return
+
+    session = _get_session(session_id)
+    if not session:
+        # Already gone — emit cancelled silently so the frontend can reset.
+        await manager.send_event(
+            client_id=client_id,
+            event_type="research.cancelled",
+            workflow_id=session_id,
+            data={"session_id": session_id},
+        )
+        return
+
+    if not _validate_session_owner(session, client_id, session_id):
+        await emit_research_error(session_id, "Not authorized", "UNAUTHORIZED", client_id)
+        return
+
+    await _cancel_running_task(session)
+    _sessions.pop(session_id, None)
+
+    await manager.send_event(
+        client_id=client_id,
+        event_type="research.cancelled",
+        workflow_id=session_id,
+        data={"session_id": session_id},
+    )
+
+
 # ── Dispatch ──────────────────────────────────────────────────────────
 
 
 _HANDLER_MAP: Dict[str, Any] = {
     "research.start": handle_research_start,
+    "research.cancel": handle_research_cancel,
     "research.review.start": handle_research_review_start,
     "research.gap.answer": handle_research_gap_answer,
     "research.hitl.response": handle_research_hitl_response,

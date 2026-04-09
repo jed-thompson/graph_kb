@@ -271,6 +271,17 @@ class Settings(BaseSettings):
         50, validation_alias="DEEP_AGENT_MAX_ITERATIONS"
     )
 
+    # ── Plan Budget Defaults ────────────────────────────────────────────
+    plan_max_llm_calls: int = Field(500, validation_alias="PLAN_MAX_LLM_CALLS")
+    plan_max_tokens: int = Field(500_000, validation_alias="PLAN_MAX_TOKENS")
+    plan_max_wall_clock_s: int = Field(1800, validation_alias="PLAN_MAX_WALL_CLOCK_S")
+    plan_budget_increase_fraction: float = Field(
+        0.5, validation_alias="PLAN_BUDGET_INCREASE_FRACTION"
+    )
+    plan_budget_increase_minimum: int = Field(
+        10, validation_alias="PLAN_BUDGET_INCREASE_MINIMUM"
+    )
+
     # ── Timeouts (seconds) ────────────────────────────────────────────
     websocket_keepalive_interval: int = Field(
         25, validation_alias="CHAINLIT_KEEPALIVE_INTERVAL"

@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { FileText, Folder, X, Edit2, Check } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { FileText, Folder, X, Edit2, Check, Loader2 } from 'lucide-react';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -10,7 +10,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { updateDocumentCategory } from '@/lib/api/documents';
+import { updateDocumentCategory, getDocument } from '@/lib/api/documents';
 
 interface DocumentOverlayProps {
   document: {
@@ -32,6 +32,27 @@ export function DocumentOverlay({ document, onClose, onCategoryUpdate }: Documen
   const [editCategoryType, setEditCategoryType] = useState<string>('');
   const [customCategory, setCustomCategory] = useState<string>('');
   const [isSaving, setIsSaving] = useState(false);
+  const [loadedContent, setLoadedContent] = useState<string | null | undefined>(undefined);
+  const [isLoadingContent, setIsLoadingContent] = useState(false);
+
+  useEffect(() => {
+    if (!document) {
+      setLoadedContent(undefined);
+      return;
+    }
+    if (document.content && !document.filename.toLowerCase().endsWith('.pdf')) {
+      setLoadedContent(document.content);
+      return;
+    }
+    setIsLoadingContent(true);
+    getDocument(document.id)
+      .then(full => setLoadedContent(full.content ?? null))
+      .catch(err => {
+        console.error('Failed to fetch document content:', err);
+        setLoadedContent(null);
+      })
+      .finally(() => setIsLoadingContent(false));
+  }, [document?.id]);
 
   if (!document) return null;
 
@@ -144,10 +165,12 @@ export function DocumentOverlay({ document, onClose, onCategoryUpdate }: Documen
             </Button>
           </div>
           {/* Overlay content */}
-          <div className="flex-1 overflow-auto p-6">
-            {document.content
-              ? <MarkdownRenderer content={document.content} enableMermaid enableCodeHighlight />
-              : <p className="text-sm text-muted-foreground">No content available</p>
+          <div className="flex-1 overflow-y-auto p-6">
+            {isLoadingContent
+              ? <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Loading content...</div>
+              : loadedContent
+                ? <MarkdownRenderer content={loadedContent} enableMermaid enableCodeHighlight />
+                : <p className="text-sm text-muted-foreground">No content available</p>
             }
           </div>
         </div>

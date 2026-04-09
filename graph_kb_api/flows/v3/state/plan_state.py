@@ -140,6 +140,33 @@ class BudgetState(TypedDict, total=False):
     started_at: str
 
 
+def _budget_reducer(existing: BudgetState, update: BudgetState) -> BudgetState:
+    """Merge-style reducer for BudgetState that prevents stale overwrites.
+
+    Rules:
+    * ``remaining_llm_calls``: take the **minimum** of both sides so that
+      decrements from any node are never silently overwritten by a stale
+      snapshot.
+    * ``tokens_used``: take the **maximum** so token consumption is
+      monotonically increasing.
+    * ``max_llm_calls``, ``max_tokens``, ``max_wall_clock_s``: take the
+      update value when present (these are set intentionally by budget
+      increase logic, not drift-prone).
+    * ``started_at``: take the update value when present (reset by
+      budget increase).
+    """
+    merged: BudgetState = {**existing, **update}
+
+    if "remaining_llm_calls" in existing and "remaining_llm_calls" in update:
+        merged["remaining_llm_calls"] = min(
+            existing["remaining_llm_calls"], update["remaining_llm_calls"]
+        )
+    if "tokens_used" in existing and "tokens_used" in update:
+        merged["tokens_used"] = max(existing["tokens_used"], update["tokens_used"])
+
+    return merged
+
+
 # ── Interrupt Payload Types ─────────────────────────────────────
 
 
@@ -173,6 +200,7 @@ class ApprovalInterruptPayload(TypedDict):
     artifacts: List[ArtifactManifestEntry]
     context_items: NotRequired[Dict[str, Any]]
     tasks: NotRequired[List[Dict[str, Any]]]
+    task_results: NotRequired[List[Dict[str, Any]]]
 
 
 class AnalysisReviewInterruptPayload(TypedDict):
@@ -208,6 +236,7 @@ class TaskContextInterruptPayload(TypedDict):
     task_name: str
     spec_section: str
     context_gaps: List[str]
+    task_results: NotRequired[List[Dict[str, Any]]]
 
 
 PlanInterruptPayload = Union[
@@ -263,7 +292,7 @@ class PlanState(TypedDict):
     """Consolidated state for the /plan command with hybrid storage."""
 
     artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: BudgetState
+    budget: Annotated[BudgetState, _budget_reducer]
     transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
     fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     context: Annotated[ContextData, operator.or_]
@@ -293,7 +322,7 @@ class ContextSubgraphState(TypedDict):
     """State for the context subgraph."""
 
     artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: BudgetState
+    budget: Annotated[BudgetState, _budget_reducer]
     transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
     fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     context: Annotated[ContextData, operator.or_]
@@ -310,7 +339,7 @@ class ResearchSubgraphState(TypedDict):
     """State for the research subgraph."""
 
     artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: BudgetState
+    budget: Annotated[BudgetState, _budget_reducer]
     transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
     fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     context: Annotated[ContextData, operator.or_]  # For FormulateQueriesNode, GapCheckNode
@@ -328,7 +357,7 @@ class PlanningSubgraphState(TypedDict):
     """State for the planning subgraph."""
 
     artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: BudgetState
+    budget: Annotated[BudgetState, _budget_reducer]
     transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
     fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     context: Annotated[
@@ -348,7 +377,7 @@ class OrchestrateSubgraphState(TypedDict):
     """State for the orchestrate subgraph."""
 
     artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: BudgetState
+    budget: Annotated[BudgetState, _budget_reducer]
     transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
     fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     context: Annotated[ContextData, operator.or_]  # For FetchContextNode, TaskResearchNode
@@ -372,7 +401,7 @@ class AssemblySubgraphState(TypedDict):
     """State for the assembly subgraph."""
 
     artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: BudgetState
+    budget: Annotated[BudgetState, _budget_reducer]
     transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
     fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     orchestrate: Annotated[OrchestrateData, operator.or_]

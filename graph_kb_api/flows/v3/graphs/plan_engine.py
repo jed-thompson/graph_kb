@@ -10,7 +10,6 @@ budget initialization, and service injection via WorkflowContext.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any, Dict, Optional, cast
 
 from langgraph.graph import END, START, StateGraph
@@ -39,6 +38,7 @@ from graph_kb_api.flows.v3.nodes.plan_nodes import (
     PruneAfterOrchestrateNode,
     PruneAfterResearchNode,
 )
+from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 from graph_kb_api.flows.v3.services.fingerprint_tracker import FingerprintTracker
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
 from graph_kb_api.flows.v3.state.plan_state import CASCADE_MAP, PlanPhase, PlanState
@@ -302,14 +302,7 @@ class PlanEngine(BaseWorkflowEngine):
         """
         return {
             **seed,
-            "budget": {
-                "max_llm_calls": seed.get("max_llm_calls", 200),
-                "remaining_llm_calls": seed.get("max_llm_calls", 200),
-                "max_tokens": seed.get("max_tokens", 500_000),
-                "tokens_used": 0,
-                "max_wall_clock_s": seed.get("max_wall_clock_s", 1800),
-                "started_at": datetime.now(UTC).isoformat(),
-            },
+            "budget": BudgetGuard.build_initial(seed),
             "artifacts": {},
             "transition_log": [],
             "fingerprints": {},

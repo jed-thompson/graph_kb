@@ -1,6 +1,8 @@
 """Orchestrate subgraph nodes for the /plan command.
 
-PruneAfterResearchNode, PruneAfterOrchestrateNode, BudgetCheckNode, TaskSelectorNode, FetchContextNode, GapNode, TaskResearchNode, ToolPlanNode, DispatchNode, WorkerNode, CritiqueNode, ProgressNode.
+Nodes: PruneAfterResearchNode, PruneAfterOrchestrateNode, BudgetCheckNode,
+TaskSelectorNode, FetchContextNode, TaskResearchNode, ToolPlanNode,
+DispatchNode, WorkerNode, CritiqueNode, ProgressNode.
 """
 
 from __future__ import annotations
@@ -272,6 +274,7 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
         artifact_svc: ArtifactService | None = configurable.get("artifact_service")
+        workflow_context: WorkflowContext | None = configurable.get("context")
 
         orchestrate: OrchestrateData = state.get("orchestrate", {})
         research: ResearchData = state.get("research", {})
@@ -317,9 +320,10 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         # Scoped supporting document sections (Step 11, Part I: D7)
         relevant_docs = current_task.get("relevant_docs", [])
         doc_index = context.get("document_section_index", [])
+        blob_storage = workflow_context.blob_storage if workflow_context else None
         if relevant_docs and doc_index and artifact_svc:
             task_context["supporting_doc_sections"] = await self._load_relevant_doc_sections(
-                relevant_docs, doc_index, artifact_svc, max_tokens=4000
+                relevant_docs, doc_index, artifact_svc, blob_storage=blob_storage, max_tokens=4000
             )
 
         return NodeExecutionResult.success(
@@ -336,6 +340,7 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         relevant_docs: list[dict],
         document_section_index: list[dict],
         artifact_svc: ArtifactService,
+        blob_storage: BlobStorage | None = None,
         max_tokens: int = 4000,
     ) -> list[dict]:
         """Load section-scoped content from supporting documents for a task.
@@ -344,6 +349,7 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             relevant_docs: [{doc_id, sections: ["Heading A", "Heading B"]}]
             document_section_index: composite index from CollectContextNode
             artifact_svc: for blob retrieval
+            blob_storage: shared BlobStorage from WorkflowContext (avoids re-init)
             max_tokens: token budget for combined supporting doc content
 
         Returns:
@@ -354,6 +360,7 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         if not relevant_docs or not document_section_index:
             return []
 
+        storage = blob_storage or BlobStorage.from_env()
         index_by_doc = {d["doc_id"]: d for d in document_section_index}
         loaded: list[dict] = []
         tokens_used = 0
@@ -377,7 +384,6 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                         doc_repo = DocumentRepository(db_session)
                         doc = await doc_repo.get(doc_id)
                     if doc:
-                        storage = BlobStorage.from_env()
                         artifact = await storage.backend.retrieve(doc.storage_key)
                         if artifact and isinstance(artifact.content, str):
                             blob_cache[doc_id] = artifact.content
@@ -529,7 +535,7 @@ class TaskContextInputNode(SubgraphAwareNode[OrchestrateSubgraphState]):
     context (URLs, documents) when the current task lacks sufficient
     supporting material. Passes through silently when context is adequate.
 
-    Routing: fetch_context → task_context_input → gap → ...existing flow...
+    Routing: fetch_context → task_context_input → task_research → ...existing flow...
     """
 
     def __init__(self) -> None:
@@ -546,19 +552,14 @@ class TaskContextInputNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             return NodeExecutionResult.success(output={})
 
         # Determine if context is sparse enough to warrant user input
-        context_gaps = orchestrate.get("context_gaps", [])
         relevant_docs = current_task.get("relevant_docs", [])
         task_context = orchestrate.get("current_task_context", {})
         has_artifact_context = any(k.startswith("artifact_context.") for k in task_context if isinstance(k, str))
         has_research = bool(task_context.get("research_summary"))
 
-        # Skip interrupt if context is sufficient
+        # Skip interrupt if context is sufficient (GapNode no longer runs, so
+        # sparse-context detection is based on artifact/research/doc presence alone)
         if has_artifact_context or has_research or len(relevant_docs) > 0:
-            return NodeExecutionResult.success(output={})
-
-        # Only interrupt for high-severity gaps
-        severe_gaps = [g for g in context_gaps if g.get("severity") in ("high", "critical")]
-        if not severe_gaps:
             return NodeExecutionResult.success(output={})
 
         # Emit interrupt for user input (Step 12)
@@ -575,6 +576,10 @@ class TaskContextInputNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             ]
             if not task_context.get("artifact_context")
             else [],
+            # Snapshot completed task_results so handle_reconnect can restore
+            # task statuses after page refresh (parent checkpoint lacks
+            # orchestrate subgraph state when use_default_checkpointer=False).
+            "task_results": list(orchestrate.get("task_results") or []),
         }
 
         # Use interrupt() to pause workflow and wait for user response
@@ -601,10 +606,10 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
     """Performs focused per-task research before worker execution.
 
     Uses ResearchAgent to investigate task-specific questions based on the
-    spec section type and any context gaps identified by GapNode.
+    spec section type and task context_requirements.
 
     Stores results via ArtifactService and merges into current_task_context.
-    Skips research when no gaps exist and task doesn't require research context.
+    Skips research when task doesn't require research context.
     """
 
     def __init__(self) -> None:
@@ -633,10 +638,15 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         task_id = current_task.get("id", "unknown")
         context_requirements = current_task.get("context_requirements", [])
 
-        # Skip research if no gaps and task doesn't require research context
-        needs_research: bool = len(context_gaps) > 0 or "research_findings" in context_requirements
+        # Run research when task explicitly requires research findings.
+        # (context_gaps is always empty after GapNode was removed from the graph;
+        # research eligibility is now determined solely by context_requirements.)
+        needs_research: bool = "research_findings" in context_requirements
         if not needs_research:
-            logger.info(f"TaskResearchNode: skipping research for task {task_id} (no gaps, no research requirement)")
+            logger.info(
+                "TaskResearchNode: skipping research for task %s (no research_findings in context_requirements)",
+                task_id,
+            )
             return NodeExecutionResult.success(output={"orchestrate": orchestrate})
 
         BudgetGuard.check(budget)
@@ -739,7 +749,7 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                 "findings": agent_findings,
                 "summary": agent_findings.get("summary", ""),
             }
-            llm_calls = 1
+            llm_calls = result.get("llm_calls_used", 1)
 
             tokens_used = get_token_estimator().count_tokens(str(task_research_results))
 
@@ -873,6 +883,7 @@ class DispatchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
         artifact_svc: ArtifactService | None = configurable.get("artifact_service")
+        workflow_context: WorkflowContext | None = configurable.get("context")
         session_id: str = state.get("session_id", "")
         client_id: str | None = configurable.get("client_id")
 
@@ -923,11 +934,11 @@ class DispatchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                     primary_blob: str | None = None
                     if primary_id and primary_id not in self._blob_cache:
                         try:
+                            storage = workflow_context.blob_storage if workflow_context else BlobStorage.from_env()
                             async with get_db_session_ctx() as db_session:
                                 doc_repo = DocumentRepository(db_session)
                                 doc = await doc_repo.get(primary_id)
                             if doc:
-                                storage = BlobStorage.from_env()
                                 artifact = await storage.backend.retrieve(doc.storage_key)
                                 if artifact and isinstance(artifact.content, str):
                                     self._blob_cache[primary_id] = artifact.content
@@ -1019,7 +1030,6 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
         artifact_svc: ArtifactService | None = configurable.get("artifact_service")
         budget: BudgetState = state.get("budget", {})
 
@@ -1090,6 +1100,21 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         output_content = ""
         llm_calls = 1
         task_status = "done"
+
+        iteration_count = orchestrate.get("iteration_count", 0)
+        if iteration_count > 0:
+            # Revision pass: re-emit task start so the UI transitions from
+            # 'critiquing' → 'in_progress' instead of staying frozen.
+            try:
+                await emit_task_start(
+                    session_id=session_id,
+                    task_id=task_id,
+                    task_name=task_name,
+                    client_id=client_id,
+                    spec_section=agent_context.get("spec_section") or None,
+                )
+            except Exception as e:
+                logger.warning(f"WorkerNode emit_task_start (revision) failed: {e}")
 
         try:
             await emit_phase_progress(
@@ -1464,9 +1489,13 @@ class ProgressNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
         total_tasks = len(all_tasks)
         completed_tasks = len([t for t in task_results if t.get("status") == "done"])
+        # Count all terminal statuses (done, failed, error) for completion check.
+        # Using only "done" caused an infinite loop: if any task failed,
+        # finished_count < total_tasks forever and all_complete was never set.
+        finished_tasks = len([t for t in task_results if t.get("status") in ("done", "failed", "error")])
         progress_pct = completed_tasks / max(total_tasks, 1)
 
-        all_complete = completed_tasks == total_tasks and total_tasks > 0
+        all_complete = finished_tasks == total_tasks and total_tasks > 0
 
         # Store current task final output and append to iteration_log (GAP 12d)
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
@@ -1593,5 +1622,19 @@ class ProgressNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                 )
             except Exception:
                 pass  # fire-and-forget
+
+        # Persist task_results to DB so they survive server restarts.
+        # The orchestrate subgraph runs with use_default_checkpointer=False,
+        # meaning the parent LangGraph checkpoint only holds pre-subgraph state.
+        # Without this, a restart wipes all completed task progress.
+        if session_id and task_results:
+            try:
+                from graph_kb_api.database.plan_repositories import PlanSessionRepository
+
+                async with get_db_session_ctx() as db_session:
+                    repo = PlanSessionRepository(db_session)
+                    await repo.update(session_id, task_results=list(task_results))
+            except Exception as e:
+                logger.warning("ProgressNode: failed to persist task_results to DB: %s", e)
 
         return NodeExecutionResult.success(output=output)

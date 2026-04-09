@@ -85,12 +85,14 @@ class WorkflowContext:
         if llm is None:
             raise ValueError("AppContext must have an 'llm' attribute")
 
+        graph_store = getattr(app_context, "graph_kb_facade", None)
         return cls(
             llm=llm,  # LLMService is now a BaseChatModel
             app_context=app_context,
-            vector_store=getattr(app_context, "vector_store", None),
+            # vector_store lives on GraphKBFacade, not AppContext directly.
+            vector_store=graph_store.vector_store if graph_store is not None else None,
             artifact_service=artifact_service or getattr(app_context, "artifact_service", None),
-            graph_store=getattr(app_context, "graph_kb_facade", None),
+            graph_store=graph_store,
             blob_storage=blob_storage,
             checkpointer=checkpointer or getattr(app_context, "checkpointer", None),
         )

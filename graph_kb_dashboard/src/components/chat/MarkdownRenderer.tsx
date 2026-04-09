@@ -512,6 +512,13 @@ export function MarkdownRenderer({
           line-height: 1.75;
           font-size: 0.9375rem;
         }
+        .markdown-content h1 {
+          font-size: 1.5rem;
+          font-weight: 700;
+          margin-top: 1rem;
+          margin-bottom: 1rem;
+          color: hsl(var(--foreground));
+        }
         .markdown-content h2 {
           font-size: 1.375rem;
           font-weight: 700;
@@ -569,8 +576,10 @@ export function MarkdownRenderer({
       {sections && sections.sections.length > 0 ? (
         // Render preamble + collapsible sections (## header pattern detected)
         <div className={`space-y-4 ${className}`}>
-          {/* Render preamble content (e.g., mermaid diagrams before first header) */}
-          {sections.preamble && (
+          {/* Render preamble content — only if it contains a code block (e.g., mermaid
+              diagrams). Plain-text preambles are spurious LLM output that should not
+              appear as a large unstyled block above the structured sections. */}
+          {sections.preamble && /```/.test(sections.preamble) && (
             <div className="markdown-content">
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
                 {sections.preamble}

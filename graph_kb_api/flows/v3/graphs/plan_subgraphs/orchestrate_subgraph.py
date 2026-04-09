@@ -13,7 +13,6 @@ from graph_kb_api.flows.v3.nodes.plan_nodes import (
     CritiqueNode,
     DispatchNode,
     FetchContextNode,
-    GapNode,
     ProgressNode,
     TaskContextInputNode,
     TaskResearchNode,
@@ -33,7 +32,7 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
 
     Conditional routing flow:
         START -> budget_check -> (task_selector | END)
-        task_selector -> fetch_context -> gap -> task_research ->
+        task_selector -> fetch_context -> task_context_input -> task_research ->
         tool_plan -> dispatch -> worker -> critique -> (worker | progress)
         progress -> END
     """
@@ -54,7 +53,6 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
         self.task_selector = TaskSelectorNode()
         self.fetch_context = FetchContextNode()
         self.task_context_input = TaskContextInputNode()
-        self.gap = GapNode()
         self.task_research = TaskResearchNode()
         self.tool_plan = ToolPlanNode()
         self.dispatch = DispatchNode()
@@ -69,7 +67,6 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
         builder.add_node("task_selector", self.task_selector)
         builder.add_node("fetch_context", self.fetch_context)
         builder.add_node("task_context_input", self.task_context_input)
-        builder.add_node("gap", self.gap)
         builder.add_node("task_research", self.task_research)
         builder.add_node("tool_plan", self.tool_plan)
         builder.add_node("dispatch", self.dispatch)
@@ -84,8 +81,7 @@ class OrchestrateSubgraph(BaseWorkflowEngine):
         )
         builder.add_edge("task_selector", "fetch_context")
         builder.add_edge("fetch_context", "task_context_input")
-        builder.add_edge("task_context_input", "gap")
-        builder.add_edge("gap", "task_research")
+        builder.add_edge("task_context_input", "task_research")
         builder.add_edge("task_research", "tool_plan")
         builder.add_edge("tool_plan", "dispatch")
         builder.add_edge("dispatch", "worker")

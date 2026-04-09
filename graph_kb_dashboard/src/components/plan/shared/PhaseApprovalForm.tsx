@@ -1,15 +1,17 @@
 'use client';
 
-import { useState } from 'react';
+import React, { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
 import { Textarea } from '@/components/ui/textarea';
-import { Loader2, ChevronDown, ChevronUp, Upload, X, FileText, MessageSquarePlus, AlertTriangle, Coins } from 'lucide-react';
-import type { PlanPhaseId } from '@/lib/store/planStore';
+import { Loader2, ChevronDown, ChevronUp, Upload, X, FileText, MessageSquarePlus, AlertTriangle, Coins, Eye } from 'lucide-react';
+import type { PlanPhaseId, DocumentManifestEntry } from '@/lib/store/planStore';
 import { useFileUpload, ACCEPTED_EXTENSIONS } from '@/hooks/useFileUpload';
+import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
+import { PlanDocumentDownload } from '../PlanDocumentDownload';
 import { ResultValueRenderer } from './ResultValueRenderer';
 import { TaskListRenderer } from './TaskListRenderer';
 import { cleanAIText } from '@/lib/utils/cleanAIText';
@@ -17,7 +19,7 @@ import type { TaskItem } from '../PlanContext';
 import type { ItemFeedback } from './ArchitectureFeedbackItem';
 
 /** Summary keys to hide from the rendered display. */
-const HIDDEN_SUMMARY_KEYS = new Set(['evaluation_method', 'budget_exhausted', 'remaining_llm_calls', 'tokens_used', 'max_llm_calls', 'max_tokens', 'reason']);
+const HIDDEN_SUMMARY_KEYS = new Set(['evaluation_method', 'budget_exhausted', 'remaining_llm_calls', 'tokens_used', 'max_llm_calls', 'max_tokens', 'reason', 'document_preview', 'manifest_entries']);
 
 interface BudgetSummary {
     budget_exhausted: boolean;
@@ -39,9 +41,11 @@ export interface PhaseApprovalFormProps {
     onSubmit: (data: Record<string, unknown>) => void;
     /** Pre-populated dismissed gap IDs (e.g. from a prior complete-state view). */
     initialDismissedGaps?: Set<string>;
+    /** Plan session ID for artifact downloads. */
+    sessionId?: string | null;
 }
 
-export function PhaseApprovalForm({ title, description, summary, options, message, tasks, onSubmit, initialDismissedGaps }: PhaseApprovalFormProps) {
+export function PhaseApprovalForm({ phase, title, description, summary, options, message, tasks, onSubmit, initialDismissedGaps, sessionId }: PhaseApprovalFormProps) {
     const [isSubmitting, setIsSubmitting] = useState<string | null>(null);
     const [showContextInput, setShowContextInput] = useState(false);
     const [contextText, setContextText] = useState('');
@@ -128,6 +132,22 @@ export function PhaseApprovalForm({ title, description, summary, options, messag
         ? Object.fromEntries(Object.entries(summary).filter(([key]) => !HIDDEN_SUMMARY_KEYS.has(key)))
         : undefined;
 
+    const tasksSection: React.ReactNode = tasks && tasks.length > 0 ? (
+        <div className="space-y-2">
+            <h3 className="text-sm font-medium">Tasks</h3>
+            <TaskListRenderer tasks={tasks} />
+        </div>
+    ) : null;
+
+    const assemblyPreview: React.ReactNode = phase === 'assembly' && (summary?.document_preview || summary?.manifest_entries) ? (
+        <AssemblyDocumentPreview
+            documentPreview={summary.document_preview as string | undefined}
+            manifestEntries={summary.manifest_entries as Array<Record<string, unknown>> | undefined}
+            specName={summary.spec_name as string | undefined}
+            sessionId={sessionId}
+        />
+    ) : null;
+
     return (
         <div className="max-w-3xl mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-2 duration-300">
             <div>
@@ -203,12 +223,10 @@ export function PhaseApprovalForm({ title, description, summary, options, messag
                     </div>
                 )}
 
-                {tasks && tasks.length > 0 && (
-                    <div className="space-y-2">
-                        <h3 className="text-sm font-medium">Tasks</h3>
-                        <TaskListRenderer tasks={tasks} />
-                    </div>
-                )}
+                {tasksSection}
+
+                {/* Assembly document preview + download */}
+                {assemblyPreview}
 
                 {/* Inline context toggle */}
                 <div className="border-t pt-3">
@@ -355,6 +373,74 @@ export function PhaseApprovalForm({ title, description, summary, options, messag
                     </div>
                 )}
             </Card>
+        </div>
+    );
+}
+
+// ── Assembly Document Preview ────────────────────────────────────────
+
+interface AssemblyDocumentPreviewProps {
+    documentPreview?: string;
+    manifestEntries?: Array<Record<string, unknown>>;
+    specName?: string;
+    sessionId?: string | null;
+}
+
+function AssemblyDocumentPreview({
+    documentPreview,
+    manifestEntries,
+    specName,
+    sessionId,
+}: AssemblyDocumentPreviewProps) {
+    const [expanded, setExpanded] = useState(true);
+
+    // Convert backend manifest entries to frontend DocumentManifestEntry format
+    const downloadEntries: DocumentManifestEntry[] | undefined = manifestEntries?.map(e => ({
+        taskId: (e.task_id as string) || '',
+        specSection: (e.spec_section as string) || '',
+        filename: `${(e.spec_section as string) || (e.task_id as string) || 'section'}.md`,
+        status: (e.status as DocumentManifestEntry['status']) || 'draft',
+        tokenCount: (e.token_count as number) || 0,
+        downloadUrl: (e.download_url as string) || '',
+        errorMessage: e.error_message as string | undefined,
+    }));
+
+    return (
+        <div className="space-y-3 border-t pt-4">
+            <button
+                type="button"
+                onClick={() => setExpanded(!expanded)}
+                className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-foreground/80 transition-colors w-full"
+            >
+                <Eye className="h-4 w-4" />
+                <span>Document Preview</span>
+                {expanded
+                    ? <ChevronUp className="h-4 w-4 ml-auto" />
+                    : <ChevronDown className="h-4 w-4 ml-auto" />}
+            </button>
+
+            {expanded && (
+                <div className="animate-in fade-in slide-in-from-top-1 duration-200 space-y-3">
+                    {/* Download links */}
+                    {downloadEntries && downloadEntries.length > 0 && (
+                        <PlanDocumentDownload
+                            sessionId={sessionId}
+                            manifestEntries={downloadEntries}
+                            specName={specName}
+                            isPreview
+                        />
+                    )}
+
+                    {/* Markdown preview */}
+                    {documentPreview && (
+                        <div className="bg-muted/30 rounded-lg border max-h-[500px] overflow-y-auto">
+                            <div className="p-4">
+                                <MarkdownRenderer content={documentPreview} />
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
         </div>
     );
 }

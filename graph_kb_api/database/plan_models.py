@@ -57,6 +57,15 @@ class PlanSession(Base):
     fingerprints: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     budget_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     context_items: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Orchestrate task_results persisted after each task so they survive restarts.
+    # The orchestrate subgraph uses use_default_checkpointer=False, so the parent
+    # LangGraph checkpoint does not hold subgraph-internal state between tasks.
+    task_results: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # Assembly completion evidence persisted by AssembleNode so that if the server
+    # dies before the parent LangGraph checkpoint is written, reconnect recovery can
+    # still detect that assembly finished and re-emit plan.complete.
+    spec_document_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(

@@ -22,8 +22,8 @@ from graph_kb_api.flows.v3.models.node_models import NodeExecutionResult
 from graph_kb_api.flows.v3.models.types import ThreadConfigurable
 from graph_kb_api.flows.v3.nodes.base_node import BaseWorkflowNodeV3
 from graph_kb_api.flows.v3.services.artifact_service import ArtifactStorageError
-from graph_kb_api.flows.v3.services.budget_guard import BudgetExhaustedError
-from graph_kb_api.flows.v3.state import ResearchData
+from graph_kb_api.flows.v3.services.budget_guard import BudgetExhaustedError, BudgetGuard
+from graph_kb_api.flows.v3.state import ContextData, ResearchData
 from graph_kb_api.flows.v3.state.plan_state import (
     ApprovalInterruptPayload,
     ArtifactManifestEntry,
@@ -172,6 +172,12 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
                     {"id": "cancel", "label": "Cancel"},
                 ],
                 "artifacts": self._serialize_artifacts(cast(dict[str, ArtifactRef], state.get("artifacts", {}))),
+                # Snapshot completed task_results and document_manifest so
+                # handle_reconnect / handle_phase_input can restore them
+                # after page refresh or budget resume (parent checkpoint lacks
+                # orchestrate subgraph state when use_default_checkpointer=False).
+                "task_results": list(state.get("orchestrate", {}).get("task_results") or []),
+                "document_manifest": state.get("document_manifest"),
             }
             response = interrupt(payload)
 
@@ -233,7 +239,15 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
                 return NodeExecutionResult.success(
                     output={"budget": updated_budget, "workflow_status": "running"},
                 )
-            return NodeExecutionResult.success(output={})
+            # budget_update missing — apply a default increase so the
+            # workflow does not immediately re-exhaust on the next check.
+            fallback_budget = BudgetGuard.increase(
+                state.get("budget") or {},
+                reset_wall_clock=True,
+            )
+            return NodeExecutionResult.success(
+                output={"budget": fallback_budget, "workflow_status": "running"},
+            )
         except ArtifactStorageError as exc:
             # Emit spec.error with STORAGE_ERROR code (Req 27.2)
             try:
@@ -376,11 +390,16 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
         return entries
 
     @staticmethod
-    async def _load_context_items(session_id: str | None, research: ResearchData) -> dict[str, Any]:
+    async def _load_context_items(
+        session_id: str | None,
+        research: ResearchData,
+        context: ContextData | None = None,
+    ) -> dict[str, Any]:
         """Load persisted context_items from DB, falling back to empty dict.
 
         Reads context_items that FeedbackReviewNode persisted to the plan session,
         and merges in any research findings doc IDs from artifacts.
+        Also merges uploaded document IDs from context state when provided.
         """
         context_items: dict[str, Any] = {}
         if session_id:
@@ -395,6 +414,27 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
             except Exception as e:
                 logger.warning("Failed to load context_items: %s", e)
 
+        # Normalize DB context_items: _persist_runtime_snapshot may have overwritten
+        # FeedbackReviewNode's canonical DB write with raw ContextData that uses
+        # form-field keys (primary_document, supporting_docs) instead of canonical
+        # keys (primary_document_id, supporting_doc_ids).
+        primary_doc_id_db = (
+            context_items.get("primary_document_id") or context_items.get("primary_document") or ""
+        )
+        if primary_doc_id_db and not context_items.get("primary_document_id"):
+            context_items["primary_document_id"] = primary_doc_id_db
+        supporting_ids_db: list[str] = list(context_items.get("supporting_doc_ids") or [])
+        form_supporting_db = context_items.get("supporting_docs") or []
+        if isinstance(form_supporting_db, str):
+            form_supporting_db = [s.strip() for s in form_supporting_db.split(",") if s.strip()]
+        elif not isinstance(form_supporting_db, list):
+            form_supporting_db = []
+        for doc_id in form_supporting_db:
+            if doc_id and doc_id not in supporting_ids_db:
+                supporting_ids_db.append(doc_id)
+        if supporting_ids_db:
+            context_items["supporting_doc_ids"] = supporting_ids_db
+
         # Merge any research doc IDs from research state
         research_doc_id: str | None = research.get("findings_doc_id")
         if research_doc_id:
@@ -402,5 +442,34 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
             if research_doc_id not in supporting:
                 supporting.append(research_doc_id)
                 context_items["supporting_doc_ids"] = supporting
+
+        # Merge uploaded document IDs from context state so approval gates
+        # always show the full document set regardless of whether the DB
+        # context_items were persisted before the uploads were associated.
+        # Handle both canonical (primary_document_id) and form-field (primary_document) keys
+        # since CollectContextNode outputs form-field keys to state.
+        if context:
+            ctx_dict = cast(Dict[str, Any], context)
+            primary_doc_id: str = (
+                ctx_dict.get("primary_document_id") or ctx_dict.get("primary_document") or ""
+            )
+            if primary_doc_id and not context_items.get("primary_document_id"):
+                context_items["primary_document_id"] = primary_doc_id
+
+            ctx_supporting: list[str] = list(ctx_dict.get("supporting_doc_ids") or [])
+            form_sup = ctx_dict.get("supporting_docs") or []
+            if isinstance(form_sup, str):
+                form_sup = [s.strip() for s in form_sup.split(",") if s.strip()]
+            elif not isinstance(form_sup, list):
+                form_sup = []
+            for doc_id in form_sup:
+                if doc_id and doc_id not in ctx_supporting:
+                    ctx_supporting.append(doc_id)
+            if ctx_supporting:
+                existing_supporting = list(context_items.get("supporting_doc_ids", []))
+                for doc_id in ctx_supporting:
+                    if doc_id not in existing_supporting:
+                        existing_supporting.append(doc_id)
+                context_items["supporting_doc_ids"] = existing_supporting
 
         return context_items

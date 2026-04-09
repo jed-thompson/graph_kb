@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypedDict, cast
 
 from langgraph.types import RunnableConfig
@@ -19,6 +18,7 @@ from graph_kb_api.context import AppContext, get_app_context
 from graph_kb_api.database.base import get_session
 from graph_kb_api.database.plan_repositories import PlanSessionRepository
 from graph_kb_api.flows.v3.checkpointer import CheckpointerFactory
+from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
 from graph_kb_api.flows.v3.state.plan_state import CASCADE_MAP
 from graph_kb_api.websocket.events import (
@@ -30,6 +30,7 @@ from graph_kb_api.websocket.events import (
 from graph_kb_api.websocket.handlers.base import _debug_log, logger
 from graph_kb_api.websocket.manager import manager
 from graph_kb_api.websocket.plan_events import (
+    PlanCancelPayload,
     PlanNavigatePayload,
     PlanPausePayload,
     PlanPhaseInputPayload,
@@ -38,8 +39,8 @@ from graph_kb_api.websocket.plan_events import (
     PlanRetryPayload,
     PlanStartPayload,
     PlanStepForwardPayload,
-    emit_error,
     emit_complete,
+    emit_error,
     set_plan_ws_manager,
 )
 
@@ -227,7 +228,9 @@ class PlanDispatcher:
                     "name": current_task.get("name") or task_id,
                     "status": "pending",
                     "priority": current_task.get("priority") or "medium",
-                    "dependencies": current_task.get("dependencies") if isinstance(current_task.get("dependencies"), list) else [],
+                    "dependencies": current_task.get("dependencies")
+                    if isinstance(current_task.get("dependencies"), list)
+                    else [],
                     "events": [],
                     "iterationCount": 0,
                 })
@@ -373,16 +376,30 @@ class PlanDispatcher:
             return None
 
         snapshot: Dict[str, Any] = {}
-        for key in (
-            "extracted_urls",
-            "rounds",
-            "primary_document_id",
-            "supporting_doc_ids",
-            "user_explanation",
-        ):
+        for key in ("extracted_urls", "rounds", "user_explanation"):
             value = context.get(key)
             if value not in (None, "", [], {}):
                 snapshot[key] = cls._to_jsonable(value)
+
+        # Handle both canonical (primary_document_id) and form-field (primary_document)
+        # naming conventions. CollectContextNode outputs form-field keys to state; canonical
+        # normalization only happens inside FeedbackReviewNode's DB write, which may be
+        # overwritten by _persist_runtime_snapshot writing raw ContextData.
+        primary_doc_id = context.get("primary_document_id") or context.get("primary_document") or ""
+        if primary_doc_id:
+            snapshot["primary_document_id"] = cls._to_jsonable(primary_doc_id)
+
+        supporting_ids: list[str] = list(context.get("supporting_doc_ids") or [])
+        form_supporting = context.get("supporting_docs") or []
+        if isinstance(form_supporting, str):
+            form_supporting = [s.strip() for s in form_supporting.split(",") if s.strip()]
+        elif not isinstance(form_supporting, list):
+            form_supporting = []
+        for doc_id in form_supporting:
+            if doc_id and doc_id not in supporting_ids:
+                supporting_ids.append(doc_id)
+        if supporting_ids:
+            snapshot["supporting_doc_ids"] = cls._to_jsonable(supporting_ids)
 
         return snapshot or None
 
@@ -558,19 +575,16 @@ class PlanDispatcher:
         resolved_current_phase = current_phase or cls._resolve_current_phase(resolved_state)
         resolved_budget = budget or cast(Dict[str, Any], resolved_state.get("budget", {}) or {})
         raw_workflow_status = workflow_status or resolved_state.get("workflow_status")
-        resolved_workflow_status = raw_workflow_status if isinstance(raw_workflow_status, str) and raw_workflow_status else "running"
+        resolved_workflow_status = (
+            raw_workflow_status if isinstance(raw_workflow_status, str) and raw_workflow_status else "running"
+        )
 
         payload: Dict[str, Any] = {
             "session_id": session_id,
             "current_phase": resolved_current_phase,
             "completed_phases": resolved_completed,
             "workflow_status": resolved_workflow_status,
-            "budget": {
-                "remainingLlmCalls": resolved_budget.get("remaining_llm_calls", 0),
-                "tokensUsed": resolved_budget.get("tokens_used", 0),
-                "maxLlmCalls": resolved_budget.get("max_llm_calls", 200),
-                "maxTokens": resolved_budget.get("max_tokens", 500_000),
-            },
+            "budget": BudgetGuard.build_display(resolved_budget),
             "artifacts": cls._serialize_plan_artifacts(resolved_state.get("artifacts", {})),
         }
 
@@ -1018,19 +1032,78 @@ class PlanDispatcher:
         approval_decision = completeness.get("approval_decision")
         is_approved = completeness.get("approved") is True or approval_decision == "approve"
 
-        if (
-            not completed_phases.get("assembly")
-            or approval_decision == "reject"
-            or not is_approved
-            or not cls._has_document_output(merged_state)
-        ):
+        # Hard exit on explicit rejection only.  If completeness is absent from the
+        # checkpoint (server killed before the assembly subgraph's parent checkpoint
+        # was written), is_approved evaluates False even though the workflow succeeded —
+        # the DB fallback below handles that case, so we must not short-circuit here.
+        if approval_decision == "reject":
             return False
+        if completeness and not is_approved:
+            return False
+
+        # Fast path: checkpoint already has full assembly evidence.
+        checkpoint_complete = (
+            bool(completed_phases.get("assembly")) and cls._has_document_output(merged_state)
+        )
+
+        if not checkpoint_complete:
+            # The parent LangGraph checkpoint may not have been written before the
+            # server was killed (assembly subgraph uses use_default_checkpointer=False,
+            # so the parent checkpoint is only saved after the subgraph returns).
+            # Fall back to the DB record written by AssembleNode.
+            db_assembly_complete = False
+            db_spec_url = ""
+            try:
+                async with get_session() as _db:
+                    _repo = PlanSessionRepository(_db)
+                    _record = await _repo.get(session_id)
+                    if _record:
+                        db_phases = _record.completed_phases or {}
+                        db_assembly_complete = bool(db_phases.get("assembly"))
+                        db_spec_url = _record.spec_document_url or ""
+            except Exception:
+                logger.warning(
+                    "_recover_stale_terminal_completion: DB fallback query failed",
+                    exc_info=True,
+                )
+
+            if not db_assembly_complete:
+                return False
+
+            # Augment merged_state with DB-sourced spec URL so _has_document_output
+            # and _resolve_spec_document_url work correctly for both single-doc and
+            # multi-doc paths.  Always inject when available so _resolve_spec_document_url
+            # returns the correct URL regardless of whether document_manifest is present.
+            if db_spec_url:
+                merged_state = {
+                    **merged_state,
+                    "generate": {
+                        **(merged_state.get("generate") or {}),
+                        "spec_document_path": db_spec_url,
+                    },
+                }
+
+            if not cls._has_document_output(merged_state):
+                return False
+
+            logger.info(
+                "Recovering stale assembly completion from DB evidence "
+                "(parent checkpoint was not written before server restart)",
+                extra={"session_id": session_id, "workflow_id": workflow_id},
+            )
 
         spec_document_url = cls._resolve_spec_document_url(merged_state)
         manifest = merged_state.get("document_manifest")
 
         try:
-            await engine.workflow.aupdate_state(config, {"workflow_status": "completed"})
+            # Write generate state alongside workflow_status so subsequent reconnects
+            # hit the fast path (workflow_status == "completed" + has_document_output)
+            # without needing another DB fallback query.  merged_state already has
+            # spec_document_path injected by the DB fallback block above when needed.
+            checkpoint_update: Dict[str, Any] = {"workflow_status": "completed"}
+            if isinstance(merged_state.get("generate"), dict):
+                checkpoint_update["generate"] = merged_state["generate"]
+            await engine.workflow.aupdate_state(config, checkpoint_update)
         except Exception:
             logger.warning("Failed to update stale completed workflow status", exc_info=True)
 
@@ -1683,6 +1756,62 @@ class PlanDispatcher:
         )
         manager.register_session(session_id, client_id)
 
+    def _cleanup_session(self, session_id: str) -> None:
+        """Remove a completed/cancelled/errored session from the in-memory registry."""
+        self._sessions.pop(session_id, None)
+        manager.unregister_session(session_id)
+
+    async def _cold_restore_session(
+        self,
+        session_id: str,
+        client_id: str,
+        workflow_id: str,
+    ) -> PlanSession | None:
+        """Restore a session from the PostgreSQL checkpoint after server restart.
+
+        If the session exists in the DB but not in the in-memory registry,
+        reconstructs the PlanEngine and re-registers the session.
+        Returns the restored PlanSession, or None if restore fails.
+        """
+        if not await self._ensure_session_owner(client_id, workflow_id, session_id, None):
+            return None
+
+        thread_id = f"plan-{session_id}"
+        try:
+            engine, _progress_callback = self._create_engine(
+                client_id, workflow_id, session_id=session_id
+            )
+            cfg: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+            cfg = engine.get_config_with_services(cfg)
+            cfg["configurable"]["progress_callback"] = self._make_progress_callback(
+                client_id,
+                workflow_id,
+                session_id=session_id,
+                thread_id=thread_id,
+                user_id=client_id,
+            )
+            cfg["configurable"]["client_id"] = client_id
+            self._register_session(
+                session_id, engine, cfg, thread_id, client_id, client_id, workflow_id,
+            )
+            session = self.get_session(session_id)
+            if session:
+                session["client_id"] = client_id
+                session["workflow_id"] = workflow_id
+                logger.info(
+                    "Cold-restored plan session from checkpoint",
+                    extra={"session_id": session_id, "client_id": client_id},
+                )
+            return session
+        except Exception as e:
+            logger.warning("Failed to cold-restore plan session %s: %s", session_id, e, exc_info=True)
+            await self._emit_plan_error(
+                client_id, workflow_id,
+                f"Failed to restore plan session: {e}",
+                "ENGINE_ERROR",
+            )
+            return None
+
     async def _cancel_running_task(self, session: PlanSession) -> bool:
         """Cancel the running agent task for a session, if any."""
         task: Optional[asyncio.Task] = session.get("running_task")
@@ -1824,6 +1953,7 @@ class PlanDispatcher:
                 state=latest_state,
                 result=result,
             ):
+                self._cleanup_session(session_id)
                 return
             if await self._check_and_emit_error(result, client_id, workflow_id, session_id):
                 return
@@ -1836,6 +1966,7 @@ class PlanDispatcher:
                 session_id=session_id,
                 fallback_phase="context",
             ):
+                self._cleanup_session(session_id)
                 return
             idata = await self._extract_interrupt_from_state(engine, cfg)
             if idata:
@@ -1844,12 +1975,7 @@ class PlanDispatcher:
                 state = await engine.get_workflow_state(cfg)
                 if state:
                     budget = state.get("budget", {})
-                    idata["budget"] = {
-                        "remainingLlmCalls": budget.get("remaining_llm_calls", 0),
-                        "tokensUsed": budget.get("tokens_used", 0),
-                        "maxLlmCalls": budget.get("max_llm_calls", 200),
-                        "maxTokens": budget.get("max_tokens", 500_000),
-                    }
+                    idata["budget"] = BudgetGuard.build_display(budget)
                 await self._emit_phase_prompt(client_id, workflow_id, idata)
                 return
             logger.info(
@@ -1877,6 +2003,7 @@ class PlanDispatcher:
                 workflow_status="error",
                 current_phase="context",
             )
+            self._cleanup_session(session_id)
             await self._emit_plan_error(
                 client_id,
                 workflow_id,
@@ -1899,15 +2026,14 @@ class PlanDispatcher:
 
         session = self.get_session(validated.session_id)
         if not session:
-            await self._emit_plan_error(
-                client_id,
-                workflow_id,
-                f"No active plan session: {validated.session_id}",
-                "SESSION_NOT_FOUND",
+            # Cold-restore: session missing from in-memory registry (e.g. after
+            # server restart).  Attempt to reconstruct from PostgreSQL checkpoint.
+            session = await self._cold_restore_session(
+                validated.session_id, client_id, workflow_id,
             )
-            return
-
-        if not await self._ensure_session_owner(client_id, workflow_id, validated.session_id, session):
+            if not session:
+                return
+        elif not await self._ensure_session_owner(client_id, workflow_id, validated.session_id, session):
             return
 
         running_task = session.get("running_task")
@@ -2009,7 +2135,11 @@ class PlanDispatcher:
         # applied to state BEFORE resuming so the re-executed node sees it.
         input_data = validated.data or {}
         budget_update: Dict[str, Any] = {}
-        if input_data.get("decision") == "increase_budget" and not self._is_budget_interrupt(current_interrupt):
+        if (
+            input_data.get("decision") == "increase_budget"
+            and current_interrupt is not None
+            and not self._is_budget_interrupt(current_interrupt)
+        ):
             logger.warning(
                 "Ignoring mismatched budget increase request for non-budget interrupt",
                 extra={
@@ -2028,34 +2158,80 @@ class PlanDispatcher:
                 state = await engine.get_workflow_state(config)
                 if state:
                     budget = state.get("budget", {})
-                    if input_data.get("max_llm_calls") is not None:
-                        old_max = budget.get("max_llm_calls", 200)
-                        additional = input_data["max_llm_calls"] - old_max
-                        budget_update["max_llm_calls"] = input_data["max_llm_calls"]
-                        remaining = budget.get("remaining_llm_calls", 0)
-                        budget_update["remaining_llm_calls"] = max(remaining + additional, 0)
-                    else:
-                        # No explicit value provided — apply 50% default increase
-                        old_max = budget.get("max_llm_calls", 200)
-                        additional = max(int(old_max * 0.5), 10)
-                        budget_update["max_llm_calls"] = old_max + additional
-                        remaining = budget.get("remaining_llm_calls", 0)
-                        budget_update["remaining_llm_calls"] = remaining + additional
-                    if input_data.get("max_tokens") is not None:
-                        budget_update["max_tokens"] = input_data["max_tokens"]
-                    if input_data.get("max_wall_clock_s") is not None:
-                        budget_update["max_wall_clock_s"] = input_data["max_wall_clock_s"]
-                    # Reset the wall-clock timer so the full budget window
-                    # is available from this point forward.  Without this,
-                    # a wall-clock exhaustion would immediately re-trigger
-                    # on the next BudgetGuard.check() after resume.
-                    budget_update["started_at"] = datetime.now(UTC).isoformat()
+                    increased = BudgetGuard.increase(
+                        budget,
+                        new_max_llm_calls=input_data.get("max_llm_calls"),
+                        max_tokens=input_data.get("max_tokens"),
+                        max_wall_clock_s=input_data.get("max_wall_clock_s"),
+                        reset_wall_clock=True,
+                    )
+                    budget_update = {
+                        k: v for k, v in increased.items() if v != budget.get(k)
+                    }
+                    # Always include these so the budget is fully refreshed
+                    budget_update["max_llm_calls"] = increased["max_llm_calls"]
+                    budget_update["remaining_llm_calls"] = increased["remaining_llm_calls"]
+                    budget_update["started_at"] = increased["started_at"]
+                    # Preserve orchestrate state so completed task_results survive
+                    # the budget interrupt/resume subgraph restart. The orchestrate
+                    # subgraph uses use_default_checkpointer=False, so the parent
+                    # graph's checkpoint only holds pre-subgraph state. Without this,
+                    # TaskSelectorNode sees empty task_results and re-runs all tasks.
+                    orchestrate_state = state.get("orchestrate", {})
+                    # Resolve task_results: DB is authoritative (ProgressNode persists
+                    # after each task). Interrupt payload is fallback for mid-task pauses
+                    # where ProgressNode hasn't yet run.
+                    db_task_results_resume: list | None = None
+                    try:
+                        async with get_session() as db:
+                            repo = PlanSessionRepository(db)
+                            ps = await repo.get(validated.session_id)
+                            if ps and ps.task_results:
+                                db_task_results_resume = list(ps.task_results)
+                    except Exception as _e:
+                        logger.warning("handle_phase_input: failed to load task_results from DB: %s", _e)
+                    interrupt_task_results = (
+                        current_interrupt.get("task_results")
+                        if isinstance(current_interrupt, dict)
+                        else None
+                    )
+                    best_task_results = (
+                        db_task_results_resume
+                        or (interrupt_task_results if isinstance(interrupt_task_results, list) else None)
+                    )
+                    if best_task_results:
+                        orchestrate_state = {**orchestrate_state, "task_results": best_task_results}
+                    # Preserve document_manifest so deliverable entries accumulated
+                    # across orchestrate cycles survive the subgraph restart.
+                    # The orchestrate subgraph uses use_default_checkpointer=False,
+                    # so its internal manifest state is lost on restart. Without this,
+                    # BudgetCheckNode creates a fresh empty manifest and assembly only
+                    # sees entries from the final orchestrate run.
+                    #
+                    # Prefer the interrupt payload's manifest (snapshot of the
+                    # subgraph's in-memory state at exhaustion time — includes entries
+                    # from the current run) over the parent checkpoint's manifest
+                    # (stale, only includes entries from prior runs).
+                    state_update: Dict[str, Any] = {
+                        "workflow_status": "running",
+                        "budget": {**budget, **budget_update},
+                        "orchestrate": orchestrate_state,
+                    }
+                    interrupt_manifest = (
+                        current_interrupt.get("document_manifest")
+                        if isinstance(current_interrupt, dict)
+                        else None
+                    )
+                    best_manifest = (
+                        interrupt_manifest
+                        if isinstance(interrupt_manifest, dict)
+                        else state.get("document_manifest")
+                    )
+                    if isinstance(best_manifest, dict):
+                        state_update["document_manifest"] = best_manifest
                     await engine.workflow.aupdate_state(
                         config,
-                        {
-                            "workflow_status": "running",
-                            "budget": {**budget, **budget_update},
-                        },
+                        state_update,
                     )
                     logger.info(
                         "Plan phase input: updated budget for HITL resume",
@@ -2064,6 +2240,34 @@ class PlanDispatcher:
                             "budget_update": budget_update,
                         },
                     )
+                    # Emit plan.state immediately so BudgetIndicator reflects the
+                    # new remaining/max BEFORE the workflow resumes.  Without this
+                    # the frontend sees no change until the next interrupt fires,
+                    # which can be another exhaustion — making it look like the
+                    # entire increase was instantly consumed.
+                    try:
+                        updated_budget_state = {**budget, **budget_update}
+                        _interrupt_phase = (
+                            current_interrupt.get("phase")
+                            if isinstance(current_interrupt, dict)
+                            else None
+                        )
+                        await manager.send_event(
+                            client_id=client_id,
+                            event_type="plan.state",
+                            workflow_id=workflow_id,
+                            data=self._build_plan_state_payload(
+                                session_id=validated.session_id,
+                                state=state,
+                                workflow_status="running",
+                                current_phase=_interrupt_phase,
+                                budget=updated_budget_state,
+                            ),
+                        )
+                    except Exception as _e:
+                        logger.warning(
+                            "handle_phase_input: budget increase plan.state failed: %s", _e
+                        )
             except Exception as e:
                 logger.warning("Failed to update budget for HITL resume: %s", e, exc_info=True)
 
@@ -2109,6 +2313,7 @@ class PlanDispatcher:
                     state=latest_state,
                     result=result,
                 ):
+                    self._cleanup_session(validated.session_id)
                     return
                 if await self._check_and_emit_error(
                     result,
@@ -2126,6 +2331,7 @@ class PlanDispatcher:
                     session_id=validated.session_id,
                     fallback_phase=validated.phase.value,
                 ):
+                    self._cleanup_session(validated.session_id)
                     return
                 latest_status = self._merge_runtime_state(latest_state, result).get("workflow_status")
                 if self._is_terminal_status(latest_status):
@@ -2140,6 +2346,31 @@ class PlanDispatcher:
                 idata: dict[str, Any] | None = await self._extract_interrupt_from_state(engine, config)
                 if idata:
                     idata.setdefault("session_id", validated.session_id)
+                    # Attach live budget so the frontend can detect budget_exhausted
+                    # on re-exhaustion and BudgetIndicator shows the critical badge.
+                    # Mirrors handle_plan_start which always injects budget into idata.
+                    if latest_state:
+                        _live_budget = latest_state.get("budget", {})
+                        idata["budget"] = BudgetGuard.build_display(_live_budget)
+                    # Emit plan.state before plan.phase.prompt so currentPhase updates
+                    # immediately in the frontend after approval — without waiting for
+                    # plan.phase.enter from the resumed subgraph (which may be delayed
+                    # or silently dropped if client_id is None in the subgraph config).
+                    try:
+                        interrupt_phase = idata.get("phase")
+                        await manager.send_event(
+                            client_id=client_id,
+                            event_type="plan.state",
+                            workflow_id=workflow_id,
+                            data=self._build_plan_state_payload(
+                                session_id=validated.session_id,
+                                state=latest_state,
+                                workflow_status="running",
+                                current_phase=interrupt_phase,
+                            ),
+                        )
+                    except Exception as e:
+                        logger.warning("plan.phase.input emit plan.state failed: %s", e)
                     await self._emit_phase_prompt(client_id, workflow_id, idata)
                     return
                 # plan.complete / plan.error already emitted by FinalizeNode (or error nodes)
@@ -2169,6 +2400,7 @@ class PlanDispatcher:
                 current_phase=validated.phase.value,
                 completed_phases=self._infer_completed_phases(validated.phase.value),
             )
+            self._cleanup_session(validated.session_id)
             await self._emit_plan_error(
                 client_id,
                 workflow_id,
@@ -2192,13 +2424,11 @@ class PlanDispatcher:
 
         session = self.get_session(validated.session_id)
         if not session:
-            await self._emit_plan_error(
-                client_id,
-                workflow_id,
-                f"No active plan session: {validated.session_id}",
-                "SESSION_NOT_FOUND",
+            session = await self._cold_restore_session(
+                validated.session_id, client_id, workflow_id,
             )
-            return
+            if not session:
+                return
 
         engine: PlanEngine = session["engine"]
         config: RunnableConfig = session["config"]
@@ -2324,38 +2554,15 @@ class PlanDispatcher:
             return
 
         session = self.get_session(validated.session_id)
-        if not await self._ensure_session_owner(client_id, workflow_id, validated.session_id, session):
-            return
-
         if not session:
-            thread_id = f"plan-{validated.session_id}"
-            cfg: RunnableConfig = {
-                "configurable": {
-                    "thread_id": thread_id,
-                }
-            }
-            engine, _progress_callback = self._create_engine(client_id, workflow_id, session_id=validated.session_id)
-            cfg = engine.get_config_with_services(cfg)
-            cfg["configurable"]["progress_callback"] = self._make_progress_callback(
-                client_id,
-                workflow_id,
-                session_id=validated.session_id,
-                thread_id=thread_id,
-                user_id=client_id,
+            session = await self._cold_restore_session(
+                validated.session_id, client_id, workflow_id,
             )
-            cfg["configurable"]["client_id"] = client_id
-            self._register_session(
-                validated.session_id,
-                engine,
-                cfg,
-                thread_id,
-                client_id,
-                client_id,
-                workflow_id,
-            )
-            session = self.get_session(validated.session_id)
-            assert session is not None  # just registered above
+            if not session:
+                return
         else:
+            if not await self._ensure_session_owner(client_id, workflow_id, validated.session_id, session):
+                return
             session["client_id"] = client_id
             session["workflow_id"] = workflow_id
             manager.register_session(validated.session_id, client_id)
@@ -2394,31 +2601,48 @@ class PlanDispatcher:
             # limits and reset status so the workflow can resume (Req 28.3)
             if state.get("workflow_status") == "budget_exhausted":
                 budget = state.get("budget", {})
-                budget_update: Dict[str, Any] = {}
-
-                if validated.max_llm_calls is not None:
-                    # Increase remaining by the delta between new and old max
-                    old_max = budget.get("max_llm_calls", 200)
-                    additional = validated.max_llm_calls - old_max
-                    budget_update["max_llm_calls"] = validated.max_llm_calls
-                    remaining = budget.get("remaining_llm_calls")
-                    budget_update["remaining_llm_calls"] = max(
-                        (remaining if remaining is not None else 0) + additional, 0
-                    )
+                increased = BudgetGuard.increase(
+                    budget,
+                    new_max_llm_calls=validated.max_llm_calls,
+                    max_tokens=validated.max_tokens,
+                    max_wall_clock_s=validated.max_wall_clock_s,
+                    reset_wall_clock=True,
+                )
+                budget_update: Dict[str, Any] = {
+                    "max_llm_calls": increased["max_llm_calls"],
+                    "remaining_llm_calls": increased["remaining_llm_calls"],
+                    "started_at": increased["started_at"],
+                }
                 if validated.max_tokens is not None:
-                    budget_update["max_tokens"] = validated.max_tokens
+                    budget_update["max_tokens"] = increased["max_tokens"]
                 if validated.max_wall_clock_s is not None:
-                    budget_update["max_wall_clock_s"] = validated.max_wall_clock_s
-
-                # Reset the wall-clock timer so the full budget window
-                # is available from this point forward.
-                budget_update["started_at"] = datetime.now(UTC).isoformat()
+                    budget_update["max_wall_clock_s"] = increased["max_wall_clock_s"]
 
                 state_update: Dict[str, Any] = {
                     "workflow_status": "running",
                 }
                 if budget_update:
                     state_update["budget"] = {**budget, **budget_update}
+
+                # Restore task_results from DB so TaskSelectorNode skips
+                # already-completed tasks after a budget-exhausted resume.
+                try:
+                    async with get_session() as db:
+                        repo = PlanSessionRepository(db)
+                        ps = await repo.get(validated.session_id)
+                        if ps and ps.task_results:
+                            state_update["orchestrate"] = {
+                                **(state.get("orchestrate") or {}),
+                                "task_results": list(ps.task_results),
+                            }
+                except Exception as _e:
+                    logger.warning("handle_resume: failed to load task_results from DB: %s", _e)
+
+                # Preserve document_manifest so deliverable entries accumulated
+                # across previous orchestrate cycles survive the subgraph restart.
+                existing_manifest = state.get("document_manifest")
+                if isinstance(existing_manifest, dict):
+                    state_update["document_manifest"] = existing_manifest
 
                 await engine.workflow.aupdate_state(config, state_update)
 
@@ -2558,6 +2782,7 @@ class PlanDispatcher:
                         user_id=session.get("user_id", client_id),
                         workflow_status="error",
                     )
+                    self._cleanup_session(validated.session_id)
                     await self._emit_plan_error(
                         client_id,
                         workflow_id,
@@ -2583,26 +2808,8 @@ class PlanDispatcher:
                 state=state,
             ):
                 return
-            if await self._emit_terminal_status_if_needed(
-                state=state,
-                result=None,
-                client_id=client_id,
-                workflow_id=workflow_id,
-                session_id=validated.session_id,
-            ):
-                return
-            await self._persist_runtime_snapshot(
-                validated.session_id,
-                session.get("thread_id", f"plan-{validated.session_id}"),
-                session.get("user_id", client_id),
-                engine,
-                config,
-                workflow_status=workflow_status,
-            )
-
-            # Emit current workflow state so the client can reconstruct
-            # the UI on reconnect (Req 29.3). Sent as a dedicated event
-            # because SpecPhasePromptData doesn't carry state fields.
+            # Emit plan.state before the error check so the frontend can always
+            # reconstruct phase history, even when workflow_status is "error".
             try:
                 await manager.send_event(
                     client_id=client_id,
@@ -2619,6 +2826,23 @@ class PlanDispatcher:
                 )
             except Exception as e:
                 logger.warning(f"plan.resume emit plan.state failed: {e}")
+
+            if await self._emit_terminal_status_if_needed(
+                state=state,
+                result=None,
+                client_id=client_id,
+                workflow_id=workflow_id,
+                session_id=validated.session_id,
+            ):
+                return
+            await self._persist_runtime_snapshot(
+                validated.session_id,
+                session.get("thread_id", f"plan-{validated.session_id}"),
+                session.get("user_id", client_id),
+                engine,
+                config,
+                workflow_status=workflow_status,
+            )
 
             # Try to retrieve the actual interrupt payload for the correct prompt
             idata = await self._extract_interrupt_from_state(engine, config)
@@ -2757,6 +2981,10 @@ class PlanDispatcher:
             session_id=validated.session_id,
         )
 
+        session = self.get_session(validated.session_id)
+        if session:
+            await self._cancel_running_task(session)
+
         await manager.send_event(
             client_id=client_id,
             event_type="plan.paused",
@@ -2767,7 +2995,6 @@ class PlanDispatcher:
                 "session_id": validated.session_id,
             },
         )
-        session = self.get_session(validated.session_id)
         if session:
             await self._persist_session_to_db(
                 session_id=validated.session_id,
@@ -2775,6 +3002,61 @@ class PlanDispatcher:
                 user_id=session.get("user_id", client_id),
                 workflow_status="paused",
             )
+
+    async def handle_cancel(self, client_id: str, workflow_id: str, payload: Dict[str, Any]) -> None:
+        """Handle plan.cancel — cancel and tear down an active plan session."""
+        try:
+            validated = PlanCancelPayload(**payload)
+        except ValidationError as e:
+            await self._emit_plan_error(
+                client_id,
+                workflow_id,
+                f"Invalid plan.cancel payload: {e.errors()}",
+                "VALIDATION_ERROR",
+            )
+            return
+
+        session_id = validated.session_id
+
+        _debug_log(
+            "PLAN_CANCEL",
+            client_id=client_id,
+            session_id=session_id,
+        )
+
+        session = self.get_session(session_id)
+        if not session:
+            # Session not in memory — idempotent cancel: silently acknowledge
+            # (session was already cancelled or completed)
+            await manager.send_event(
+                client_id=client_id,
+                event_type="plan.cancelled",
+                workflow_id=workflow_id,
+                data={"status": "cancelled", "session_id": session_id, "message": "Plan session already cancelled."},
+            )
+            return
+
+        await self._cancel_running_task(session)
+
+        await manager.send_event(
+            client_id=client_id,
+            event_type="plan.cancelled",
+            workflow_id=workflow_id,
+            data={
+                "status": "cancelled",
+                "session_id": session_id,
+                "message": "Plan session cancelled.",
+            },
+        )
+
+        await self._persist_session_to_db(
+            session_id=session_id,
+            thread_id=session.get("thread_id", f"plan-{session_id}"),
+            user_id=session.get("user_id", client_id),
+            workflow_status="cancelled",
+        )
+
+        self._cleanup_session(session_id)
 
     async def handle_retry(self, client_id: str, workflow_id: str, payload: Dict[str, Any]) -> None:
         """Handle plan.retry — retry failed phase (Req 20.2)."""
@@ -2791,13 +3073,11 @@ class PlanDispatcher:
 
         session = self.get_session(validated.session_id)
         if not session:
-            await self._emit_plan_error(
-                client_id,
-                workflow_id,
-                f"No active plan session: {validated.session_id}",
-                "SESSION_NOT_FOUND",
+            session = await self._cold_restore_session(
+                validated.session_id, client_id, workflow_id,
             )
-            return
+            if not session:
+                return
 
         session["client_id"] = client_id
         session["workflow_id"] = workflow_id
@@ -2890,6 +3170,7 @@ class PlanDispatcher:
                 user_id=session.get("user_id", client_id),
                 workflow_status="error",
             )
+            self._cleanup_session(validated.session_id)
             await self._emit_plan_error(
                 client_id,
                 workflow_id,
@@ -2915,17 +3196,17 @@ class PlanDispatcher:
             return
 
         session = self.get_session(validated.session_id)
-        if not session:
-            await self._emit_plan_error(
-                client_id,
-                workflow_id,
-                f"No active plan session: {validated.session_id}",
-                "SESSION_NOT_FOUND",
+        if session:
+            if not await self._ensure_session_owner(client_id, workflow_id, validated.session_id, session):
+                return
+        else:
+            # Cold-resume: session missing from in-memory registry (e.g. after
+            # server restart).  Reconstruct the engine from the PostgreSQL checkpoint.
+            session = await self._cold_restore_session(
+                validated.session_id, client_id, workflow_id,
             )
-            return
-
-        if not await self._ensure_session_owner(client_id, workflow_id, validated.session_id, session):
-            return
+            if not session:
+                return
 
         # Update client_id and workflow_id for the reconnected client
         session["client_id"] = client_id
@@ -2978,6 +3259,25 @@ class PlanDispatcher:
                 state=state,
             ):
                 return
+            # Emit plan.state before the error check so the frontend can always
+            # reconstruct phase history, even when workflow_status is "error".
+            try:
+                await manager.send_event(
+                    client_id=client_id,
+                    event_type="plan.state",
+                    workflow_id=workflow_id,
+                    data=self._build_plan_state_payload(
+                        session_id=validated.session_id,
+                        state=state,
+                        workflow_status=workflow_status,
+                        completed_phases=completed,
+                        current_phase=current_phase,
+                        budget=budget,
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"handle_reconnect: emit plan.state (error path) failed: {e}")
+
             if await self._emit_terminal_status_if_needed(
                 state=state,
                 result=None,
@@ -2995,9 +3295,60 @@ class PlanDispatcher:
                 workflow_status=workflow_status,
             )
 
+            # Extract interrupt before building state payload so we can augment
+            # orchestrate.task_results when use_default_checkpointer=False causes
+            # the parent checkpoint to lack subgraph-internal completed task state.
+            idata = await self._extract_interrupt_from_state(engine, config)
+
+            # Resolve authoritative task_results: DB is most reliable after restart
+            # because ProgressNode persists after each task. Interrupt payload is a
+            # fallback for mid-task pauses (budget exhaustion) where ProgressNode
+            # hasn't run yet. Checkpoint value is last resort.
+            db_task_results: list | None = None
+            try:
+                async with get_session() as db:
+                    repo = PlanSessionRepository(db)
+                    persisted_session = await repo.get(validated.session_id)
+                    if persisted_session and persisted_session.task_results:
+                        db_task_results = list(persisted_session.task_results)
+            except Exception as e:
+                logger.warning("handle_reconnect: failed to load task_results from DB: %s", e)
+
+            interrupt_task_results = idata.get("task_results") if idata else None
+            # DB wins over interrupt payload (more complete); both win over checkpoint
+            authoritative_task_results = (
+                db_task_results
+                or (interrupt_task_results if isinstance(interrupt_task_results, list) else None)
+            )
+
+            effective_state = state
+            if authoritative_task_results:
+                effective_state = {
+                    **state,
+                    "orchestrate": {
+                        **(state.get("orchestrate") or {}),
+                        "task_results": authoritative_task_results,
+                    },
+                }
+                # Inject into the LangGraph parent checkpoint so TaskSelectorNode
+                # sees completed tasks when resuming and skips re-running them.
+                try:
+                    existing_orchestrate = (state.get("orchestrate") or {})
+                    await engine.workflow.aupdate_state(
+                        config,
+                        {
+                            "orchestrate": {
+                                **existing_orchestrate,
+                                "task_results": authoritative_task_results,
+                            }
+                        },
+                    )
+                except Exception as e:
+                    logger.warning("handle_reconnect: aupdate_state task_results failed: %s", e)
+
             state_data: Dict[str, Any] = self._build_plan_state_payload(
                 session_id=validated.session_id,
-                state=state,
+                state=effective_state,
                 workflow_status=workflow_status,
                 completed_phases=completed,
                 current_phase=current_phase,
@@ -3016,7 +3367,6 @@ class PlanDispatcher:
             )
 
             # Re-emit the current interrupt prompt if the workflow is paused
-            idata = await self._extract_interrupt_from_state(engine, config)
             if idata:
                 idata.setdefault("session_id", validated.session_id)
                 await self._emit_phase_prompt(client_id, workflow_id, idata)
@@ -3049,13 +3399,11 @@ class PlanDispatcher:
 
         session = self.get_session(validated.session_id)
         if not session:
-            await self._emit_plan_error(
-                client_id,
-                workflow_id,
-                f"No active plan session: {validated.session_id}",
-                "SESSION_NOT_FOUND",
+            session = await self._cold_restore_session(
+                validated.session_id, client_id, workflow_id,
             )
-            return
+            if not session:
+                return
 
         engine = session["engine"]
         config: RunnableConfig = session["config"]
@@ -3150,6 +3498,8 @@ class PlanDispatcher:
                 await self.handle_resume(client_id, workflow_id, payload)
             elif msg_type == "plan.pause":
                 await self.handle_pause(client_id, workflow_id, payload)
+            elif msg_type == "plan.cancel":
+                await self.handle_cancel(client_id, workflow_id, payload)
             elif msg_type == "plan.retry":
                 await self.handle_retry(client_id, workflow_id, payload)
             elif msg_type == "plan.step.forward":

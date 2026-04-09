@@ -1,6 +1,7 @@
 """Assembly subgraph nodes for the /plan command.
 
-CompletenessNode, TemplateNode, GenerateNode, ConsistencyNode, AssembleNode, ValidateNode, AssemblyApprovalNode, FinalizeNode.
+CompletenessNode, TemplateNode, GenerateNode, ConsistencyNode, AssembleNode,
+ValidateNode, AssemblyApprovalNode, FinalizeNode.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from langchain.messages import AIMessage
 from langgraph.types import RunnableConfig, interrupt
 
 from graph_kb_api.core.llm import LLMService
+from graph_kb_api.database.base import get_session as get_db_session
+from graph_kb_api.database.plan_repositories import PlanSessionRepository
 from graph_kb_api.flows.v3.agents import AgentResult
 from graph_kb_api.flows.v3.agents.consistency_checker_agent import ConsistencyCheckerAgent
 from graph_kb_api.flows.v3.agents.document_assembly_agent import DocumentAssemblyAgent
@@ -485,7 +488,8 @@ class ConsistencyNode(SubgraphAwareNode[AssemblySubgraphState]):
         manifest: DocumentManifest | None = state.get("document_manifest")
         if manifest:
             logger.info(
-                "ConsistencyNode: skipping semantic check for multi-document manifest (handled by CompositionReviewNode)"
+                "ConsistencyNode: skipping semantic check for multi-document manifest"
+                " (handled by CompositionReviewNode)"
             )
             return NodeExecutionResult.success(output={"completeness": state.get("completeness", {})})
 
@@ -762,6 +766,39 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
         )
 
 
+async def _persist_assembly_completion_to_db(
+    session_id: str,
+    spec_document_url: str,
+) -> None:
+    """Persist assembly completion evidence directly to plan_sessions.
+
+    Called at the end of AssembleNode so that if the server dies before the
+    parent LangGraph checkpoint is written, reconnect recovery can still detect
+    that assembly finished and re-emit plan.complete.  This mirrors the pattern
+    used by the orchestrate subgraph for task_results.
+    """
+    if not session_id:
+        return
+    try:
+        async with get_db_session() as db:
+            repo = PlanSessionRepository(db)
+            existing = await repo.get(session_id)
+            if existing:
+                existing_phases = dict(existing.completed_phases or {})
+                existing_phases["assembly"] = True
+                await repo.update(
+                    session_id,
+                    completed_phases=existing_phases,
+                    spec_document_url=spec_document_url or existing.spec_document_url or "",
+                    current_phase="assembly",
+                )
+    except Exception:
+        logger.warning(
+            "AssembleNode: failed to persist assembly completion to DB",
+            exc_info=True,
+        )
+
+
 class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
     """Assembles the final document from generated sections via DocumentAssemblyAgent (LLM).
 
@@ -815,6 +852,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         # Multi-document path (Step 18)
         if manifest and manifest.get("entries"):
+            composed_url = ""
             if artifact_svc:
                 composed_index = self._build_composed_index(manifest, spec_name, sections)
                 index_ref = await artifact_svc.store(
@@ -824,6 +862,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                     f"Composed document index for {spec_name}",
                 )
                 artifacts_output["output.index"] = index_ref
+                composed_url = index_ref.get("key", "") if isinstance(index_ref, dict) else ""
 
                 manifest = {**manifest, "composed_index_ref": index_ref}
                 manifest_output = {"document_manifest": manifest}
@@ -834,6 +873,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                     json.dumps(manifest, indent=2, default=str),
                     f"Document manifest for {spec_name}",
                 )
+            await _persist_assembly_completion_to_db(session_id, composed_url)
             return NodeExecutionResult.success(
                 output={
                     "generate": {**generate_data, "flow_score": 1.0},
@@ -871,7 +911,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
         document = result.get("assembled_document", "")
         flow_score = result.get("flow_score", 0.5)
         llm_calls = 1
-        tokens_used = len(document) // 4
+        tokens_used: int = get_token_estimator().count_tokens(document) if document else 0
 
         logger.info(f"AssembleNode: LLM assembly completed with flow_score={flow_score:.2f}")
 
@@ -896,6 +936,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
             "budget": new_budget,
         }
 
+        await _persist_assembly_completion_to_db(session_id, spec_document_path)
         return NodeExecutionResult.success(output=output)
 
     def _build_composed_index(self, manifest: DocumentManifest, spec_name: str, sections: Dict[str, str]) -> str:
@@ -930,7 +971,8 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
             lines.append("\n## Failed/Error Tasks\n")
             for entry in failed:
                 lines.append(
-                    f"- **{entry.get('spec_section', 'Unknown')}** ({entry['task_id']}): {entry.get('error_message', 'Unknown error')}"
+                    f"- **{entry.get('spec_section', 'Unknown')}**"
+                    f" ({entry['task_id']}): {entry.get('error_message', 'Unknown error')}"
                 )
 
         return "\n".join(lines)
@@ -1024,7 +1066,9 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
             tools = get_all_tools(workflow_context.app_context.get_retrieval_settings())
 
         result: AgentResult = await agent.execute(
-            task=agent_task, state=cast("UnifiedSpecState", {"available_tools": tools}), workflow_context=workflow_context
+            task=agent_task,
+            state=cast("UnifiedSpecState", {"available_tools": tools}),
+            workflow_context=workflow_context,
         )
 
         # Extract validation results
@@ -1144,6 +1188,9 @@ class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
         self.step_progress = 1.0
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
+        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
+        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
+
         context: ContextData = state.get("context", {})
         completeness: CompletenessData = state.get("completeness", {})
         generate: GenerateData = state.get("generate", {})
@@ -1159,7 +1206,26 @@ class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
                 [e for e in manifest.get("entries", []) if e.get("status") in ("final", "reviewed")]
             )
 
-        summary = {
+        # Hydrate document preview for the user to review before approving
+        document_preview = await self._hydrate_document_preview(
+            manifest, generate, artifact_svc, state.get("artifacts", {})
+        )
+
+        # Build manifest entries for download links
+        manifest_entries: list[dict[str, Any]] = []
+        if manifest:
+            for entry in manifest.get("entries", []):
+                ref: ArtifactRef | None = entry.get("artifact_ref")
+                manifest_entries.append({
+                    "task_id": entry.get("task_id", ""),
+                    "spec_section": entry.get("spec_section", ""),
+                    "status": entry.get("status", "draft"),
+                    "token_count": entry.get("token_count", 0),
+                    "download_url": ref.get("key", "") if ref else "",
+                    "error_message": entry.get("error_message"),
+                })
+
+        summary: Dict[str, Any] = {
             "spec_name": spec_name,
             "spec_document_path": spec_path,
             "is_valid": validation.get("is_valid", False),
@@ -1167,16 +1233,21 @@ class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
             "warnings_count": len(validation.get("warnings", [])),
             "sections_generated": sections_generated,
         }
+        if document_preview:
+            summary["document_preview"] = document_preview
+        if manifest_entries:
+            summary["manifest_entries"] = manifest_entries
 
-        context_items = await self._load_context_items(state.get("session_id"), state["research"])
+        context_items = await self._load_context_items(state.get("session_id"), state.get("research", {}), context)
         payload: ApprovalInterruptPayload = {
             "type": "approval",
             "phase": "assembly",
             "step": "approval",
             "summary": summary,
             "message": (
-                f"Specification '{spec_name}' is ready. "
-                f"{summary['sections_generated']} sections generated. Approve to finalize?"
+                f"Specification '{spec_name}' is ready for review. "
+                f"{summary['sections_generated']} sections generated. "
+                f"Review the document below, then approve to finalize."
             ),
             "artifacts": self._serialize_artifacts(state["artifacts"]),
             "options": [
@@ -1239,6 +1310,91 @@ class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
             # after the workflow halts — no need to emit here (avoids duplicate).
 
         return NodeExecutionResult.success(output=output)
+
+    @staticmethod
+    async def _hydrate_document_preview(
+        manifest: DocumentManifest | None,
+        generate: GenerateData,
+        artifact_svc: ArtifactService | None,
+        artifacts: Dict[str, ArtifactRef] | None = None,
+    ) -> str:
+        """Build a markdown preview of the assembled document for user review.
+
+        Multi-doc path: hydrates each manifest entry from blob storage and
+        concatenates them under section headings.
+        Legacy path: loads the final assembled document from the output.spec
+        artifact (produced by AssembleNode), NOT the raw pre-assembly sections.
+
+        The preview is token-capped to avoid oversized interrupt payloads.
+        """
+        max_preview_tokens = 40_000
+        estimator = get_token_estimator()
+
+        # Multi-document manifest path
+        if manifest and manifest.get("entries") and artifact_svc:
+            parts: list[str] = []
+            tokens_used = 0
+            spec_name = manifest.get("spec_name", "Document")
+            parts.append(f"# {spec_name}\n")
+
+            for entry in manifest.get("entries", []):
+                if entry.get("status") in ("failed", "error"):
+                    section = entry.get("spec_section", entry.get("task_id", ""))
+                    err = entry.get("error_message", "Generation failed")
+                    parts.append(f"## {section}\n\n*Section failed: {err}*\n")
+                    continue
+
+                ref: ArtifactRef | None = entry.get("artifact_ref")
+                if not ref:
+                    continue
+
+                section_heading = entry.get("spec_section", entry.get("task_id", "Section"))
+                try:
+                    content = await artifact_svc.retrieve(ref)
+                    if content:
+                        content_tokens = estimator.count_tokens(content)
+                        remaining = max_preview_tokens - tokens_used
+                        if remaining <= 0:
+                            parts.append(f"## {section_heading}\n\n*[Content truncated — budget exceeded]*\n")
+                            continue
+                        if content_tokens > remaining:
+                            content = truncate_to_tokens(content, remaining)
+                            content += "\n\n*[Section truncated for preview]*"
+                        parts.append(f"## {section_heading}\n\n{content}\n")
+                        tokens_used += min(content_tokens, remaining)
+                except Exception as e:
+                    logger.warning("AssemblyApprovalNode: failed to hydrate %s: %s", entry.get("task_id"), e)
+                    parts.append(f"## {section_heading}\n\n*[Could not load content]*\n")
+
+            return "\n".join(parts) if len(parts) > 1 else ""
+
+        # Legacy single-document path: load the final assembled doc from artifacts
+        if artifact_svc and artifacts:
+            spec_ref: ArtifactRef | None = artifacts.get("output.spec")
+            if spec_ref:
+                try:
+                    assembled = await artifact_svc.retrieve(spec_ref)
+                    if assembled:
+                        if estimator.count_tokens(assembled) > max_preview_tokens:
+                            assembled = truncate_to_tokens(assembled, max_preview_tokens)
+                            assembled += "\n\n*[Document truncated for preview]*"
+                        return assembled
+                except Exception as e:
+                    logger.warning("AssemblyApprovalNode: failed to load output.spec: %s", e)
+
+        # Fallback: raw sections (should rarely be reached)
+        sections = generate.get("sections", {})
+        if sections:
+            parts = []
+            for name, content in sections.items():
+                parts.append(f"## {name}\n\n{content}")
+            combined = "\n\n".join(parts)
+            if estimator.count_tokens(combined) > max_preview_tokens:
+                combined = truncate_to_tokens(combined, max_preview_tokens)
+                combined += "\n\n*[Document truncated for preview]*"
+            return combined
+
+        return ""
 
 
 # ── Finalize Node ─────────────────────────────────────────────────────
@@ -1313,7 +1469,10 @@ class FinalizeNode(SubgraphAwareNode[AssemblySubgraphState]):
             try:
                 await emit_error(
                     session_id=session_id,
-                    message="Plan workflow completed but no document was generated. The assembly phase may have failed silently.",
+                    message=(
+                        "Plan workflow completed but no document was generated."
+                        " The assembly phase may have failed silently."
+                    ),
                     code="NO_DOCUMENT",
                     phase="assembly",
                     client_id=client_id,

@@ -280,37 +280,59 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                         safe_name = self._url_to_safe_name(url, i)
                         storage_key = f"plan_docs/{session_id}/{doc_id}.md"
 
-                        # Store blob
-                        await storage.backend.store(
-                            path=storage_key,
-                            content=content_bytes,
-                            content_type="text/markdown",
-                        )
+                        try:
+                            # Store blob first (outside DB savepoint — blob store is not transactional)
+                            await storage.backend.store(
+                                path=storage_key,
+                                content=content_bytes,
+                                content_type="text/markdown",
+                                metadata={
+                                    "doc_id": doc_id,
+                                    "original_filename": safe_name,
+                                    "source_url": url,
+                                    "session_id": session_id,
+                                },
+                            )
 
-                        # Create document record
-                        await doc_repo.create(
-                            storage_key=storage_key,
-                            original_filename=safe_name,
-                            mime_type="text/markdown",
-                            file_size=len(content_bytes),
-                            uploaded_by="system",
-                            storage_backend="local",
-                            document_type="reference_url",
-                            file_hash=file_hash,
-                            metadata={"source_url": url},
-                            document_id=doc_id,
-                        )
-                        await db_session.commit()
+                            # Wrap DB writes in a savepoint so a per-row failure doesn't
+                            # poison the outer session transaction.
+                            async with db_session.begin_nested():
+                                await doc_repo.create(
+                                    storage_key=storage_key,
+                                    original_filename=safe_name,
+                                    mime_type="text/markdown",
+                                    file_size=len(content_bytes),
+                                    uploaded_by="system",
+                                    storage_backend="local",
+                                    document_type="reference_url",
+                                    file_hash=file_hash,
+                                    metadata={"source_url": url},
+                                    document_id=doc_id,
+                                )
 
-                        # Associate with plan session
-                        await assoc_repo.associate(
-                            source_type="plan_session",
-                            source_id=session_id,
-                            document_id=doc_id,
-                            role="reference",
-                            associated_by="system",
-                            notes=f"Scraped from {url}",
-                        )
+                                await assoc_repo.associate(
+                                    source_type="plan_session",
+                                    source_id=session_id,
+                                    document_id=doc_id,
+                                    role="reference",
+                                    associated_by="system",
+                                    notes=f"Scraped from {url}",
+                                )
+
+                        except Exception as e:
+                            logger.warning(
+                                "CollectContextNode: failed to store URL doc %d (%s) — %r. Skipping.",
+                                i,
+                                url,
+                                e,
+                            )
+                            # Best-effort blob cleanup — avoids orphaning a storage object
+                            # when the DB savepoint rolled back after the blob was written.
+                            try:
+                                await storage.backend.delete(storage_key)
+                            except Exception:
+                                pass
+                            continue
 
                         summary = content.strip()
                         url_meta_list.append(
@@ -377,6 +399,21 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
             if doc_id and doc_id not in supporting_ids:
                 supporting_ids.append(doc_id)
 
+        # Associate library (ChromaDB-only) documents with this plan session so
+        # FeedbackReviewNode's DocumentRepository.exists() validation passes for
+        # documents selected from the global library (not uploaded via the plan router).
+        _lib_docs: List[tuple[str, str]] = []
+        if primary_id:
+            _lib_docs.append((primary_id, "primary"))
+        for _sid in supporting_ids:
+            if _sid:
+                _lib_docs.append((_sid, "supporting"))
+        if _lib_docs:
+            _wc: WorkflowContext | None = configurable.get("context")
+            await CollectContextNode._ensure_library_docs_associated(
+                _lib_docs, session_id, _wc
+            )
+
         all_doc_entries: List[Dict[str, str]] = []
 
         # Load primary document content.
@@ -398,8 +435,7 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                 # document store. Fetch content directly from the vector store and
                 # inject it so it's available to the LLM without requiring a DB write.
                 if not primary_docs:
-                    workflow_context = configurable.get("context")
-                    vector_store = getattr(workflow_context, "vector_store", None) if workflow_context else None
+                    vector_store = workflow_context.vector_store if workflow_context is not None else None
                     if vector_store is not None:
                         try:
                             chunk = vector_store.get(primary_id)
@@ -584,6 +620,169 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
         stripped = _re.sub(r"^https?://", "", url).strip("/")
         safe = _re.sub(r"[^a-zA-Z0-9._-]", "_", stripped)[:80]
         return f"reference_{index}_{safe}.txt"
+
+    @staticmethod
+    async def _ensure_library_docs_associated(
+        doc_ids_with_roles: List[tuple[str, str]],
+        session_id: str,
+        workflow_context: WorkflowContext | None,
+    ) -> None:
+        """Import library documents into the plan document system.
+
+        For each doc_id not already in the uploaded_documents PostgreSQL table,
+        looks it up first in ChromaDB then in blob storage. If found in either,
+        creates an UploadedDocument record and a DocumentLink association for this
+        plan session so that FeedbackReviewNode's DocumentRepository.exists()
+        validation passes for documents selected from the global library
+        (uploaded via /docs, not the plan router).
+
+        Args:
+            doc_ids_with_roles: List of (doc_id, role) pairs — role is "primary" or "supporting".
+            session_id: The current plan session ID.
+            workflow_context: WorkflowContext for ChromaDB vector store access.
+        """
+        if not doc_ids_with_roles or not session_id:
+            return
+
+        vector_store: Any = workflow_context.vector_store if workflow_context is not None else None
+
+        async with get_db_session_ctx() as db_session:
+            doc_repo = DocumentRepository(db_session)
+            assoc_repo = DocumentLinkRepository(db_session)
+
+            for doc_id, role in doc_ids_with_roles:
+                if not doc_id:
+                    continue
+
+                doc_exists = await doc_repo.exists(doc_id)
+
+                if not doc_exists:
+                    # ── Attempt 1: ChromaDB lookup ────────────────────────────
+                    meta: Dict[str, Any] = {}
+                    if vector_store is not None:
+                        try:
+                            chunk = vector_store.get(doc_id)
+                            if chunk is not None:
+                                meta = chunk.metadata or {}
+                                logger.info(
+                                    "CollectContextNode: found library doc %s in ChromaDB",
+                                    doc_id,
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "CollectContextNode: ChromaDB lookup failed for %s: %s",
+                                doc_id,
+                                e,
+                            )
+
+                    # ── Attempt 2: blob storage scan ──────────────────────────
+                    if not meta:
+                        try:
+                            blob_storage = BlobStorage.from_env()
+                            blob_items = await blob_storage.backend.list_with_metadata("documents/")
+                            match = next(
+                                (
+                                    item
+                                    for item in blob_items
+                                    if item.get("metadata", {}).get("doc_id") == doc_id
+                                ),
+                                None,
+                            )
+                            if match:
+                                blob_meta = match.get("metadata", {})
+                                meta = {
+                                    "storage_key": match["path"],
+                                    "filename": (
+                                        blob_meta.get("original_filename")
+                                        or blob_meta.get("filename")
+                                        or doc_id
+                                    ),
+                                    "mime_type": blob_meta.get("mime_type") or "application/octet-stream",
+                                    "file_size": blob_meta.get("file_size") or 0,
+                                    "file_hash": blob_meta.get("file_hash"),
+                                }
+                                logger.info(
+                                    "CollectContextNode: found library doc %s in blob storage",
+                                    doc_id,
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "CollectContextNode: blob storage scan failed for %s: %s",
+                                doc_id,
+                                e,
+                            )
+
+                    if not meta:
+                        logger.warning(
+                            "CollectContextNode: doc %s not found in ChromaDB or blob storage — skipping",
+                            doc_id,
+                        )
+                        continue
+
+                    storage_key: str = meta.get("storage_key") or f"documents/{doc_id}"
+                    filename: str = meta.get("filename") or meta.get("file_path") or doc_id
+                    mime_type: str = meta.get("mime_type") or (
+                        "application/pdf" if filename.lower().endswith(".pdf") else "application/octet-stream"
+                    )
+                    file_size: int = int(meta.get("file_size") or 0)
+                    file_hash: str | None = meta.get("file_hash") or None
+
+                    try:
+                        async with db_session.begin_nested():
+                            await doc_repo.create(
+                                storage_key=storage_key,
+                                original_filename=filename,
+                                mime_type=mime_type,
+                                file_size=file_size,
+                                uploaded_by="system",
+                                storage_backend="local",
+                                document_type="library",
+                                file_hash=file_hash,
+                                document_id=doc_id,
+                            )
+                        logger.info(
+                            "CollectContextNode: created UploadedDocument record for library doc %s (%s)",
+                            doc_id,
+                            filename,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "CollectContextNode: failed to create UploadedDocument for %s: %s",
+                            doc_id,
+                            e,
+                        )
+                        continue
+
+                # Always ensure a DocumentLink exists for this session — a doc imported
+                # in a previous session already has an UploadedDocument row but not a
+                # DocumentLink for the current session_id.
+                try:
+                    existing_assoc = await assoc_repo.get_association(
+                        "plan_session", session_id, doc_id
+                    )
+                    if not existing_assoc:
+                        async with db_session.begin_nested():
+                            await assoc_repo.associate(
+                                source_type="plan_session",
+                                source_id=session_id,
+                                document_id=doc_id,
+                                role=role,
+                                associated_by="system",
+                                notes="Imported from library document store",
+                            )
+                        logger.info(
+                            "CollectContextNode: linked library doc %s with session %s as %s",
+                            doc_id,
+                            session_id,
+                            role,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "CollectContextNode: failed to link doc %s with session %s: %s",
+                        doc_id,
+                        session_id,
+                        e,
+                    )
 
 
 class ReviewNode(SubgraphAwareNode[ContextSubgraphState]):
@@ -999,6 +1198,38 @@ class FeedbackReviewNode(SubgraphAwareNode[ContextSubgraphState]):
                 supporting_ids.append(doc_id)
         if supporting_ids:
             context_items["supporting_doc_ids"] = supporting_ids
+        supporting_doc_ids: list[str] = list(context_items.get("supporting_doc_ids", []))
+
+        # Validate both primary_document_id and supporting_doc_ids against DB —
+        # removes stale/orphaned IDs left behind by checkpoint replay or DB wipes.
+        primary_doc_id_to_validate = context_items.get("primary_document_id", "")
+        async with get_db_session_ctx() as db_session:
+            doc_repo = DocumentRepository(db_session)
+
+            if primary_doc_id_to_validate:
+                if not await doc_repo.exists(primary_doc_id_to_validate):
+                    logger.warning(
+                        "FeedbackReviewNode: primary_document_id %r not found in DB — "
+                        "clearing from state (stale checkpoint or orphaned document)",
+                        primary_doc_id_to_validate,
+                    )
+                    context_items.pop("primary_document_id", None)
+
+            if supporting_doc_ids:
+                valid_ids: list[str] = []
+                for doc_id in supporting_doc_ids:
+                    if await doc_repo.exists(doc_id):
+                        valid_ids.append(doc_id)
+                    else:
+                        logger.warning(
+                            "FeedbackReviewNode: supporting_doc_id %r not found in DB — "
+                            "removing from state (stale checkpoint or orphaned document)",
+                            doc_id,
+                        )
+                if len(valid_ids) != len(supporting_doc_ids):
+                    supporting_doc_ids = valid_ids
+                    context_items["supporting_doc_ids"] = valid_ids
+
         user_explanation = context.get("user_explanation", "")
         if user_explanation:
             context_items["user_explanation"] = user_explanation
@@ -1017,7 +1248,6 @@ class FeedbackReviewNode(SubgraphAwareNode[ContextSubgraphState]):
 
         # Persist context_items to database for cross-phase access
         try:
-            from graph_kb_api.database.base import get_db_session_ctx
             from graph_kb_api.database.plan_repositories import PlanSessionRepository
 
             session_id = state.get("session_id")

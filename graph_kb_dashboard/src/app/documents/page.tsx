@@ -82,7 +82,7 @@ export default function DocumentsPage() {
   const [selectedCategory, setSelectedCategory] = useState<string>('__all__');
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [viewMode, setViewMode] = useState<'tree' | 'list'>('tree');
-  const [indexForSearch, setIndexForSearch] = useState(true);
+  const [indexForSearch, setIndexForSearch] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
   const [pendingUploads, setPendingUploads] = useState<PendingFile[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -129,24 +129,41 @@ export default function DocumentsPage() {
     if (documents.length > 0 && expandedGroups.size === 0) {
       const groupKeys = new Set<string>();
       documents.forEach((doc) => {
-        groupKeys.add(doc.parent || '__uncategorized__');
+        if (doc.parent) groupKeys.add(doc.parent);
+        else if (doc.category) groupKeys.add(`cat:${doc.category}`);
+        else groupKeys.add('__uncategorized__');
       });
       setExpandedGroups(groupKeys);
     }
   }, [documents]);
 
-  // Group documents by parent, then by category for uncategorized
+  // Group documents by parent; when no parent, fall back to category
   const groupedDocuments = useMemo((): GroupedDocumentsRaw => {
     const groups: GroupedDocumentsRaw = {};
 
     documents.forEach((doc) => {
-      const groupKey = doc.parent || '__uncategorized__';
-      const groupLabel = doc.parent || 'Uncategorized';
+      let groupKey: string;
+      let groupLabel: string;
+      let groupType: 'parent' | 'category' | 'uncategorized';
+
+      if (doc.parent) {
+        groupKey = doc.parent;
+        groupLabel = doc.parent;
+        groupType = 'parent';
+      } else if (doc.category) {
+        groupKey = `cat:${doc.category}`;
+        groupLabel = doc.category;
+        groupType = 'category';
+      } else {
+        groupKey = '__uncategorized__';
+        groupLabel = 'Uncategorized';
+        groupType = 'uncategorized';
+      }
 
       if (!groups[groupKey]) {
         groups[groupKey] = {
           label: groupLabel,
-          type: doc.parent ? 'parent' : 'uncategorized',
+          type: groupType,
           documents: [],
         };
       }

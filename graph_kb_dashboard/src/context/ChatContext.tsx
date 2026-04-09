@@ -71,6 +71,9 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
   // Track active stream abort controller so we can cancel on unmount
   const streamControllerRef = useRef<AbortController | null>(null);
 
+  // Debounce guard to prevent double-click creating duplicate plan sessions
+  const planStartPending = useRef(false);
+
   // Track whether an ingest is in progress so we can subscribe/unsubscribe
   const [ingestActive, setIngestActive] = useState(false);
 
@@ -410,6 +413,8 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
   // ---------------------------------------------------------------------------
   const startPlanFlow = useCallback(
     (planName: string): boolean => {
+      if (planStartPending.current) return false;
+
       if (!sharedWs || !wsConnected) {
         const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws';
         const errorMessage: ChatMessage = {
@@ -420,8 +425,11 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
           metadata: { timestamp: new Date() },
         };
         addMessage(errorMessage);
-        return true;
+        return false;
       }
+
+      planStartPending.current = true;
+      setTimeout(() => { planStartPending.current = false; }, 2000);
 
       const startMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),

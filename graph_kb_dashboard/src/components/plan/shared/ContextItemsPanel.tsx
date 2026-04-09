@@ -13,7 +13,8 @@ import {
     Loader2,
     X,
 } from 'lucide-react';
-import { listPlanDocuments, downloadPlanDocument } from '@/lib/api/planDocuments';
+import { downloadPlanDocument } from '@/lib/api/planDocuments';
+import { usePlanDocumentFilenames } from '@/hooks/usePlanDocumentFilenames';
 import { getDocument } from '@/lib/api/documents';
 import { getPlanArtifact } from '@/lib/api/planArtifacts';
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
@@ -190,7 +191,6 @@ function ContextTextRow({ item, onView }: { item: ContextTextItem; onView: () =>
 
 export function ContextItemsPanel({ contextItems, sessionId }: ContextItemsPanelProps) {
     const [overlayDoc, setOverlayDoc] = useState<OverlayDoc | null>(null);
-    const [filenameMap, setFilenameMap] = useState<Record<string, string>>({});
     const [mounted, setMounted] = useState(false);
 
     // SSR guard: document.body is not available during server-side rendering
@@ -198,44 +198,15 @@ export function ContextItemsPanel({ contextItems, sessionId }: ContextItemsPanel
         setMounted(true);
     }, []);
 
-    // Populate filename map for plan documents
-    useEffect(() => {
-        if (sessionId && contextItems && (contextItems.primary_document_id || contextItems.supporting_doc_ids?.length)) {
-            listPlanDocuments(sessionId).then((res) => {
-                const map: Record<string, string> = {};
-                for (const doc of res.documents) {
-                    map[doc.id] = doc.original_filename;
-                }
-                setFilenameMap(map);
-            }).catch(() => {
-                // API failed — build a fallback map from rounds data if available
-                const fallbackMap: Record<string, string> = {};
-                const rounds = contextItems?.rounds ?? [];
-                let docCounter = 1;
-                // Check if rounds contain filename hints
-                for (const round of rounds) {
-                    const docs = round.uploaded_docs ?? [];
-                    for (const docId of docs) {
-                        if (!fallbackMap[docId]) {
-                            fallbackMap[docId] = `Uploaded Document ${docCounter++}`;
-                        }
-                    }
-                }
-                // Assign fallback names for primary and supporting docs
-                if (contextItems?.primary_document_id && !fallbackMap[contextItems.primary_document_id]) {
-                    fallbackMap[contextItems.primary_document_id] = 'Primary Document';
-                }
-                for (const id of (contextItems?.supporting_doc_ids ?? [])) {
-                    if (!fallbackMap[id]) {
-                        fallbackMap[id] = `Supporting Document ${docCounter++}`;
-                    }
-                }
-                if (Object.keys(fallbackMap).length > 0) {
-                    setFilenameMap(fallbackMap);
-                }
-            });
-        }
-    }, [sessionId, contextItems]);
+    // Stable keys derived from document IDs — avoids re-fetching on every
+    // contextItems object reference change (which happens on every re-render).
+    const primaryDocId = contextItems?.primary_document_id ?? null;
+
+    const filenameMap = usePlanDocumentFilenames(
+        sessionId,
+        primaryDocId,
+        contextItems?.supporting_doc_ids ?? [],
+    );
 
     if (!contextItems || Object.keys(contextItems).length === 0) return null;
 
@@ -298,8 +269,11 @@ export function ContextItemsPanel({ contextItems, sessionId }: ContextItemsPanel
     const handleViewDocument = async (docId: string) => {
         const initialFilename = filenameMap[docId] || docId;
         setOverlayDoc({ filename: initialFilename, content: '', loading: true });
+        const isPdf = initialFilename.toLowerCase().endsWith('.pdf');
         try {
-            if (sessionId) {
+            // PDFs skip the raw download (returns binary) and use getDocument
+            // which does server-side pypdf text extraction.
+            if (sessionId && !isPdf) {
                 try {
                     const content = await downloadPlanDocument(sessionId, docId);
                     setOverlayDoc({ filename: initialFilename, content });

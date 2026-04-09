@@ -11,6 +11,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 
 from graph_kb_api.dependencies import get_graph_kb_facade
+from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 from graph_kb_api.schemas.settings import (
     MCPServerConfig,
     MCPSettingsRequest,
@@ -124,9 +125,9 @@ def _load_settings(facade) -> SettingsResponse:
             max_depth = prefs.max_depth
 
     # Load extra settings (model, temperature, auto_review) from metadata store
-    plan_max_llm_calls = 200
-    plan_max_tokens = 500_000
-    plan_max_wall_clock_s = 1800
+    plan_max_llm_calls = BudgetGuard.get_default_max_llm_calls()
+    plan_max_tokens = BudgetGuard.get_default_max_tokens()
+    plan_max_wall_clock_s = BudgetGuard.get_default_max_wall_clock_s()
     if facade.metadata_store is not None:
         extra = _load_extra_settings(facade.metadata_store)
         if extra.get("model") is not None:

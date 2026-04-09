@@ -171,6 +171,12 @@ class PlanPausePayload(BaseModel):
     session_id: str = Field(..., min_length=1)
 
 
+class PlanCancelPayload(BaseModel):
+    """Payload for plan.cancel — cancels and tears down an active plan session."""
+
+    session_id: str = Field(..., min_length=1)
+
+
 class PlanRetryPayload(BaseModel):
     """Payload for plan.retry — retries a failed phase."""
 

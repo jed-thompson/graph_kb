@@ -235,6 +235,7 @@ export function BasePhaseContent({
                         message={promptData.message}
                         tasks={promptData.tasks}
                         onSubmit={onSubmit}
+                        sessionId={sessionId}
                     />
                 ) : (promptData as Record<string, unknown>).type === 'task_context_input' ? (
                     <TaskContextInputForm

@@ -111,6 +111,16 @@ class DocumentRepository:
             return True
         return False
 
+    async def exists(self, document_id: str) -> bool:
+        """Check if a document exists without loading the full record."""
+        result = await self._execute(
+            select(UploadedDocument.id).where(
+                UploadedDocument.id == document_id,
+                UploadedDocument.deleted_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
 
 class DocumentLinkRepository:
     """Repository for polymorphic document-entity associations."""

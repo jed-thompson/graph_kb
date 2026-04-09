@@ -3,7 +3,6 @@
 import { useState } from 'react';
 
 import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
-import { groupPlanTasks } from '@/lib/planEventUtils';
 import { cn } from '@/lib/utils';
 import type { PhaseField, PlanArtifactManifestEntry } from '@shared/websocket-events';
 import {
@@ -406,8 +405,7 @@ export function OrchestratePhase({
         displayTasks = Array.from(syntheticTasksMap.values());
     }
 
-    const taskGroups = groupPlanTasks(displayTasks);
-    const completedTaskCount = taskGroups.filter((g) => g.parent.status === 'complete').length;
+    const completedTaskCount = displayTasks.filter((t) => t.status === 'complete').length;
     const deliverables = completedTaskArtifacts?.filter(isDeliverableArtifact) ?? [];
     const totalDeliverableSize = deliverables.reduce((sum, artifact) => sum + artifact.size_bytes, 0);
     const activeTask = displayTasks.find((task) => task.status === 'in_progress' || task.status === 'critiquing');
@@ -446,19 +444,19 @@ export function OrchestratePhase({
             {displayTasks.length > 0 && (
                 <div className="space-y-3">
                     <div className="flex items-center justify-between text-sm font-medium text-slate-700 dark:text-slate-300">
-                        <h3>Generative Tasks ({taskGroups.length})</h3>
+                        <h3>Generative Tasks ({displayTasks.length})</h3>
                         <div className="flex items-center gap-4 text-xs text-slate-600 dark:text-slate-500">
                             {deliverables.length > 0 && (
                                 <span className="text-emerald-600 dark:text-emerald-400/80 font-mono font-medium">
                                     {(totalDeliverableSize / 1024).toFixed(1)}K gen
                                 </span>
                             )}
-                            <span className="font-medium">{completedTaskCount} / {taskGroups.length} Completed</span>
+                            <span className="font-medium">{completedTaskCount} / {displayTasks.length} Completed</span>
                         </div>
                     </div>
                     <div className="space-y-2">
-                        {taskGroups.map((group) => (
-                            <TaskCard key={group.key} task={group.parent} childTasks={group.children} />
+                        {displayTasks.map((task) => (
+                            <TaskCard key={task.id} task={task} />
                         ))}
                     </div>
                 </div>

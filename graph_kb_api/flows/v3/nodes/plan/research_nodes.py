@@ -92,9 +92,9 @@ class FormulateQueriesNode(SubgraphAwareNode[ResearchSubgraphState]):
             # Parse LLM response
             parsed: dict[str, Any] = self._parse_llm_response(content)
 
-            # Decrement budget after LLM call
+            # Decrement budget after LLM call (count response tokens, not prompt)
 
-            tokens_used: int = get_token_estimator().count_tokens(prompt)
+            tokens_used: int = get_token_estimator().count_tokens(content)
             new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
 
             return NodeExecutionResult.success(
@@ -133,9 +133,9 @@ class FormulateQueriesNode(SubgraphAwareNode[ResearchSubgraphState]):
             section_lines = []
             for doc in section_index:
                 role_label = doc.get("role", "supporting")
-                section_lines.append(f"\n### {doc['filename']} ({role_label})")
+                section_lines.append(f"\n### {doc.get('filename', 'unknown')} ({role_label})")
                 for sec in doc.get("sections", []):
-                    section_lines.append(f"- {sec['heading']}")
+                    section_lines.append(f"- {sec.get('heading', 'Untitled')}")
             parts.append("## Section Index\n" + "\n".join(section_lines))
 
         # Append primary doc content (truncated to 3K tokens).
@@ -316,10 +316,7 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
             )
             graph_results = [{"source": "agent_findings", "data": findings}]
 
-        # Estimate LLM calls from agent token usage (or default to 1)
-        agent_tokens = result.get("tokens", {})
-        total_tokens = agent_tokens.get("total_tokens", 0) if isinstance(agent_tokens, dict) else 0
-        llm_calls = max(1, round(total_tokens / 3000)) if total_tokens > 0 else 1
+        llm_calls = result.get("llm_calls_used", 1)
 
         try:
             await emit_phase_progress(
@@ -379,11 +376,22 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
 
         # Track whether structured data was actually retrieved (vs narrative fallback).
         # When False, the research loop should not iterate — more passes won't help.
+        # On repeat iterations (research_gap_iterations > 0), graph-only results are
+        # not counted as "new" structured data — the graph KB is a static index and
+        # re-querying it produces the same results. Only web/vector sources indicate
+        # genuinely fresh data. This triggers the stagnation early-exit in
+        # _route_after_gap_check after 2 iterations when web=0 AND vector=0.
+        # Uploaded documents are always treated as available structured data — the
+        # gap_check LLM now receives their full content and can resolve gaps directly.
+        iteration_count = research.get("research_gap_iterations", 0)
+        has_uploaded_docs = bool(context.get("uploaded_document_contents", []))
         has_structured_data = bool(
-            web_results
+            has_uploaded_docs
+            or web_results
             or vector_results
             or (
-                graph_results
+                iteration_count == 0
+                and graph_results
                 and not any(isinstance(r, dict) and r.get("source") == "agent_findings" for r in graph_results)
             )
         )
@@ -424,6 +432,7 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
         llm: Any | None = configurable.get("llm")
         artifact_svc: Any | None = configurable.get("artifact_service")
+        workflow_context: WorkflowContext | None = configurable.get("context")
         budget: BudgetState = state.get("budget", {})
         research: ResearchData = state.get("research", {})
 
@@ -481,7 +490,6 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
                             "findings": aggregated,
                         },
                         "artifacts": {},
-                        "budget": budget,
                     }
                 )
 
@@ -506,7 +514,6 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
                         "findings": empty_findings["findings"],
                     },
                     "artifacts": {},
-                    "budget": budget,
                 }
             )
 
@@ -532,7 +539,7 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
         session_id: str | None = state.get("session_id")
         if session_id and findings_markdown:
             try:
-                storage: BlobStorage = BlobStorage.from_env()
+                storage: BlobStorage = workflow_context.blob_storage if workflow_context else BlobStorage.from_env()
                 async with get_db_session_ctx() as db_session:
                     doc_repo = DocumentRepository(db_session)
                     assoc_repo = DocumentLinkRepository(db_session)
@@ -720,6 +727,7 @@ class GapCheckNode(SubgraphAwareNode[ResearchSubgraphState]):
             "context": {
                 "research_phase": True,
                 "document_section_index": context.get("document_section_index", []),
+                "uploaded_document_contents": context.get("uploaded_document_contents", []),
             },
         }
 
@@ -884,7 +892,11 @@ class ConfidenceGateNode(SubgraphAwareNode[ResearchSubgraphState]):
         spec_name = context.get("spec_name", "Unknown")
         user_explanation = context.get("user_explanation", "Not provided")
         research_summary = findings.get("summary", "No summary")
-        gap_descriptions = [g.get("question", g.get("description", "")) for g in gaps if isinstance(g, dict)]
+        gap_descriptions = [
+            f"[{g.get('type', 'unknown').upper()} / importance={g.get('importance', 'medium')}] "
+            f"{g.get('question', g.get('description', ''))}"
+            for g in gaps if isinstance(g, dict)
+        ]
         risk_descriptions = [r.get("description", "") for r in risks if isinstance(r, dict)]
 
         prompt = get_agent_prompt_manager().render_prompt(
@@ -907,7 +919,7 @@ class ConfidenceGateNode(SubgraphAwareNode[ResearchSubgraphState]):
                 role_label = doc.get("role", "supporting")
                 section_lines.append(f"\n### {doc.get('filename', 'unknown')} ({role_label})")
                 for sec in doc.get("sections", []):
-                    section_lines.append(f"- {sec['heading']}")
+                    section_lines.append(f"- {sec.get('heading', 'Untitled')}")
             prompt += "\n\n## Document Section Index\n"
             prompt += "".join(section_lines)
             prompt += "\n\nEvaluate per-section research coverage using the above index."
@@ -980,7 +992,7 @@ class ResearchApprovalNode(SubgraphAwareNode[ResearchSubgraphState]):
         )
 
         # Request user approval via interrupt
-        context_items: dict[str, Any] = await self._load_context_items(state.get("session_id"), state["research"])
+        context_items: dict[str, Any] = await self._load_context_items(state.get("session_id"), research, context)
         payload: ApprovalInterruptPayload = {
             "type": "approval",
             "phase": "research",

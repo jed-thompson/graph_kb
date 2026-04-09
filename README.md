@@ -1,57 +1,40 @@
-# 🚀 SA-Doc-Generator
+# GraphKB — Code Knowledge Graph Agent
 
-An AI-powered documentation agent that ingests GitHub repositories and supporting documents, builds a semantic knowledge graph, and generates structured technical documentation using RAG (Retrieval-Augmented Generation).
+An AI-powered agent that ingests GitHub repositories, builds a semantic knowledge graph, and answers questions about codebases using RAG (Retrieval-Augmented Generation).
 
 ## Overview
 
-SA-Doc-Generator combines vector embeddings (ChromaDB) with a graph knowledge base (Neo4j) to provide deep code understanding. It can:
+GraphKB combines vector embeddings (ChromaDB) with a graph knowledge base (Neo4j) to provide deep code understanding. It can:
 
-- Ingest and index GitHub repositories with full AST parsing
+- Ingest and index GitHub repositories with AST parsing
 - Build relationship graphs (imports, calls, contains) for code navigation
-- Answer questions about codebases with context-aware responses
-- Generate technical specifications from templates
-- Visualize code architecture and flows as Mermaid diagrams
+- Answer questions about codebases via a chat interface
+- Generate technical specifications and documentation from templates
+- Visualize code architecture and call graphs as Mermaid diagrams
+- Run multi-step agentic research workflows via LangGraph
 
-The application runs as an interactive chat interface powered by Chainlit.
+The application exposes a **FastAPI backend** with REST and WebSocket endpoints, and a **Next.js dashboard** as the primary UI.
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    subgraph UI["Chainlit UI :8090"]
-        Commands["/ingest, /generate, /ask..."]
-        Flows["Multi-step Flows"]
-        Handlers["File Upload & Actions"]
-        Intent["Intent Detection"]
-    end
-
-    subgraph Core["Core Services"]
-        LLM["LLM (GPT-4)"]
-        RAG["RAG Engine"]
-        Templates["Template Manager"]
-        Steering["Steering Manager"]
-    end
-
-    subgraph GraphKB["Graph Knowledge Base"]
-        Ingestion["Ingestion<br/>(AST Parsing)"]
-        Retrieval["Retrieval<br/>(Graph Traversal)"]
-        Viz["Visualization<br/>(Mermaid)"]
-    end
-
-    subgraph Storage["Storage Layer"]
-        ChromaDB[("ChromaDB :8091<br/>Vector Embeddings")]
-        Neo4j[("Neo4j :7474/:7687<br/>Graph Relationships")]
-    end
-
-    UI --> Core
-    Core --> GraphKB
-    RAG --> ChromaDB
-    Retrieval --> Neo4j
-    Ingestion --> ChromaDB
-    Ingestion --> Neo4j
-    Viz --> Neo4j
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Next.js Dashboard  :3000                                   │
+│  Chat · Repositories · Visualize · Plan · Documents        │
+└─────────────────────┬───────────────────────────────────────┘
+                      │  REST + WebSocket
+┌─────────────────────▼───────────────────────────────────────┐
+│  FastAPI + LangGraph  :8000                                 │
+│  /api/v1/* · /ws · /ws/ask-code · /ws/ingest               │
+└──────┬──────────┬──────────────┬──────────────┬────────────┘
+       │          │              │              │
+  ┌────▼───┐ ┌───▼────┐  ┌──────▼─────┐ ┌─────▼─────┐
+  │ Neo4j  │ │ChromaDB│  │ PostgreSQL │ │   MinIO   │
+  │ :7688  │ │ :8091  │  │   :5432    │ │   :9010   │
+  │ Graph  │ │Vectors │  │  Metadata  │ │  Blobs/S3 │
+  └────────┘ └────────┘  └────────────┘ └───────────┘
 ```
 
 ---
@@ -60,352 +43,312 @@ flowchart TB
 
 ### Prerequisites
 
-- **Python 3.11+** (required for proper type hint support)
-- Docker and Docker Compose
-- OpenAI API key
+- **Python 3.11+**
+- **Node.js 18+**
+- **Docker and Docker Compose**
+- **OpenAI API key**
 - (Optional) GitHub token for private repositories
+- (Optional) Hugging Face token for embedding model downloads
 
 ### 1. Clone and Configure
 
 ```bash
 git clone <repo-url>
-cd sa-doc-generator
+cd GraphKB-TaskAgent
 
-# Set up environment variables
 cp .env.example .env
 ```
 
-Edit `.env` with your credentials:
+Edit `.env` with your credentials — at minimum set:
+
 ```bash
 OPENAI_API_KEY=sk-your-key-here
-GITHUB_TOKEN=ghp-your-token-here  # Optional, for private repos
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=password
+GITHUB_TOKEN=ghp-your-token-here   # optional, for private repos
+HF_TOKEN=hf_your-token-here        # for Jina embeddings
 ```
 
-### 2. Restore Pre-indexed Data (Optional)
-
-If backups are available, restore the pre-indexed `REPO-NAME` codebase:
-
-```bash
-./scripts/restore_databases.sh
-```
-
-This loads vector embeddings and graph relationships so you can start querying immediately.
-
-### 3. Start the Application
+### 2. Start All Services
 
 ```bash
 docker compose up -d
 ```
 
-### 4. Access the UI
+This starts the API, dashboard, Neo4j, ChromaDB, PostgreSQL, and MinIO.
 
-- **Chat Interface**: http://localhost:8090
-- **Neo4j Browser**: http://localhost:7474 (user: neo4j, password: password)
+### 3. Access the UI
+
+| Interface | URL |
+|-----------|-----|
+| **Dashboard** | http://localhost:3000 |
+| **API Docs (Swagger)** | http://localhost:8000/docs |
+| **Neo4j Browser** | http://localhost:7475 (user: `neo4j`, password: `password`) |
+| **MinIO Console** | http://localhost:9011 (user: `minioadmin`, password: `minioadmin`) |
 
 ---
 
 ## Services
 
-| Service   | Port | Description                              |
-|-----------|------|------------------------------------------|
-| agent     | 8090 | Chainlit chat application                |
-| chromadb  | 8091 | Vector database for embeddings           |
-| neo4j     | 7474 | Graph database browser (HTTP)            |
-| neo4j     | 7687 | Graph database (Bolt protocol)           |
+| Service | Host Port | Description |
+|---------|-----------|-------------|
+| `api` | 8000 | FastAPI backend + WebSocket server |
+| `dashboard` | 3000 | Next.js frontend |
+| `postgres` | 5432 | PostgreSQL — workflow state, metadata |
+| `neo4j-api` | 7475 / 7688 | Neo4j graph database |
+| `chromadb` | 8091 | ChromaDB vector store |
+| `minio` | 9010 / 9011 | S3-compatible blob storage |
 
 ---
 
-## Chat Commands
+## Using the Dashboard
 
-### Repository Ingestion
-| Command | Description |
-|---------|-------------|
-| `/ingest [url]` | Index a GitHub repository (dual-write to ChromaDB + Neo4j) |
-| `/status [url]` | Check ingestion progress |
-| `/diff [url]` | Check for repository updates |
-| `/list_repos` | List all indexed repositories |
+The Next.js dashboard is the primary way to interact with GraphKB.
 
-### Code Q&A
-| Command | Description |
-|---------|-------------|
-| `/ask [question]` | Ask questions about indexed code |
-| `/search [query]` | Search repository contents |
-| `/architecture [repo]` | Generate architecture overview |
+### Ingesting a Repository
 
-### Graph Visualization
-| Command | Description |
-|---------|-------------|
-| `/visualize [repo] [type] [options]` | Generate interactive graph visualizations |
-| `/graph_stats [repo]` | Display graph statistics (node/edge counts, depths) |
+1. Navigate to **Repositories** and click **Add Repository**
+2. Enter a GitHub URL and start ingestion
+3. Monitor progress in real time via the WebSocket stream
 
-**Visualization Types:**
-- `architecture` — Directory structure and file organization
-- `calls` — Function/method call relationships
-- `dependencies` — File import/dependency relationships
-- `full` — Combined view of architecture, calls, and dependencies
-- `comprehensive` — Single unified graph with all nodes and edges
-- `call_chain` — Trace calls from/to a specific symbol
-- `hotspots` — Most connected symbols (potential refactoring targets)
+### Asking Questions
 
-**Options:**
-- `--symbol=<name>` — Symbol name for call_chain (required)
-- `--direction=outgoing|incoming` — Call direction (default: outgoing)
-- `--depth=<n>` — Max traversal depth (default: 30)
-- `--limit=<n>` — Max results
-- `--kinds=function,method,class` — Filter by symbol kinds
+Use the **Chat** page to ask natural language questions about any indexed repository. The agent uses hybrid retrieval (vector + graph traversal) to find relevant context before generating an answer.
 
-**Examples:**
-```bash
-/visualize my_repo calls
-/visualize my_repo hotspots
-/visualize my_repo call_chain --symbol=process_request
-/visualize my_repo call_chain --symbol=save --direction=incoming
-/visualize my_repo calls --kinds=function,method --depth=20
-```
+### Visualizing Code
 
-### Document Management
-| Command | Description |
-|---------|-------------|
-| `/upload` | Upload supporting documents (PDFs, etc.) |
-| `/list_docs [carrier]` | List uploaded documents |
-| `/view_doc [filename]` | View document contents |
-| `/delete_doc [filename]` | Delete a document |
+The **Visualize** page generates Mermaid diagrams for:
+- `architecture` — directory structure and file organization
+- `calls` — function/method call relationships
+- `dependencies` — import/dependency graph
+- `call_chain` — trace calls from/to a specific symbol
+- `hotspots` — most-connected symbols (refactoring targets)
 
-### Generation
-| Command | Description |
-|---------|-------------|
-| `/generate [type] [topic]` | Generate documentation from templates |
-| `/prompts` | List available generation prompts |
-| `/add_template` | Upload a new template |
+### Other Pages
 
-### Steering Documents
-| Command | Description |
-|---------|-------------|
-| `/add_steering` | Add a steering document |
-| `/list_steering` | List steering documents |
-| `/edit_steering [name]` | Edit a steering document |
-| `/remove_steering [name]` | Remove a steering document |
-
-### Utility
-| Command | Description |
-|---------|-------------|
-| `/help` | Show help information |
-| `/menu` | Show interactive command menu |
-
-You can also use natural language — the intent detector will map your request to the appropriate command.
+| Page | Description |
+|------|-------------|
+| **Plan** | Generate technical specifications via multi-step agent |
+| **Documents** | Upload and manage supporting documents (PDF, etc.) |
+| **Sources** | Manage steering documents that guide LLM generation |
+| **Graph Stats** | Explore node/edge counts and graph metrics |
+| **Settings** | Configure LLM model, retrieval depth, and other options |
 
 ---
 
-## Project Structure
+## API
 
-```
-sa-doc-generator/
-├── src/
-│   ├── app.py                 # Chainlit entry point
-│   ├── context.py             # Application context (services)
-│   ├── commands/              # Slash command implementations
-│   │   ├── ingest.py          # /ingest, /status, /diff, /list_repos
-│   │   ├── ask_code.py        # /ask, /search, /architecture
-│   │   ├── generate.py        # /generate, /prompts
-│   │   ├── visualize.py       # /visualize
-│   │   ├── docs.py            # /upload, /list_docs, /view_doc
-│   │   ├── steering.py        # Steering document commands
-│   │   └── menu.py            # /menu
-│   ├── core/
-│   │   ├── llm.py             # OpenAI LLM wrapper
-│   │   ├── rag.py             # RAG engine (retrieval + generation)
-│   │   ├── embedding.py       # Embedding service
-│   │   ├── template_manager.py # Jinja2 template handling
-│   │   ├── steering_manager.py # Steering document management
-│   │   ├── intent_detector.py  # Natural language → command mapping
-│   │   └── prompt_manager.py   # Prompt template management
-│   ├── graph_kb/              # Graph Knowledge Base
-│   │   ├── ingestion/         # Repository ingestion (AST parsing)
-│   │   ├── retrieval/         # Graph traversal and search
-│   │   ├── storage/           # Neo4j and metadata stores
-│   │   ├── visualization/     # Mermaid diagram generation
-│   │   ├── analysis/          # Code analysis utilities
-│   │   └── models/            # Data models and enums
-│   ├── flows/                 # Multi-step conversation flows
-│   ├── handlers/              # File upload and action handlers
-│   ├── ingestion/             # Document ingestion (PDF, etc.)
-│   ├── storage/               # Vector store abstractions
-│   ├── steering/              # Default steering documents
-│   ├── templates/             # Generation templates
-│   └── utils/                 # Logging, Mermaid rendering
-├── scripts/
-│   ├── backup_databases.sh    # Backup ChromaDB + Neo4j
-│   └── restore_databases.sh   # Restore from backups
-├── config/
-│   └── settings.yaml          # Application configuration
-├── docker-compose.yml
-├── Dockerfile.api
-└── requirements.txt
+### REST Endpoints (`/api/v1`)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/repos` | List repositories |
+| GET | `/repos/{id}` | Get repository details |
+| DELETE | `/repos/{id}` | Delete repository |
+| GET | `/repos/{id}/symbols` | Search symbols |
+| POST | `/repos/{id}/search` | Semantic search |
+| POST | `/repos/{id}/retrieve` | Hybrid retrieval |
+| GET | `/repos/{id}/stats` | Graph statistics |
+| GET | `/documents` | List documents |
+| POST | `/documents` | Upload a document |
+| GET | `/templates` | List generation templates |
+| GET | `/steering` | List steering documents |
+| GET | `/health` | Service health check |
+
+Full interactive documentation at http://localhost:8000/docs.
+
+### WebSocket Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/ws` | Generic workflow endpoint |
+| `/ws/ask-code` | Code Q&A workflow |
+| `/ws/ingest` | Repository ingestion workflow |
+
+**Client → Server:**
+```json
+{"type": "start", "payload": {"query": "...", "repo_id": "..."}}
 ```
 
----
-
-## Configuration
-
-### config/settings.yaml
-
-```yaml
-# Vector database
-vector_db_path: "./chroma_db"
-storage_path: "./output_docs"
-
-# LLM
-openai_model: "gpt-4o"
-
-# Embeddings (local model)
-embedding_model: "jinaai/jina-embeddings-v3"
-dimensions: 1024
-embedding_device: "cpu"
-
-# Chunking
-chunk_size: 1000
-chunk_overlap: 200
-
-# Graph traversal depth
-max_depth: 10
-```
-
-### Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | OpenAI API key for LLM |
-| `GITHUB_TOKEN` | No | GitHub token for private repos |
-| `NEO4J_URI` | No | Neo4j connection URI (default: bolt://neo4j:7687) |
-| `NEO4J_USER` | No | Neo4j username (default: neo4j) |
-| `NEO4J_PASSWORD` | No | Neo4j password (default: password) |
-| `CHROMA_SERVER_HOST` | No | ChromaDB host (default: chromadb) |
-| `CHROMA_SERVER_PORT` | No | ChromaDB port (default: 8000) |
-
----
-
-## Database Backup & Restore
-
-The application uses ChromaDB (vector embeddings) and Neo4j (graph knowledge base) for persistent storage. Scripts are provided to capture and restore database state.
-
-### Creating a Backup
-
-```bash
-# Stop containers for consistent backup
-docker compose down
-
-# Create backup
-./scripts/backup_databases.sh
-
-# Restart
-docker compose up -d
-```
-
-Creates timestamped archives in `./backups/`:
-- `neo4j_backup_YYYYMMDD_HHMMSS.tar.gz`
-- `chromadb_backup_YYYYMMDD_HHMMSS.tar.gz`
-- `backup_manifest_YYYYMMDD_HHMMSS.json`
-
-### Restoring from Backup
-
-```bash
-# Restore latest backup
-./scripts/restore_databases.sh
-
-# Restore specific backup
-./scripts/restore_databases.sh --timestamp 20241226_143000
-
-# List available backups
-./scripts/restore_databases.sh --list
-```
-
-Options:
-- `--latest` — Restore from latest backup (default)
-- `--timestamp YYYYMMDD_HHMMSS` — Restore specific backup
-- `--neo4j-only` — Only restore Neo4j
-- `--chromadb-only` — Only restore ChromaDB
-
-### Quick Start with Pre-loaded Data
-
-```bash
-# 1. Clone and configure
-git clone <repo-url> && cd <repo-name>
-cp .env.example .env  # Edit with your OPENAI_API_KEY
-
-# 2. Restore databases
-./scripts/restore_databases.sh
-
-# 3. Start application
-docker compose up -d
+**Server → Client:**
+```json
+{"type": "progress", "workflow_id": "...", "data": {"step": "..."}}
+{"type": "complete", "workflow_id": "...", "data": {"response": "..."}}
 ```
 
 ---
 
 ## Development
 
-### Local Development (without Docker)
+### Local API (without Docker)
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install API dependencies
+pip install -r requirements.api.txt
 
-# Start Neo4j and ChromaDB separately, then:
-chainlit run src/app.py -w
+# Copy and configure environment
+cp .env.example .env
+
+# Start infrastructure only (Neo4j, ChromaDB, Postgres, MinIO)
+make infra-up
+
+# Run database migrations
+make db-migrate
+
+# Start the API with hot-reload
+uvicorn graph_kb_api.main:app --reload --port 8000
 ```
 
-### Rebuild After Code Changes
+### Local Dashboard (without Docker)
 
 ```bash
-docker compose down
-docker compose up --build -d
+cd graph_kb_dashboard
+npm install
+npm run dev
 ```
 
-### View Logs
+Dashboard will be available at http://localhost:3000.
+
+### Common Make Targets
 
 ```bash
-docker compose logs -f agent
+make help            # Show all available targets
+
+# Docker
+make docker-up       # Start all services
+make docker-down     # Stop all services
+make docker-logs     # Tail all logs
+make docker-rebuild  # Rebuild images without cache
+make docker-status   # Show container status
+
+# Infrastructure only
+make infra-up        # Start Neo4j + ChromaDB + Postgres + MinIO
+make infra-down      # Stop infrastructure
+
+# Database
+make db-migrate      # Apply pending Alembic migrations
+make db-status       # Show current migration revision
+
+# Linting
+make ruff            # Run ruff checks
+make ruff-fix        # Auto-fix ruff issues
+
+# Testing
+make test            # Run all tests
+make test-unit       # Unit tests only
+make test-integration  # Integration tests only
+make test-fast       # Unit + property tests (skips slow)
+make test-cov        # Tests with coverage report
+
+# E2E Tests (Playwright)
+make e2e-test        # Run E2E tests (live LLM calls)
+make e2e-mock        # Run E2E tests with pre-recorded responses
+make e2e-record      # Record LLM responses for mock mode
 ```
 
 ---
 
-## Data Storage
+## Environment Variables
 
-### Local SQLite Databases
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OPENAI_API_KEY` | Yes | OpenAI API key |
+| `OPENAI_MODEL` | No | Model name (default: `gpt-5.2`) |
+| `GITHUB_TOKEN` | No | GitHub token for private repos |
+| `HF_TOKEN` | No | Hugging Face token for embedding model |
+| `DATABASE_URL` | No | PostgreSQL URL (default: local Docker) |
+| `NEO4J_URI` | No | Neo4j Bolt URI (default: `bolt://localhost:7688`) |
+| `NEO4J_PASSWORD` | No | Neo4j password (default: `password`) |
+| `CHROMA_SERVER_HOST` | No | ChromaDB host (default: `localhost`) |
+| `CHROMA_SERVER_PORT` | No | ChromaDB port (default: `8091`) |
+| `EMBEDDING_MODEL` | No | Embedding model (default: `jinaai/jina-embeddings-v3`) |
+| `LANGGRAPH_V3_ENABLED` | No | Enable LangGraph v3 workflows (default: `true`) |
+| `MAX_DEPTH` | No | Max graph traversal depth (default: `25`) |
+| `LLM_RECORDING_MODE` | No | `off` / `record` / `replay` for E2E testing |
 
-The application uses two local SQLite databases for metadata and state management:
+See `.env.example` for the full list with descriptions.
 
-| File | Purpose |
-|------|---------|
-| `graph_kb_metadata.db` | Graph KB ingestion state (repos, files, chunks, progress) |
-| `metadata.db` | Document ingestion state |
+---
 
-**graph_kb_metadata.db** tracks:
-- **Repository status** — which repos are indexed, their status (pending/indexing/ready/error/paused), last commit
-- **File-level checkpoints** — which files within a repo have been processed (enables pause/resume)
-- **Pending chunks** — chunks parsed but not yet embedded (resume from embedding phase)
-- **Failed chunks** — chunks that failed embedding (can retry without re-indexing)
-- **Live progress** — real-time indexing progress that persists across page refreshes
+## Project Structure
 
-This enables:
-- Pause and resume long-running ingestion jobs
-- Checkpoint recovery if the process crashes mid-ingestion
-- Accurate progress reporting via `/status`
+```
+GraphKB-TaskAgent/
+├── graph_kb_api/              # FastAPI backend
+│   ├── main.py                # App entry point, router registration
+│   ├── config.py              # Settings (Pydantic)
+│   ├── dependencies.py        # FastAPI dependency injection
+│   ├── routers/               # REST route handlers
+│   │   ├── chat.py            # Chat/ask-code endpoints
+│   │   ├── repos.py           # Repository management
+│   │   ├── search.py          # Semantic + hybrid search
+│   │   ├── visualization.py   # Graph visualization
+│   │   ├── documents.py       # Document management
+│   │   ├── steering.py        # Steering documents
+│   │   ├── templates.py       # Generation templates
+│   │   └── plan.py            # Plan session endpoints
+│   ├── flows/v3/              # LangGraph agentic workflows
+│   │   ├── agents/            # Specialized agent nodes
+│   │   ├── graphs/            # LangGraph graph definitions
+│   │   ├── nodes/             # Individual workflow nodes
+│   │   ├── state/             # TypedDict state schemas
+│   │   └── tools/             # Agent tools
+│   ├── graph_kb/              # Knowledge graph core
+│   │   ├── ingestion/         # Repository ingestion (AST parsing)
+│   │   ├── retrieval/         # Graph traversal and hybrid search
+│   │   ├── storage/           # Neo4j and ChromaDB adapters
+│   │   ├── visualization/     # Mermaid diagram generation
+│   │   └── models/            # Domain models
+│   ├── websocket/             # WebSocket connection manager
+│   ├── database/              # PostgreSQL + SQLAlchemy setup
+│   └── services/              # Application services
+│
+├── graph_kb_dashboard/        # Next.js frontend
+│   └── src/
+│       ├── app/               # Next.js app router pages
+│       │   ├── chat/          # Chat interface
+│       │   ├── repositories/  # Repository management
+│       │   ├── visualize/     # Code visualization
+│       │   ├── plan/          # Spec generation
+│       │   ├── documents/     # Document management
+│       │   ├── sources/       # Steering documents
+│       │   ├── graph-stats/   # Graph metrics
+│       │   └── settings/      # App settings
+│       ├── components/        # React components
+│       ├── hooks/             # Custom React hooks
+│       ├── lib/               # Stores, API clients, WebSocket
+│       └── context/           # React context providers
+│
+├── tests/                     # API unit and integration tests
+├── e2e/                       # Playwright end-to-end tests
+├── alembic/                   # Database migrations
+├── scripts/                   # Backup/restore and utility scripts
+├── docker-compose.yml         # Full stack configuration
+├── Dockerfile.api.optimized   # Production API image
+├── requirements.api.txt       # Python dependencies
+├── ruff.toml                  # Python linter config
+└── .env.example               # Environment variable template
+```
 
-### Docker Volumes
+---
 
-When running with Docker Compose, the main data is stored in named volumes:
+## Database Backup & Restore
 
-| Volume | Contents |
-|--------|----------|
-| `chromadb_data` | Vector embeddings |
-| `neo4j_data` | Graph database |
-| `neo4j_logs` | Neo4j logs |
-| `repo_data` | Cloned repositories |
-| `hf_cache` | HuggingFace model cache |
+```bash
+# Create a backup (stops containers for consistency)
+docker compose down
+./scripts/backup_databases.sh
+docker compose up -d
 
-Use the backup/restore scripts to capture and share the ChromaDB and Neo4j volumes.
+# Restore latest backup
+./scripts/restore_databases.sh
+
+# Restore specific timestamp
+./scripts/restore_databases.sh --timestamp 20241226_143000
+
+# Options
+./scripts/restore_databases.sh --neo4j-only
+./scripts/restore_databases.sh --chromadb-only
+./scripts/restore_databases.sh --list
+```
 
 ---
 
@@ -413,25 +356,23 @@ Use the backup/restore scripts to capture and share the ChromaDB and Neo4j volum
 
 ### Ingestion Pipeline
 
-1. **Clone**: Repository is cloned to local storage
-2. **AST Parsing**: Python files are parsed to extract functions, classes, imports
-3. **Chunking**: Code is split into semantic chunks
-4. **Embedding**: Chunks are embedded using the configured model
-5. **Dual Write**: 
-   - ChromaDB: Vector embeddings for semantic search
-   - Neo4j: Graph nodes and relationships (CALLS, IMPORTS, CONTAINS)
+1. **Clone** — repository is cloned to local storage
+2. **AST Parsing** — Python/JS files parsed to extract functions, classes, imports
+3. **Chunking** — code split into semantic chunks
+4. **Embedding** — chunks embedded using Jina AI (`jina-embeddings-v3`)
+5. **Dual Write** — ChromaDB (vector search) + Neo4j (graph relationships: CALLS, IMPORTS, CONTAINS)
 
 ### Retrieval Pipeline
 
-1. **Vector Search**: Query is embedded and matched against ChromaDB
-2. **Graph Expansion**: Initial matches are expanded via Neo4j relationships (up to N hops)
-3. **Ranking**: Results are ranked by vector similarity + graph distance + file bonuses
-4. **Token Pruning**: Context is limited to fit LLM context window (~8000 tokens)
+1. **Vector Search** — query embedded and matched against ChromaDB
+2. **Graph Expansion** — initial matches expanded via Neo4j relationships (up to N hops)
+3. **Ranking** — results ranked by vector similarity + graph distance
+4. **Token Pruning** — context trimmed to fit LLM context window
 
-### Generation Pipeline
+### Agentic Workflows (LangGraph v3)
 
-1. **Template Selection**: User selects a generation template
-2. **Context Retrieval**: Relevant code/docs are retrieved via RAG
-3. **Steering**: Steering documents provide additional instructions
-4. **LLM Generation**: GPT-4 generates the document
-5. **Output**: Markdown document saved to `output_docs/`
+Multi-step workflows run as LangGraph state machines, persisted in PostgreSQL via a checkpointer. Workflows include:
+- **ask-code** — multi-hop question answering over indexed code
+- **ingest** — repository indexing with progress streaming
+- **research** — deep research with context synthesis
+- **plan** — specification generation from templates

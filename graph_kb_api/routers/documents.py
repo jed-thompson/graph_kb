@@ -11,11 +11,12 @@ Upload behavior:
 """
 
 import hashlib
+import io
 import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Response, UploadFile
 
@@ -53,25 +54,39 @@ async def get_filter_options(
 ):
     """Get distinct values for filtering documents (parents and categories)."""
     try:
-        vector_store = _ensure_vector_store(facade)
+        parents: set[str] = set()
+        categories: set[str] = set()
 
-        # Get all documents with metadata
-        results = vector_store.collection.get(include=["metadatas"])
-
-        metadatas = results.get("metadatas", [])
-
-        # Extract distinct values
-        parents = set()
-        categories = set()
-
-        for meta in metadatas:
-            if meta:
-                # Use parent if available, otherwise repo_id (for repo chunks)
-                parent = meta.get("parent") or meta.get("repo_id")
+        # Primary source: blob storage metadata (source of truth for user uploads)
+        try:
+            bs = BlobStorage.from_env()
+            blob_items = await bs.backend.list_with_metadata("documents/")
+            for item in blob_items:
+                meta = item.get("metadata", {})
+                parent = meta.get("parent") or None
+                category = meta.get("category") or None
                 if parent:
                     parents.add(parent)
-                if meta.get("category"):
-                    categories.add(meta["category"])
+                if category:
+                    categories.add(category)
+        except Exception as e:
+            logger.warning(f"Blob storage filter-options listing failed: {e}")
+
+        # Secondary source: ChromaDB (picks up pre-blob indexed docs and repo chunks)
+        try:
+            vector_store = _ensure_vector_store(facade)
+            results = vector_store.collection.get(include=["metadatas"])
+            for meta in results.get("metadatas", []):
+                if meta:
+                    parent = meta.get("parent") or meta.get("repo_id")
+                    if parent:
+                        parents.add(parent)
+                    if meta.get("category"):
+                        categories.add(meta["category"])
+        except HTTPException:
+            pass  # ChromaDB unavailable — blob results are sufficient
+        except Exception as e:
+            logger.warning(f"ChromaDB filter-options listing failed: {e}")
 
         return DocumentFilterOptions(
             parents=sorted(parents),
@@ -95,85 +110,114 @@ async def list_documents(
 ):
     """List documents with optional filtering and pagination.
 
-    By default, returns only user-uploaded documents (those stored in S3/blob storage).
-    Set user_uploads_only=false to include repo code chunks.
+    Blob storage is the source of truth for user-uploaded documents.
+    ChromaDB is queried to add indexed_for_search status and as a fallback
+    for any docs not yet in blob storage.
+    Set user_uploads_only=false to also include repo code chunks from ChromaDB.
     """
     try:
-        vector_store = _ensure_vector_store(facade)
+        docs: Dict[str, DocumentResponse] = {}
 
-        # Build chromadb where filter
-        where_clauses = []
-        if parent:
-            where_clauses.append({"parent": parent})
-        if category:
-            where_clauses.append({"category": category})
-
-        # Note: We filter for user_uploads_only in Python after retrieval
-        # because ChromaDB doesn't support $ne operator in where clauses
-
-        where = None
-        if len(where_clauses) == 1:
-            where = where_clauses[0]
-        elif len(where_clauses) > 1:
-            where = {"$and": where_clauses}
-
-        # Query the collection directly for filtering support
-        kwargs = {"include": ["metadatas", "documents"]}
-        if where:
-            kwargs["where"] = where
-
-        results = vector_store.collection.get(**kwargs)
-
-        all_ids = results.get("ids", [])
-        all_metadatas = results.get("metadatas", [])
-        all_documents = results.get("documents", [])
-
-        # Filter for user uploads only (documents with storage_key OR filename metadata)
-        # ChromaDB doesn't support $ne, so we filter in Python
-        # User uploads have: storage_key (new), filename (all), mime_type
-        # Repo chunks have: repo_id, file_path, symbol_name
-        if user_uploads_only:
-            user_upload_indices = []
-            for i, doc_id in enumerate(all_ids):
-                meta = all_metadatas[i] if all_metadatas else {}
-                # User uploads have storage_key (new uploads) OR filename without repo_id (older uploads)
-                has_storage_key = meta and meta.get("storage_key")
-                has_filename_no_repo = meta and meta.get("filename") and not meta.get("repo_id")
-                if has_storage_key or has_filename_no_repo:
-                    user_upload_indices.append(i)
-
-            logger.info(f"Filter: found {len(user_upload_indices)} user uploads out of {len(all_ids)} total documents")
-            all_ids = [all_ids[i] for i in user_upload_indices]
-            all_metadatas = [all_metadatas[i] for i in user_upload_indices]
-            all_documents = [all_documents[i] for i in user_upload_indices] if all_documents else []
-
-        total = len(all_ids)
-
-        # Apply pagination
-        page_ids = all_ids[offset : offset + limit]
-        page_metadatas = all_metadatas[offset : offset + limit]
-        page_documents = all_documents[offset : offset + limit] if all_documents else [None] * len(page_ids)
-
-        documents = []
-        for i, doc_id in enumerate(page_ids):
-            meta = page_metadatas[i] if page_metadatas else {}
-            content = page_documents[i] if page_documents else None
-            # Use filename if available, otherwise file_path (for repo chunks), otherwise doc_id
-            filename = meta.get("filename") or meta.get("file_path") or doc_id
-            documents.append(
-                DocumentResponse(
+        # --- Primary source: blob storage ---
+        try:
+            bs = BlobStorage.from_env()
+            blob_items = await bs.backend.list_with_metadata("documents/")
+            for item in blob_items:
+                meta = item.get("metadata", {})
+                doc_id = meta.get("doc_id")
+                if not doc_id:
+                    continue
+                item_parent = meta.get("parent") or None
+                item_category = meta.get("category") or None
+                if parent and item_parent != parent:
+                    continue
+                if category and item_category != category:
+                    continue
+                file_size_raw = meta.get("file_size")
+                try:
+                    file_size = int(file_size_raw) if file_size_raw else None
+                except (ValueError, TypeError):
+                    file_size = None
+                docs[doc_id] = DocumentResponse(
                     id=doc_id,
-                    filename=filename,
-                    parent=meta.get("parent") or meta.get("repo_id"),
-                    category=meta.get("category"),
-                    content=content,
+                    filename=meta.get("original_filename") or meta.get("filename", ""),
+                    parent=item_parent,
+                    category=item_category,
+                    content=None,
                     metadata=meta,
                     created_at=meta.get("created_at", datetime.now(timezone.utc).isoformat()),
+                    storage_key=item["path"],
+                    indexed_for_search=False,
+                    file_size=file_size,
+                    mime_type=meta.get("mime_type"),
                 )
-            )
+        except Exception as e:
+            logger.warning(f"Blob storage listing failed: {e}")
+
+        # --- Secondary: ChromaDB (indexed status + fallback for pre-blob docs) ---
+        try:
+            vector_store = _ensure_vector_store(facade)
+            chroma_results = vector_store.collection.get(include=["metadatas", "documents"])
+            all_ids = chroma_results.get("ids", [])
+            all_metadatas = chroma_results.get("metadatas", [])
+            all_documents = chroma_results.get("documents", [])
+
+            for i, doc_id in enumerate(all_ids):
+                meta = all_metadatas[i] if all_metadatas else {}
+                content = all_documents[i] if all_documents else None
+
+                if doc_id in docs:
+                    # Mark blob doc as indexed; backfill fields missing from old blob metadata
+                    docs[doc_id].indexed_for_search = True
+                    if content:
+                        docs[doc_id].content = content
+                    if meta:
+                        if not docs[doc_id].category and meta.get("category"):
+                            docs[doc_id].category = meta.get("category")
+                        if not docs[doc_id].parent and meta.get("parent"):
+                            docs[doc_id].parent = meta.get("parent")
+                    continue
+
+                # Fallback: ChromaDB-only doc not yet in blob storage
+                has_storage_key = meta and meta.get("storage_key")
+                has_filename_no_repo = meta and meta.get("filename") and not meta.get("repo_id")
+                is_user_upload = has_storage_key or has_filename_no_repo
+                if user_uploads_only and not is_user_upload:
+                    continue
+
+                item_parent = (meta.get("parent") or meta.get("repo_id")) if meta else None
+                item_category = meta.get("category") if meta else None
+                if parent and item_parent != parent:
+                    continue
+                if category and item_category != category:
+                    continue
+
+                docs[doc_id] = DocumentResponse(
+                    id=doc_id,
+                    filename=(meta.get("filename") or meta.get("file_path") or doc_id) if meta else doc_id,
+                    parent=item_parent,
+                    category=item_category,
+                    content=content,
+                    metadata=meta,
+                    created_at=(meta.get("created_at") or datetime.now(timezone.utc).isoformat()) if meta else datetime.now(timezone.utc).isoformat(),
+                    storage_key=meta.get("storage_key") if meta else None,
+                    indexed_for_search=True,
+                    file_size=meta.get("file_size") if meta else None,
+                    mime_type=meta.get("mime_type") if meta else None,
+                )
+        except Exception as e:
+            logger.warning(f"ChromaDB listing failed: {e}")
+            if not docs:
+                raise HTTPException(status_code=500, detail=f"Failed to list documents: {e}")
+
+        all_docs = sorted(docs.values(), key=lambda d: str(d.created_at or ""), reverse=True)
+        total = len(all_docs)
+        page_docs = all_docs[offset : offset + limit]
+
+        logger.info(f"Listed {total} documents ({sum(1 for d in all_docs if d.indexed_for_search)} indexed)")
 
         return DocumentListResponse(
-            documents=documents,
+            documents=page_docs,
             total=total,
             offset=offset,
             limit=limit,
@@ -190,23 +234,77 @@ async def get_document(
     doc_id: str,
     facade=Depends(get_graph_kb_facade),
 ):
-    """Get a single document by ID with its content and metadata."""
-    try:
-        vector_store = _ensure_vector_store(facade)
+    """Get a single document by ID with its content and metadata.
 
-        result = vector_store.get(doc_id)
-        if not result:
+    Tries ChromaDB first (indexed docs), then falls back to blob storage
+    (non-indexed / blob-only docs). PDFs are extracted via pypdf.
+    """
+    try:
+        # Primary: ChromaDB (indexed docs)
+        if facade.vector_store:
+            result = facade.vector_store.get(doc_id)
+            if result:
+                meta = result.metadata or {}
+                filename = meta.get("filename") or meta.get("file_path") or result.chunk_id
+                return DocumentResponse(
+                    id=result.chunk_id,
+                    filename=filename,
+                    parent=meta.get("parent") or meta.get("repo_id"),
+                    category=meta.get("category"),
+                    content=result.content,
+                    metadata=meta,
+                    created_at=meta.get("created_at", datetime.now(timezone.utc).isoformat()),
+                )
+
+        # Fallback: blob storage (non-indexed docs, including PDFs)
+        try:
+            bs = BlobStorage.from_env()
+            blob_items = await bs.backend.list_with_metadata("documents/")
+            target_item = next(
+                (item for item in blob_items if item.get("metadata", {}).get("doc_id") == doc_id),
+                None,
+            )
+        except Exception as blob_err:
+            logger.warning(f"Blob storage lookup failed for {doc_id}: {blob_err}")
+            target_item = None
+
+        if not target_item:
             raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
 
-        meta = result.metadata or {}
-        # Use filename if available, otherwise file_path (for repo chunks), otherwise chunk_id
-        filename = meta.get("filename") or meta.get("file_path") or result.chunk_id
+        meta = target_item.get("metadata", {})
+        storage_key = target_item["path"]
+        filename = meta.get("original_filename") or doc_id
+
+        content_str: Optional[str] = None
+        try:
+            bs = BlobStorage.from_env()
+            result_binary = await bs.backend.retrieve_binary(storage_key)
+            if result_binary:
+                content_bytes, _ = result_binary
+                is_pdf = filename.lower().endswith(".pdf") or meta.get("mime_type") == "application/pdf"
+                if is_pdf:
+                    try:
+                        from pypdf import PdfReader
+                        reader = PdfReader(io.BytesIO(content_bytes))
+                        extracted = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+                        if extracted:
+                            content_str = extracted
+                    except Exception as pdf_err:
+                        logger.warning(f"PDF text extraction failed for {doc_id}: {pdf_err}")
+                else:
+                    try:
+                        content_str = content_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        pass
+        except Exception as read_err:
+            logger.warning(f"Failed to read blob content for {doc_id}: {read_err}")
+
         return DocumentResponse(
-            id=result.chunk_id,
+            id=doc_id,
             filename=filename,
-            parent=meta.get("parent") or meta.get("repo_id"),
-            category=meta.get("category"),
-            content=result.content,
+            parent=meta.get("parent") or None,
+            category=meta.get("category") or None,
+            content=content_str,
             metadata=meta,
             created_at=meta.get("created_at", datetime.now(timezone.utc).isoformat()),
         )
@@ -279,7 +377,11 @@ async def upload_document(
                 metadata={
                     "doc_id": doc_id,
                     "original_filename": filename,
-                    "parent": parent,
+                    "parent": parent or "",
+                    "category": category or "",
+                    "created_at": now.isoformat(),
+                    "file_size": str(len(content_bytes)),
+                    "mime_type": mime_type,
                 },
             )
             metadata["storage_key"] = storage_key
@@ -337,18 +439,36 @@ async def upload_document(
             try:
                 content = content_bytes.decode("utf-8")
             except UnicodeDecodeError:
-                # Binary file - can't index in ChromaDB
-                logger.info(f"Binary file {filename} stored in S3 only (not indexed)")
-                metadata["indexed_for_search"] = False
-                return DocumentResponse(
-                    id=doc_id,
-                    filename=filename,
-                    parent=parent,
-                    category=None,
-                    content=None,  # Binary content not returned
-                    metadata=metadata,
-                    created_at=now,
-                )
+                # Try PDF text extraction before giving up
+                content = None
+                is_pdf = filename.lower().endswith(".pdf") or mime_type == "application/pdf"
+                if is_pdf:
+                    try:
+                        from pypdf import PdfReader
+
+                        reader = PdfReader(io.BytesIO(content_bytes))
+                        content = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+                        if not content:
+                            content = None
+                            logger.info(f"PDF {filename} had no extractable text; stored in S3 only (not indexed)")
+                        else:
+                            logger.info(f"Extracted {len(content)} chars of text from PDF {filename}")
+                    except Exception as e:
+                        logger.warning(f"PDF text extraction failed for {filename}: {e}")
+
+                if content is None:
+                    # Binary file with no extractable text - store only
+                    logger.info(f"Binary file {filename} stored in S3 only (not indexed)")
+                    metadata["indexed_for_search"] = False
+                    return DocumentResponse(
+                        id=doc_id,
+                        filename=filename,
+                        parent=parent,
+                        category=category,
+                        content=None,
+                        metadata=metadata,
+                        created_at=now,
+                    )
 
             # Generate embedding
             embedding_generator = facade.embedding_generator
@@ -398,54 +518,69 @@ async def download_document(
     use_presigned: bool = Query(False, description="Return pre-signed URL instead of content"),
     facade=Depends(get_graph_kb_facade),
 ):
-    """Download a document from S3/blob storage.
+    """Serve a document from blob storage for inline viewing or download.
 
-    By default, returns the file content directly.
-    Set use_presigned=true to get a pre-signed URL for direct S3 access.
+    Tries ChromaDB first for storage_key metadata, then falls back to
+    scanning blob storage directly (for non-indexed / blob-only docs).
+    Returns content with Content-Disposition: inline so browsers render
+    PDFs natively instead of prompting a download.
     """
     try:
-        # Get document metadata from ChromaDB
+        blob_storage: BlobStorage = BlobStorage.from_env()
+        storage_key: Optional[str] = None
+        filename: str = doc_id
+        mime_type: str = "application/octet-stream"
+
+        # Primary: resolve storage_key from ChromaDB metadata
         vector_store = facade.vector_store
         if vector_store:
             result = vector_store.get(doc_id)
-            if not result:
-                raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
-            meta = result.metadata or {}
-        else:
-            # If ChromaDB unavailable, we can't look up by doc_id
-            raise HTTPException(
-                status_code=503,
-                detail="Document lookup unavailable - ChromaDB not reachable",
-            )
+            if result:
+                meta = result.metadata or {}
+                storage_key = meta.get("storage_key")
+                filename = meta.get("filename", doc_id)
+                mime_type = meta.get("mime_type", "application/octet-stream")
 
-        storage_key = meta.get("storage_key")
+                # ChromaDB-only doc (no blob) — serve text content directly
+                if not storage_key:
+                    content_text = result.content
+                    if not content_text:
+                        raise HTTPException(
+                            status_code=404,
+                            detail="Document content not available (not stored in blob storage)",
+                        )
+                    return Response(
+                        content=content_text.encode("utf-8"),
+                        media_type=meta.get("mime_type", "text/plain"),
+                        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+                    )
+
+        # Fallback: scan blob storage metadata for matching doc_id
         if not storage_key:
-            # Document not stored in S3, return content from ChromaDB if available
-            content = result.content if result else None
-            if not content:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Document content not available (not stored in S3)",
+            try:
+                blob_items = await blob_storage.backend.list_with_metadata("documents/")
+                target = next(
+                    (item for item in blob_items if item.get("metadata", {}).get("doc_id") == doc_id),
+                    None,
                 )
-            filename = meta.get("filename", doc_id)
-            return Response(
-                content=content.encode("utf-8"),
-                media_type=meta.get("mime_type", "text/plain"),
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                },
-            )
+            except Exception as scan_err:
+                logger.warning(f"Blob scan failed for {doc_id}: {scan_err}")
+                target = None
 
-        # Retrieve from S3/blob storage
-        blob_storage: BlobStorage = BlobStorage.from_env()
+            if not target:
+                raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+            meta = target.get("metadata", {})
+            storage_key = target["path"]
+            filename = meta.get("original_filename", doc_id)
+            mime_type = meta.get("mime_type", "application/octet-stream")
+
+        # Retrieve binary from blob storage
         result_binary = await blob_storage.backend.retrieve_binary(storage_key)
-
         if not result_binary:
             raise HTTPException(status_code=404, detail="Document file not found in storage")
 
         content, _ = result_binary
-        filename = meta.get("filename", doc_id)
-        mime_type = meta.get("mime_type", "application/octet-stream")
 
         # Handle pre-signed URL request
         if use_presigned:
@@ -457,17 +592,19 @@ async def download_document(
                 return {"presigned_url": presigned_url, "expires_in": PRESIGNED_URL_EXPIRY}
             except NotImplementedError:
                 logger.warning("Pre-signed URLs not supported by current storage backend")
-                # Fall through to direct download
             except Exception as e:
                 logger.warning(f"Failed to generate pre-signed URL: {e}")
-                # Fall through to direct download
 
-        # Return file content
+        # Correct MIME type for PDFs if stored with wrong type
+        if filename.lower().endswith(".pdf"):
+            mime_type = "application/pdf"
+
+        # inline disposition so browsers render PDFs natively
         return Response(
             content=content,
             media_type=mime_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Disposition": f'inline; filename="{filename}"',
                 "Content-Length": str(len(content)),
             },
         )
@@ -584,35 +721,74 @@ async def update_document(
     update_data: DocumentUpdateRequest,
     facade=Depends(get_graph_kb_facade),
 ):
-    """Update a document's metadata (e.g. category)."""
+    """Update a document's metadata (e.g. category).
+
+    Updates ChromaDB if the document is indexed there, and always updates
+    the blob storage .meta.json so blob-only documents are also supported.
+    """
     try:
+        new_category = (update_data.category.strip() if update_data.category else None) or None
+
+        # --- Update blob storage metadata (source of truth) ---
+        blob_updated = False
+        blob_filename: Optional[str] = None
+        blob_parent: Optional[str] = None
+        blob_created_at: Optional[str] = None
+        try:
+            bs = BlobStorage.from_env()
+            blob_items = await bs.backend.list_with_metadata("documents/")
+            blob_item = next(
+                (item for item in blob_items if item["metadata"].get("doc_id") == doc_id),
+                None,
+            )
+            if blob_item:
+                blob_meta = dict(blob_item["metadata"])
+                if new_category is not None:
+                    blob_meta["category"] = new_category
+                else:
+                    blob_meta.pop("category", None)
+                await bs.backend.write_metadata(blob_item["path"], blob_meta)
+                blob_updated = True
+                blob_filename = blob_meta.get("original_filename") or blob_meta.get("filename")
+                blob_parent = blob_meta.get("parent") or None
+                blob_created_at = blob_meta.get("created_at")
+        except Exception as e:
+            logger.warning(f"Failed to update blob metadata for {doc_id}: {e}")
+
+        # --- Update ChromaDB if indexed ---
         vector_store = _ensure_vector_store(facade)
-
         result = vector_store.get(doc_id)
-        if not result:
-            raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
-
-        meta = result.metadata or {}
-
-        # update fields...
-        if update_data.category is not None:
-            if update_data.category.strip() == "":
-                meta.pop("category", None)
+        if result:
+            meta = dict(result.metadata or {})
+            if new_category is not None:
+                meta["category"] = new_category
             else:
-                meta["category"] = update_data.category.strip()
+                meta.pop("category", None)
+            vector_store.collection.update(ids=[doc_id], metadatas=[meta])
+            filename = meta.get("filename") or meta.get("file_path") or blob_filename or doc_id
+            return DocumentResponse(
+                id=doc_id,
+                filename=filename,
+                parent=meta.get("parent") or meta.get("repo_id") or blob_parent,
+                category=meta.get("category"),
+                content=None,
+                metadata=meta,
+                created_at=meta.get("created_at") or blob_created_at or datetime.now(timezone.utc).isoformat(),
+            )
 
-        vector_store.collection.update(ids=[doc_id], metadatas=[meta])
+        if blob_updated:
+            return DocumentResponse(
+                id=doc_id,
+                filename=blob_filename or doc_id,
+                parent=blob_parent,
+                category=new_category,
+                content=None,
+                metadata={"doc_id": doc_id, "category": new_category},
+                created_at=blob_created_at or datetime.now(timezone.utc).isoformat(),
+                indexed_for_search=False,
+            )
 
-        filename = meta.get("filename") or meta.get("file_path") or result.chunk_id
-        return DocumentResponse(
-            id=result.chunk_id,
-            filename=filename,
-            parent=meta.get("parent") or meta.get("repo_id"),
-            category=meta.get("category"),
-            content=None,  # Do not return content payload on patches to save bandwidth
-            metadata=meta,
-            created_at=meta.get("created_at", datetime.now(timezone.utc).isoformat()),
-        )
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
 
     except HTTPException:
         raise

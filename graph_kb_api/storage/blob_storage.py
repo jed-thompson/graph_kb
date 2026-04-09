@@ -75,6 +75,22 @@ class BlobStorageBackend(ABC):
         """List all paths under prefix."""
         pass
 
+    async def list_with_metadata(self, prefix: str) -> List[Dict[str, Any]]:
+        """List all paths under prefix with their stored metadata.
+
+        Returns a list of ``{"path": str, "metadata": dict}`` dicts.
+        Subclasses should override for efficient metadata retrieval.
+        """
+        paths = await self.list_directory(prefix)
+        return [{"path": p, "metadata": {}} for p in paths]
+
+    async def write_metadata(self, path: str, metadata: Dict[str, Any]) -> None:
+        """Overwrite metadata for an existing object.
+
+        Subclasses should override for efficient metadata persistence.
+        Default is a no-op.
+        """
+
     async def generate_presigned_url(self, path: str, expires_in: int = 3600) -> str:
         """Generate a pre-signed URL for direct access.
 
@@ -259,6 +275,31 @@ class LocalFilesystemBackend(BlobStorageBackend):
                 paths.append(str(rel_path).replace("\\", "/"))
 
         return sorted(paths)
+
+    async def list_with_metadata(self, prefix: str) -> List[Dict[str, Any]]:
+        """List paths under prefix and read their companion .meta.json files."""
+        full_prefix = self._get_full_path(prefix)
+        if not full_prefix.exists():
+            return []
+        results = []
+        for file_path in sorted(full_prefix.rglob("*")):
+            if file_path.is_file() and not file_path.name.endswith(".meta.json"):
+                rel_path = str(file_path.relative_to(self.base_path)).replace("\\", "/")
+                meta_path = file_path.with_suffix(file_path.suffix + ".meta.json")
+                metadata: Dict[str, Any] = {}
+                if meta_path.exists():
+                    try:
+                        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+                results.append({"path": rel_path, "metadata": metadata})
+        return results
+
+    async def write_metadata(self, path: str, metadata: Dict[str, Any]) -> None:
+        """Overwrite the companion .meta.json for an existing object."""
+        full_path = self._get_full_path(path)
+        meta_path = full_path.with_suffix(full_path.suffix + ".meta.json")
+        meta_path.write_text(json.dumps(metadata, default=str), encoding="utf-8")
 
     # =========================================================================
     # Binary content methods (native filesystem support)
@@ -469,6 +510,28 @@ class S3Backend(BlobStorageBackend):
             pass
 
         return sorted(paths)
+
+    async def list_with_metadata(self, prefix: str) -> List[Dict[str, Any]]:
+        """List paths under prefix with S3 object metadata via head_object."""
+        client = await self._get_client()
+        full_prefix = self._get_key(prefix)
+        results = []
+        try:
+            async with client as s3:
+                paginator = s3.get_paginator("list_objects_v2")
+                async for page in paginator.paginate(Bucket=self.bucket, Prefix=full_prefix):
+                    for obj in page.get("Contents", []):
+                        key = obj["Key"]
+                        rel_path = key[len(self.prefix) + 1 :]
+                        try:
+                            head = await s3.head_object(Bucket=self.bucket, Key=key)
+                            metadata: Dict[str, Any] = head.get("Metadata", {})
+                        except Exception:
+                            metadata = {}
+                        results.append({"path": rel_path, "metadata": metadata})
+        except Exception:
+            pass
+        return sorted(results, key=lambda x: x["path"])
 
     # =========================================================================
     # Binary content methods (native S3 support)

@@ -450,25 +450,30 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
             const phase = (data.phase as string) || (meta.currentPhase as string);
             const step = { timestamp: Date.now(), phase, message: (data.message as string) || '' };
             const steps = [...((meta.thinkingSteps as Array<unknown>) || []), step];
-            // Step 19d: Capture research summary from task_research step for TaskContextPanel
-            const updatedMeta: Record<string, unknown> = { ...meta, agentContent: (data.agentContent as string) || (data.content as string) || meta.agentContent, thinkingSteps: steps };
+            // Task-scoped events carry a task_id. Phase-level agentContent should only
+            // be updated from phase-level events (no task_id), otherwise each completed
+            // task overwrites the phase-level streaming content and leaks into BasePhaseContent.
+            const progressTaskId = data.task_id as string | undefined;
+            const incomingAgentContent = (data.agentContent as string) || (data.content as string);
+            const updatedMeta: Record<string, unknown> = {
+              ...meta,
+              agentContent: progressTaskId ? meta.agentContent : (incomingAgentContent || meta.agentContent),
+              thinkingSteps: steps,
+            };
             if ((data.step as string) === 'task_research' && (data.agentContent as string)) {
               updatedMeta.researchSummary = (data.agentContent as string);
             }
 
-            // Issue 2 fix: Store agent_content per-task so it persists after the
-            // transient agentContent field is overwritten by subsequent progress events.
-            const progressTaskId = data.task_id as string | undefined;
-            const progressAgentContent = (data.agentContent as string) || (data.content as string);
-            if (progressTaskId && progressAgentContent) {
+            // Store agent_content per-task so it persists in TaskCard after subsequent events.
+            if (progressTaskId && incomingAgentContent) {
               const planTasks = { ...((updatedMeta.planTasks as Record<string, unknown>) || {}) };
               const task = (planTasks[progressTaskId] as Record<string, unknown>) || {};
               if (task && Object.keys(task).length > 0) {
                 planTasks[progressTaskId] = {
                   ...task,
-                  agentContent: progressAgentContent,
+                  agentContent: incomingAgentContent,
                   researchSummary: (data.step as string) === 'task_research'
-                    ? progressAgentContent
+                    ? incomingAgentContent
                     : (task.researchSummary as string | undefined),
                 };
                 updatedMeta.planTasks = planTasks;
@@ -514,7 +519,9 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
             const planTasks = { ...((meta.planTasks as Record<string, unknown>) || {}) };
             for (const t of tasksList) {
               const taskId = t.task_id as string;
-              if (taskId) {
+              if (taskId && !planTasks[taskId]) {
+                // Only initialize tasks that don't already exist — re-emitted DAGs
+                // (e.g. after a budget increase resume) must not reset completed tasks.
                 planTasks[taskId] = {
                   id: taskId,
                   name: (t.task_name as string) || 'Task',
@@ -831,6 +838,24 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
+        // plan.cancelled — user-initiated cancel; clear session and update panel
+        if (msgType === 'plan.cancelled' && data) {
+          // Clear persisted sessionId so reconnect doesn't retry a cancelled session
+          usePlanStore.getState().setSessionId(null);
+          const existingMsg = getExistingPlanMsg();
+          if (existingMsg?.metadata?.planPanel) {
+            const meta = existingMsg.metadata.planPanel as Record<string, unknown>;
+            chatState.updateMessage(panelMsgId, {
+              metadata: {
+                ...existingMsg.metadata,
+                message_type: 'plan_cancelled',
+                planPanel: { ...meta },
+                timestamp: new Date(),
+              },
+            });
+          }
+        }
+
         // plan.state — update phases so reconnect/resume restores UI
         if (msgType === 'plan.state' && data) {
           const existingMsg = getExistingPlanMsg();
@@ -942,12 +967,12 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       setReconnectAttempts(0);
 
       // Re-hydrate plan state after reconnect if a session was active.
-      // The backend handle_reconnect handler will re-emit plan.state and the
-      // current interrupt prompt so the UI recovers without a manual refresh.
-      const planSessionId = usePlanStore.getState().sessionId;
-      if (planSessionId) {
-        console.log('[WebSocketContext] Sending plan.reconnect for session', planSessionId);
-        socket.send({ type: 'plan.reconnect', payload: { session_id: planSessionId } } as unknown as Parameters<typeof socket.send>[0]);
+      // Guard with _hasHydrated so we don't send stale sessionId before
+      // the Zustand persist middleware has finished reading from localStorage.
+      const planStore = usePlanStore.getState();
+      if (planStore._hasHydrated && planStore.sessionId) {
+        console.log('[WebSocketContext] Sending plan.reconnect for session', planStore.sessionId);
+        socket.send({ type: 'plan.reconnect', payload: { session_id: planStore.sessionId } } as unknown as Parameters<typeof socket.send>[0]);
       }
     });
     
@@ -979,6 +1004,12 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
 
     setWs(socket);
     socket.connect();
+    // Sync connection state in case the socket was already open when this
+    // component mounted (e.g., Next.js hot-reload remounts the provider
+    // while the underlying singleton WebSocket stays connected).
+    if (socket.isConnected) {
+      setIsConnected(true);
+    }
 
     return () => {
       // Only unsubscribe this component's handlers — don't kill the

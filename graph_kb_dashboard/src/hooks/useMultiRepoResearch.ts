@@ -13,10 +13,12 @@ export function useMultiRepoResearch() {
     perRepoFindings,
     hitlPause,
     status,
+    activeSessionId,
     setPerRepoFindings,
     setCrossRepoSynthesis,
     setHitlPause,
     setStatus,
+    setActiveSessionId,
   } = useResearchStore();
 
   const wsRef = useRef(getWebSocket());
@@ -24,8 +26,22 @@ export function useMultiRepoResearch() {
   useEffect(() => {
     const ws = wsRef.current;
 
-    const offRepoStarted = ws.on('research.repo.started', (data: unknown) => {
-      const d = data as { repo_id: string; repo_index: number; total_repos: number };
+    const offStarted = ws.on('research.started', (raw: unknown) => {
+      const envelope = raw as Record<string, unknown>;
+      const d = (envelope.data ?? envelope) as { session_id: string };
+      if (d.session_id) {
+        setActiveSessionId(d.session_id);
+      }
+    });
+
+    const offCancelled = ws.on('research.cancelled', () => {
+      setStatus('idle');
+      setActiveSessionId(null);
+    });
+
+    const offRepoStarted = ws.on('research.repo.started', (raw: unknown) => {
+      const envelope = raw as Record<string, unknown>;
+      const d = (envelope.data ?? envelope) as { repo_id: string; repo_index: number; total_repos: number };
       setPerRepoFindings(d.repo_id, {
         repoId: d.repo_id,
         repoName: d.repo_id,
@@ -36,8 +52,9 @@ export function useMultiRepoResearch() {
       });
     });
 
-    const offRepoProgress = ws.on('research.repo.progress', (data: unknown) => {
-      const d = data as { repo_id: string; phase: string; message: string; percent: number };
+    const offRepoProgress = ws.on('research.repo.progress', (raw: unknown) => {
+      const envelope = raw as Record<string, unknown>;
+      const d = (envelope.data ?? envelope) as { repo_id: string; phase: string; message: string; percent: number };
       const existing = useResearchStore.getState().perRepoFindings[d.repo_id];
       if (existing) {
         setPerRepoFindings(d.repo_id, {
@@ -48,8 +65,9 @@ export function useMultiRepoResearch() {
       }
     });
 
-    const offRepoComplete = ws.on('research.repo.complete', (data: unknown) => {
-      const d = data as { repo_id: string; findings: unknown };
+    const offRepoComplete = ws.on('research.repo.complete', (raw: unknown) => {
+      const envelope = raw as Record<string, unknown>;
+      const d = (envelope.data ?? envelope) as { repo_id: string; findings: unknown };
       const existing = useResearchStore.getState().perRepoFindings[d.repo_id];
       setPerRepoFindings(d.repo_id, {
         ...(existing ?? { repoId: d.repo_id, repoName: d.repo_id, phase: 'complete' }),
@@ -60,8 +78,9 @@ export function useMultiRepoResearch() {
       });
     });
 
-    const offRepoFailed = ws.on('research.repo.failed', (data: unknown) => {
-      const d = data as { repo_id: string; error_message: string; phase: string };
+    const offRepoFailed = ws.on('research.repo.failed', (raw: unknown) => {
+      const envelope = raw as Record<string, unknown>;
+      const d = (envelope.data ?? envelope) as { repo_id: string; error_message: string; phase: string };
       const existing = useResearchStore.getState().perRepoFindings[d.repo_id];
       setPerRepoFindings(d.repo_id, {
         ...(existing ?? { repoId: d.repo_id, repoName: d.repo_id, progress: 0 }),
@@ -73,8 +92,9 @@ export function useMultiRepoResearch() {
       });
     });
 
-    const offHitlPause = ws.on('research.hitl.pause', (data: unknown) => {
-      const d = data as {
+    const offHitlPause = ws.on('research.hitl.pause', (raw: unknown) => {
+      const envelope = raw as Record<string, unknown>;
+      const d = (envelope.data ?? envelope) as {
         session_id: string;
         failed_repo_id: string;
         error_message: string;
@@ -94,8 +114,9 @@ export function useMultiRepoResearch() {
       setStatus('running');
     });
 
-    const offSynthesisComplete = ws.on('research.synthesis.complete', (data: unknown) => {
-      const d = data as { synthesis: unknown };
+    const offSynthesisComplete = ws.on('research.synthesis.complete', (raw: unknown) => {
+      const envelope = raw as Record<string, unknown>;
+      const d = (envelope.data ?? envelope) as { synthesis: unknown };
       setCrossRepoSynthesis(d.synthesis as Parameters<typeof setCrossRepoSynthesis>[0]);
     });
 
@@ -104,6 +125,8 @@ export function useMultiRepoResearch() {
     });
 
     return () => {
+      offStarted();
+      offCancelled();
       offRepoStarted();
       offRepoProgress();
       offRepoComplete();
@@ -113,7 +136,7 @@ export function useMultiRepoResearch() {
       offSynthesisComplete();
       offSynthesisProgress();
     };
-  }, [setPerRepoFindings, setCrossRepoSynthesis, setHitlPause, setStatus]);
+  }, [setPerRepoFindings, setCrossRepoSynthesis, setHitlPause, setStatus, setActiveSessionId]);
 
   const overallProgress = (() => {
     const values = Object.values(perRepoFindings);
@@ -128,6 +151,15 @@ export function useMultiRepoResearch() {
     Object.values(perRepoFindings).every(
       (r) => r.status === 'complete' || r.status === 'error'
     );
+
+  const cancelResearch = useCallback(() => {
+    const sessionId = useResearchStore.getState().activeSessionId;
+    if (!sessionId) return;
+    wsRef.current.send({
+      type: 'research.cancel',
+      payload: { session_id: sessionId },
+    });
+  }, []);
 
   const respondToHitl = useCallback(
     (choice: 'continue' | 'retry' | 'abort') => {
@@ -158,8 +190,12 @@ export function useMultiRepoResearch() {
     [selectedRepoIds, relationships, executionStrategy, setStatus]
   );
 
+  const canCancel = !!activeSessionId && (isRunning || status === 'running');
+
   return {
     startMultiRepoResearch,
+    cancelResearch,
+    canCancel,
     overallProgress,
     isRunning,
     isSynthesizing,

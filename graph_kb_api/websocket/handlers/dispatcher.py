@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from fastapi import WebSocket
 
 from graph_kb_api.schemas.websocket import (
+    VALID_WORKFLOW_TYPES,
     WSInputPayload,
     WSStartPayload,
 )
@@ -25,7 +26,6 @@ from graph_kb_api.websocket.handlers.multi_agent import handle_multi_agent_workf
 from graph_kb_api.websocket.handlers.plan_dispatcher import dispatch_plan_message
 from graph_kb_api.websocket.handlers.research_dispatcher import dispatch_research_message
 from graph_kb_api.websocket.manager import manager
-from graph_kb_api.schemas.websocket import VALID_WORKFLOW_TYPES
 from graph_kb_api.websocket.protocol import (
     ActionPayload,
     AskCodePayload,
@@ -490,6 +490,10 @@ async def process_message(
             if msg.workflow_id and "workflow_id" not in action_data:
                 action_data["workflow_id"] = msg.workflow_id
             await _handle_action(client_id, action_data)
+
+        elif msg.type == "pong":
+            # Client keepalive response — acknowledge silently
+            pass
 
         elif msg.type.startswith("plan."):
             # Handle Plan command messages

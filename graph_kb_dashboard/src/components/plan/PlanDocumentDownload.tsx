@@ -15,6 +15,8 @@ interface PlanDocumentDownloadProps {
   /** Legacy URL for single-document backward compat. */
   specDocumentUrl?: string;
   specName?: string;
+  /** When true, renders a neutral "ready for review" header instead of "Plan completed". */
+  isPreview?: boolean;
 }
 
 async function fetchArtifactAndDownload(
@@ -22,8 +24,12 @@ async function fetchArtifactAndDownload(
   artifactKey: string,
   filename: string,
 ) {
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || '';
-  const url = `${baseUrl}/api/v1/plan/sessions/${sessionId}/artifacts/${artifactKey}`;
+  const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/api\/v1\/?$/, '') || '';
+  // ArtifactRef.key is the full blob path: specs/{sessionId}/namespace/name.
+  // The backend endpoint prepends specs/{sessionId}/ itself, so strip it here.
+  const prefix = `specs/${sessionId}/`;
+  const keyForUrl = artifactKey.startsWith(prefix) ? artifactKey.slice(prefix.length) : artifactKey;
+  const url = `${baseUrl}/api/v1/plan/sessions/${sessionId}/artifacts/${keyForUrl}`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Failed to fetch artifact: ${resp.status}`);
   const json = await resp.json();
@@ -55,6 +61,7 @@ export function PlanDocumentDownload({
   composedIndexUrl,
   specDocumentUrl,
   specName,
+  isPreview,
 }: PlanDocumentDownloadProps) {
   const [downloading, setDownloading] = useState<string | null>(null);
 
@@ -125,10 +132,12 @@ export function PlanDocumentDownload({
   if (manifestEntries && manifestEntries.length > 0) {
     return (
       <div className="space-y-3">
-        <div className="flex items-center gap-2 text-green-600 dark:text-green-400">
-          <CheckCircle className="h-5 w-5" />
+        <div className={`flex items-center gap-2 ${isPreview ? 'text-blue-600 dark:text-blue-400' : 'text-green-600 dark:text-green-400'}`}>
+          {isPreview ? <FileText className="h-5 w-5" /> : <CheckCircle className="h-5 w-5" />}
           <span className="text-sm font-medium">
-            Plan completed — {manifestEntries.filter(e => e.status === 'final').length}/{manifestEntries.length} documents
+            {isPreview
+              ? `${manifestEntries.filter(e => e.status === 'final' || e.status === 'reviewed').length}/${manifestEntries.length} documents ready for review`
+              : `Plan completed — ${manifestEntries.filter(e => e.status === 'final').length}/${manifestEntries.length} documents`}
           </span>
         </div>
 

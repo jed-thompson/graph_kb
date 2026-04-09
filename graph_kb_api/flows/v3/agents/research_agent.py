@@ -158,6 +158,7 @@ class ResearchAgent(BaseAgent):
             summary="",
             confidence_score=0.0,
         )
+        llm_calls_used = 0
 
         try:
             # Step 1: Analyze codebase
@@ -168,6 +169,10 @@ class ResearchAgent(BaseAgent):
                 findings.relevant_modules = codebase_results.get("relevant_modules", [])
                 findings.code_owners = codebase_results.get("code_owners", [])
                 findings.technical_debt = codebase_results.get("technical_debt", [])
+            else:
+                logger.debug(
+                    "[ResearchAgent] repo_id not set — skipping codebase analysis (relevant_modules will be empty)"
+                )
 
             # Step 2: Search documents
             await self._emit_progress(state, "searching_documents", "Searching related documents...", 40)
@@ -183,13 +188,12 @@ class ResearchAgent(BaseAgent):
             findings.data_schemas = doc_results.get("data_schemas", [])
             findings.business_rules = doc_results.get("business_rules", [])
 
-            # Step 3: Identify risks
-            await self._emit_progress(state, "identifying_risks", "Identifying potential risks...", 60)
-            findings.risks: list[ResearchRisk] = await self._identify_risks(context, findings, workflow_context, state)
-
-            # Step 4: Detect gaps
-            await self._emit_progress(state, "detecting_gaps", "Detecting information gaps...", 80)
-            findings.gaps: list[ResearchGap] = await self._detect_gaps(context, findings, workflow_context, state)
+            # Step 3: Identify risks and gaps in a single LLM call
+            await self._emit_progress(state, "identifying_risks", "Identifying risks and gaps...", 60)
+            risks_and_gaps = await self._identify_risks_and_gaps(context, findings, workflow_context, state)
+            findings.risks = risks_and_gaps["risks"]
+            findings.gaps = risks_and_gaps["gaps"]
+            llm_calls_used += 1  # _identify_risks_and_gaps makes 1 LLM call
 
             # Step 5: Generate summary
             await self._emit_progress(state, "generating_summary", "Generating research summary...", 90)
@@ -208,6 +212,7 @@ class ResearchAgent(BaseAgent):
             "output": json.dumps(self._serialize_findings(findings)),
             "confidence_score": findings.confidence_score,
             "agent_type": "research_agent",
+            "llm_calls_used": llm_calls_used,
         }
 
     async def analyze_codebase(
@@ -300,12 +305,22 @@ class ResearchAgent(BaseAgent):
     ) -> List[Dict[str, str]]:
         """Find modules that may be relevant to the feature."""
         if not graph_store:
-            logger.warning("graph_store is None, cannot find relevant modules")
+            logger.warning(
+                "[ResearchAgent] graph_store is None — "
+                "relevant_modules will be empty for this research pass. "
+                "Verify GraphKBFacade is injected into workflow_context.graph_store."
+            )
             return []
 
         query_service = getattr(graph_store, "query_service", None)
         if not query_service:
-            logger.warning("query_service not available on graph_store, cannot find relevant modules")
+            logger.warning(
+                "[ResearchAgent] graph_store.query_service is unavailable — "
+                "relevant_modules will be empty for this research pass. "
+                "Verify Neo4j connection and GraphKBFacade initialization. "
+                "Check that workflow_context.repo_id is set and that "
+                "graph_store exposes query_service with get_architecture()."
+            )
             return []
 
         try:
@@ -623,6 +638,38 @@ class ResearchAgent(BaseAgent):
             logger.warning(f"Failed to search API docs: {e}")
             return []
 
+    async def _identify_risks_and_gaps(
+        self,
+        context: Dict[str, Any],
+        findings: ResearchFindings,
+        workflow_context: WorkflowContext,
+        state: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Identify risks and gaps in a single LLM call (replaces separate _identify_risks + _detect_gaps)."""
+        llm: LLMService = workflow_context.require_llm
+        all_tools = state.get("available_tools", [])
+        assigned_tools: list[Any] = [t for t in all_tools if t.name in self.capability.optional_tools]
+
+        try:
+            prompt: str = self._build_risks_and_gaps_prompt(context, findings)
+            response = await llm.bind_tools(assigned_tools).ainvoke(prompt)
+            result = self._parse_risks_and_gaps(str(response.content))
+            # Fall back to basic detection if parsing produced nothing —
+            # preserves the same graceful degradation as the old separate calls.
+            if not result["risks"] and not result["gaps"]:
+                logger.warning("_parse_risks_and_gaps returned empty — falling back to basic detection")
+                return {
+                    "risks": self._basic_risk_detection(context, findings),
+                    "gaps": self._basic_gap_detection(context, findings),
+                }
+            return result
+        except Exception as e:
+            logger.warning(f"LLM risks+gaps detection failed: {e}")
+            return {
+                "risks": self._basic_risk_detection(context, findings),
+                "gaps": self._basic_gap_detection(context, findings),
+            }
+
     async def _identify_risks(
         self,
         context: Dict[str, Any],
@@ -841,6 +888,69 @@ class ResearchAgent(BaseAgent):
             )
         except Exception as e:
             logger.warning(f"Failed to emit research progress: {e}")
+
+    def _build_risks_and_gaps_prompt(self, context: Dict[str, Any], findings: ResearchFindings) -> str:
+        """Build a single combined prompt for risk and gap identification."""
+        prompt = f"""Analyze the following feature specification context and identify both risks and information gaps.
+
+Context:
+- User Explanation: {context.get("user_explanation", "Not provided")}
+- Business Value: {context.get("business_value", "Not provided")}
+- Constraints: {json.dumps(context.get("constraints", {}), indent=2)}
+
+Research Findings:
+- Similar Features: {len(findings.similar_features)} found
+- Relevant Modules: {len(findings.relevant_modules)} found
+- Related Specs: {len(findings.related_specs)} found
+
+Identify risks in these categories: technical, timeline, resource, dependency, compliance.
+For each risk provide: category, description, severity (critical/high/medium/low), mitigation.
+
+Identify gaps where more information would help: scope, technical, constraint, stakeholder.
+For each gap provide: category, question, context, suggested_answers (2-3 options), impact (high/medium/low).
+
+Return a single JSON object with two keys:
+{{"risks": [...risk objects...], "gaps": [...gap objects...]}}"""
+        return append_document_context_to_prompt(prompt, context)
+
+    def _parse_risks_and_gaps(self, response: str) -> Dict[str, Any]:
+        """Parse combined LLM response into risks and gaps dicts."""
+        # Strip markdown code fences before attempting JSON extraction
+        cleaned = response.strip()
+        for fence in ("```json", "```"):
+            if cleaned.startswith(fence):
+                cleaned = cleaned[len(fence):]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+        data: dict | None = None
+        try:
+            # Attempt 1: parse the full cleaned response directly
+            data = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        if data is None:
+            # Attempt 2: use raw_decode to find the first valid JSON object.
+            # Unlike a bracket-depth scan this correctly handles braces inside
+            # string values and will not produce silently corrupt data.
+            start = cleaned.find("{")
+            if start != -1:
+                decoder = json.JSONDecoder()
+                try:
+                    data, _ = decoder.raw_decode(cleaned, start)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning(f"Failed to parse combined risks+gaps response: {e}")
+
+        if isinstance(data, dict):
+            risks = self._parse_risks(json.dumps(data.get("risks", [])))
+            gaps = self._parse_gaps(json.dumps(data.get("gaps", [])))
+            if risks or gaps:
+                return {"risks": risks, "gaps": gaps}
+
+        # All parsing attempts failed — return empty so the caller can fall back
+        return {"risks": [], "gaps": []}
 
     def _build_risk_prompt(self, context: Dict[str, Any], findings: ResearchFindings) -> str:
         """Build prompt for risk identification."""

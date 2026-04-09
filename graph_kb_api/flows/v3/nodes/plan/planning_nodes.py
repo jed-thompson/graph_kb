@@ -32,10 +32,9 @@ from graph_kb_api.flows.v3.state.plan_state import (
     PlanningSubgraphState,
 )
 from graph_kb_api.flows.v3.state.workflow_state import UnifiedSpecState
-from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator
-from graph_kb_api.websocket.plan_events import emit_phase_complete, emit_phase_progress
-from graph_kb_api.flows.v3.utils.token_estimation import truncate_to_tokens
 from graph_kb_api.flows.v3.utils.context_utils import append_document_context_to_prompt, sanitize_context_for_prompt
+from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator, truncate_to_tokens
+from graph_kb_api.websocket.plan_events import emit_phase_complete, emit_phase_progress
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +195,6 @@ class FeasibilityNode(SubgraphAwareNode[PlanningSubgraphState]):
     def _build_feasibility_prompt(
         self, context: ContextData, planning: PlanData, research: ResearchData | None = None
     ) -> str:
-        from graph_kb_api.flows.v3.utils.token_estimation import truncate_to_tokens
 
         constraints: str = context.get("constraints", "No specific constraints")
         roadmap_json: str = json.dumps(planning.get("roadmap", {}), indent=2, default=str)
@@ -214,7 +212,9 @@ class FeasibilityNode(SubgraphAwareNode[PlanningSubgraphState]):
                     if findings_summary:
                         prompt += f"**Summary:** {truncate_to_tokens(findings_summary, 1000)}\n"
                     if key_insights:
-                        prompt += f"**Key Insights:**\n" + "\n".join(f"- {ins}" for ins in key_insights[:10]) + "\n"
+                        prompt += "**Key Insights:**\n" + "\n".join(f"- {ins}" for ins in key_insights[:10]) + "\n"
+
+        prompt = append_document_context_to_prompt(prompt, context)
 
         return prompt
 
@@ -715,12 +715,29 @@ class AlignNode(SubgraphAwareNode[PlanningSubgraphState]):
         constraints: str = context.get("constraints", "No specific constraints")
         spec_name: str = context.get("spec_name", "Feature")
         roadmap: str = json.dumps(planning.get("roadmap", {}), indent=2, default=str)
-        return f"""You are a requirements alignment specialist. Verify that the plan meets all
+        task_dag = planning.get("task_dag", {})
+        tasks_summary: str = json.dumps(
+            [
+                {
+                    "id": t.get("id"),
+                    "name": t.get("name"),
+                    "description": t.get("description"),
+                    "spec_section": t.get("spec_section"),
+                    "dependencies": t.get("dependencies", []),
+                }
+                for t in task_dag.get("tasks", [])
+            ],
+            indent=2,
+            default=str,
+        )
+        prompt = f"""You are a requirements alignment specialist. Verify that the plan meets all
 requirements and constraints.
 
 ## Specification: {spec_name}
 ## Constraints: {constraints}
-## Plan: {roadmap}
+## Roadmap: {roadmap}
+## Task Breakdown ({task_dag.get("total_tasks", 0)} tasks):
+{tasks_summary}
 
 Return JSON with this structure:
 {{
@@ -733,6 +750,8 @@ Return JSON with this structure:
     }}
 }}
 """
+        prompt = append_document_context_to_prompt(prompt, context)
+        return prompt
 
     def _parse_alignment(self, content: str) -> Dict[str, Any]:
         try:
@@ -784,7 +803,7 @@ class PlanningApprovalNode(SubgraphAwareNode[PlanningSubgraphState]):
             "go_no_go": feasibility.get("go_no_go", "go"),
         }
 
-        context_items = await self._load_context_items(state.get("session_id"), state["research"])
+        context_items = await self._load_context_items(state.get("session_id"), state.get("research", {}), context)
         payload: ApprovalInterruptPayload = {
             "type": "approval",
             "phase": "planning",

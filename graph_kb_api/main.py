@@ -14,17 +14,20 @@ import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import AsyncGenerator
 
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from graph_kb_api.config import get_settings
 from graph_kb_api.config import settings as app_settings
-from graph_kb_api.database.base import close_database, init_database
+from graph_kb_api.database.base import close_database, get_session, init_database
+from graph_kb_api.database.plan_models import PlanSession
 from graph_kb_api.dependencies import (
     _init_facade,
     get_db_session,
@@ -74,6 +77,55 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning(f"PostgreSQL database not initialized: {e}")
         logger.warning("API will start but some endpoints may not work without database")
+
+    # Add task_results column if not present (idempotent ALTER TABLE).
+    # create_all never ALTERs existing tables, so new columns require an
+    # explicit migration. This must run before any code reads/writes the column.
+    try:
+        async with get_session() as db:
+            await db.execute(
+                text(
+                    "ALTER TABLE plan_sessions"
+                    " ADD COLUMN IF NOT EXISTS task_results JSONB"
+                )
+            )
+        logger.info("plan_sessions.task_results column ensured")
+    except Exception as migration_exc:
+        logger.warning(f"Failed to add task_results column: {migration_exc}")
+
+    # Add spec_document_url column if not present (idempotent ALTER TABLE).
+    # Stores assembly completion evidence so reconnect recovery works even when
+    # the server dies before the parent LangGraph checkpoint is written.
+    try:
+        async with get_session() as db:
+            await db.execute(
+                text(
+                    "ALTER TABLE plan_sessions"
+                    " ADD COLUMN IF NOT EXISTS spec_document_url TEXT"
+                )
+            )
+        logger.info("plan_sessions.spec_document_url column ensured")
+    except Exception as migration_exc:
+        logger.warning(f"Failed to add spec_document_url column: {migration_exc}")
+
+    # Sweep stale plan sessions left in 'running' state from a prior crash.
+    # The age filter (updated_at > 5 min ago) avoids incorrectly interrupting
+    # sessions that are actively running in another instance during a rolling
+    # restart or blue-green deployment.
+    try:
+        stale_cutoff = datetime.now(UTC) - timedelta(minutes=5)
+        async with get_session() as db:
+            await db.execute(
+                sa_update(PlanSession)
+                .where(
+                    PlanSession.workflow_status == "running",
+                    PlanSession.updated_at < stale_cutoff,
+                )
+                .values(workflow_status="interrupted")
+            )
+        logger.info("Swept stale 'running' plan sessions to 'interrupted'")
+    except Exception as sweep_exc:
+        logger.warning(f"Failed to sweep stale plan sessions on startup: {sweep_exc}")
 
     # Try to initialize facade, but don't fail if app if it fails
     # This allows for health endpoints to work even without Neo4j/ChromaDB
