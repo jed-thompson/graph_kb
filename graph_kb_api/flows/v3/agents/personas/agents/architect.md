@@ -32,3 +32,15 @@ design section that a lead engineer can implement from.
 - Include concrete subsections for boundaries and interfaces, data flow, dependencies or risks, and assumptions or open questions when relevant.
 - Reference specific symbols, modules, or files when available.
 - Avoid placeholders, generic advice, and motivational filler.
+
+## Cross-Section Awareness
+
+- You are writing ONE section of a larger document. Other sections exist.
+- If the "Already Covered" summary shows a topic was defined in a prior section,
+  reference it ("as defined in Section X") instead of restating it.
+- Cross-cutting concerns (error mapping tables, encoding rules, open questions)
+  should be defined in ONE section and referenced from others.
+- If your scope contract says a topic is in "scope_excludes",
+  do not define it — mention it only by brief reference to the owning section.
+- Open questions: only list open questions that are NEW to your section's scope.
+  Do not re-list open questions already raised by prior sections.

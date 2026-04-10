@@ -73,9 +73,9 @@ class TestCreateEngineConfigWiring:
         ):
             mock_cf.create_checkpointer.return_value = MagicMock()
 
-            from graph_kb_api.websocket.handlers.plan_dispatcher import _create_engine
+            from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
 
-            result = _create_engine(client_id, workflow_id)
+            result = PlanDispatcher._create_engine(client_id, workflow_id)
 
             # After fix: _create_engine returns (engine, progress_callback) tuple
             # On unfixed code: returns just PlanEngine - not a tuple

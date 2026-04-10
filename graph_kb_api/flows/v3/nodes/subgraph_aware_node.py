@@ -90,20 +90,30 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
 
         # Emit plan.phase.enter only for the first step in the phase (step_progress == 0.0)
         # This prevents emitting on every node — only the entry node triggers it (Req 0h)
+        # Also skip on loop iterations (e.g., research gap_check → formulate_queries cycle)
+        # by checking if the phase's iteration counter is already > 0.
         if self.step_progress == 0.0:
             completed_phases = state.get("completed_phases", {})
             if not completed_phases.get(self.phase):
-                try:
-                    session_id = state.get("session_id", "")
-                    client_id: str | None = configurable.get("client_id")
-                    await emit_phase_enter(
-                        session_id=session_id,
-                        phase=self.phase,
-                        expected_steps=1,  # Default; subgraphs can override
-                        client_id=client_id,
-                    )
-                except Exception:
-                    pass  # Fire-and-forget (Req 29.2)
+                # Detect loop iterations: research and orchestrate subgraphs track
+                # iteration counts. If > 0, this is a re-entry, not the first entry.
+                phase_data = state.get(self.phase, {})
+                is_loop_reentry = (
+                    phase_data.get("research_gap_iterations", 0) > 0
+                    or phase_data.get("current_task_index", 0) > 0
+                )
+                if not is_loop_reentry:
+                    try:
+                        session_id = state.get("session_id", "")
+                        client_id: str | None = configurable.get("client_id")
+                        await emit_phase_enter(
+                            session_id=session_id,
+                            phase=self.phase,
+                            expected_steps=1,  # Default; subgraphs can override
+                            client_id=client_id,
+                        )
+                    except Exception:
+                        pass  # Fire-and-forget (Req 29.2)
 
         if progress_cb and not self.skip_auto_progress:
             try:

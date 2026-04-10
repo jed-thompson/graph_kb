@@ -309,27 +309,34 @@ class DecomposeNode(SubgraphAwareNode[PlanningSubgraphState]):
         # Map spec sections → task DAG format
         tasks = []
         for section in spec_sections:
-            tasks.append(
-                {
-                    "id": section.get("id", ""),
-                    "name": section.get("name", ""),
-                    "description": section.get("description", ""),
-                    "agent_type": section.get("agent_type", "architect"),
-                    "section_type": section.get("section_type", "analysis_and_draft"),
-                    "spec_section": section.get("spec_section", "general"),
-                    "relevant_docs": section.get("relevant_docs", []),
-                    "context_requirements": section.get("context_requirements", []),
-                    "dependencies": section.get("dependencies", []),
-                    "priority": section.get("priority", "medium"),
-                    "tools_required": section.get("tools_required", ["llm"]),
-                }
-            )
+            task_entry: dict[str, Any] = {
+                "id": section.get("id", ""),
+                "name": section.get("name", ""),
+                "description": section.get("description", ""),
+                "agent_type": section.get("agent_type", "architect"),
+                "section_type": section.get("section_type", "analysis_and_draft"),
+                "spec_section": section.get("spec_section", "general"),
+                "relevant_docs": section.get("relevant_docs", []),
+                "context_requirements": section.get("context_requirements", []),
+                "dependencies": section.get("dependencies", []),
+                "priority": section.get("priority", "medium"),
+                "tools_required": section.get("tools_required", ["llm"]),
+            }
+            # Pass through scope_contract and reading_order when present
+            if "scope_contract" in section:
+                task_entry["scope_contract"] = section["scope_contract"]
+            if "reading_order" in section:
+                task_entry["reading_order"] = section["reading_order"]
+            tasks.append(task_entry)
 
-        # Build DAG edges from dependency_graph
+        # Build DAG edges from dependency_graph.
+        # dep_graph maps section_id → [prerequisite_ids], so each edge
+        # should point FROM the prerequisite TO the dependent section:
+        #   [prerequisite, dependent]  i.e.  [tgt, src]
         dag_edges = []
         for src, targets in dep_graph.items():
             for tgt in targets:
-                dag_edges.append([src, tgt])
+                dag_edges.append([tgt, src])
 
         entry_tasks = [t["id"] for t in tasks if not t.get("dependencies")]
         exit_tasks = (

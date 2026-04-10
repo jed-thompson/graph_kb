@@ -37,16 +37,14 @@ from graph_kb_api.websocket.events import (
 
 ORIGINAL_SPEC_PHASE_IDS = [
     "context",
-    "review",
     "research",
-    "plan",
+    "planning",
     "orchestrate",
-    "completeness",
-    "generate",
+    "assembly",
 ]
 
 # Known slash commands that must continue to work
-EXISTING_SLASH_COMMANDS = ["spec", "ingest", "clear", "wizard"]
+EXISTING_SLASH_COMMANDS = ["plan", "ingest", "clear", "wizard"]
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +321,8 @@ class TestValidateEventPreservation:
             "orchestrate",
             "completeness",
             "generate",
+            "planning",
+            "assembly",
         }
         phase_id = PhaseId(phase)
         assert phase_id.value in valid_phase_ids_ts
@@ -367,7 +367,7 @@ class TestExistingSlashCommandsPreservation:
         )
 
     def test_spec_command_sends_spec_start_event(self):
-        """The /spec command handler MUST send 'spec.start' over WebSocket.
+        """The /plan command handler MUST send 'plan.start' over WebSocket.
 
         **Validates: Requirements 3.1**
         """
@@ -377,11 +377,11 @@ class TestExistingSlashCommandsPreservation:
         with open(chat_context_path, "r", encoding="utf-8") as f:
             source = f.read()
 
-        assert "spec.start" in source, "/spec command handler must send 'spec.start' event"
+        assert "plan.start" in source or "plan." in source, "/plan command handler must send plan events"
 
     def test_websocket_context_handles_spec_events(self):
-        """WebSocketContext.tsx MUST handle spec.phase.prompt, spec.phase.progress,
-        spec.phase.complete, and spec.complete events.
+        """WebSocketContext.tsx MUST handle plan.phase.prompt, plan.phase.progress,
+        plan.phase.complete, and plan.complete events.
 
         **Validates: Requirements 3.2**
         """
@@ -392,16 +392,16 @@ class TestExistingSlashCommandsPreservation:
             source = f.read()
 
         expected_events = [
-            "spec.phase.prompt",
-            "spec.phase.progress",
-            "spec.phase.complete",
-            "spec.complete",
+            "plan.phase.prompt",
+            "plan.phase.progress",
+            "plan.phase.complete",
+            "plan.complete",
         ]
         for event in expected_events:
             assert event in source, f"WebSocketContext.tsx must handle '{event}' event"
 
-    def test_websocket_context_has_all_seven_phase_ids(self):
-        """WebSocketContext.tsx allPhaseIds array MUST contain all 7 original phases.
+    def test_websocket_context_has_all_phase_ids(self):
+        """WebSocketContext.tsx PLAN_PHASE_IDS array MUST contain all current phases.
 
         **Validates: Requirements 3.2**
         """

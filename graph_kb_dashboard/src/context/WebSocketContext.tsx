@@ -521,7 +521,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
             chatState.updateMessage(panelMsgId, {
               metadata: {
                 ...existingMsg.metadata,
-                planPanel: { ...meta, phases: existingPhases, agentContent: undefined, thinkingSteps: meta.thinkingSteps || [] },
+                planPanel: { ...meta, phases: existingPhases, agentContent: undefined, thinkingSteps: [] },
                 planPhases: existingPhases,
                 timestamp: new Date(),
               },
@@ -755,6 +755,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                 planPanel: {
                   ...meta,
                   phases: existingPhases,
+                  thinkingSteps: [],
                   documentManifest: (data.documentManifest || meta.documentManifest || null) as Record<string, unknown> | null,
                 },
                 planPhases: existingPhases,

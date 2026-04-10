@@ -59,3 +59,12 @@ Return ONLY the assembled markdown document as raw text.
 Do NOT wrap the output in JSON, code fences, or any other envelope.
 Do NOT include commentary about your assembly decisions.
 The first line must be the document title as a `#` heading.
+
+## Open Questions Consolidation
+
+- Extract ALL open questions and assumptions from every section.
+- Deduplicate by topic (same question phrased differently counts as one entry).
+- Place the consolidated list in a single "Open Questions & Assumptions" appendix at the end of the document.
+- Remove inline open questions sections from individual sections, replacing with
+  "See Appendix: Open Questions & Assumptions" where appropriate.
+- Preserve the section attribution for each question (e.g., "Raised in: Architecture Overview").

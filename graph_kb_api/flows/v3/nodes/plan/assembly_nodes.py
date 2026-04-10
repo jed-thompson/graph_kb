@@ -50,6 +50,7 @@ from graph_kb_api.flows.v3.state.workflow_state import (
     ResearchData,
 )
 from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator, truncate_to_tokens
+from graph_kb_api.flows.v3.utils.dedup_directives import validate_dedup_directives, CompositionReviewResponse
 from graph_kb_api.websocket.plan_events import emit_complete, emit_error, emit_phase_complete, emit_phase_progress
 
 logger = logging.getLogger(__name__)
@@ -704,23 +705,92 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         if llm and deliverables:
             try:
-                response: AIMessage = await llm.ainvoke(review_prompt)
-                raw = response.content if hasattr(response, "content") else str(response)
-                content_str = str(raw) if not isinstance(raw, str) else raw
+                # Use structured output to guarantee field names and types.
+                # with_structured_output uses OpenAI's response_format=json_schema
+                # which enforces the schema at the token generation level.
+                structured_llm = llm.with_structured_output(CompositionReviewResponse)
+                parsed_response: CompositionReviewResponse = await structured_llm.ainvoke(review_prompt)
 
-                # Parse JSON from the LLM response
-                json_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content_str, re.DOTALL)
-                if json_match:
-                    parsed = json.loads(json_match.group())
-                    composition_result = {
-                        "overall_score": max(0.0, min(1.0, float(parsed.get("overall_score", 0.5)))),
-                        "summary": parsed.get("summary", ""),
-                        "issues": parsed.get("issues", []),
-                        "needs_re_orchestrate": bool(parsed.get("needs_re_orchestrate", False)),
+                composition_result = {
+                    "overall_score": max(0.0, min(1.0, parsed_response.overall_score)),
+                    "summary": parsed_response.summary,
+                    "issues": [issue.model_dump() for issue in parsed_response.issues],
+                    "needs_re_orchestrate": parsed_response.needs_re_orchestrate,
+                }
+
+                # Validate dedup directives against manifest task IDs
+                raw_directives = [d.model_dump() for d in parsed_response.dedup_directives]
+                if raw_directives:
+                    manifest_task_ids = {
+                        e.get("task_id", "")
+                        for e in (manifest.get("entries", []) if manifest else [])
+                        if e.get("task_id")
                     }
+                    # Build section-title-to-task-id lookup so the validator
+                    # can resolve LLM responses that use titles instead of IDs.
+                    section_to_task_id: dict[str, str] = {}
+                    for entry in manifest.get("entries", []) if manifest else []:
+                        tid = entry.get("task_id", "")
+                        if tid:
+                            section_to_task_id[tid] = tid  # identity for task IDs
+                            spec_sec = entry.get("spec_section", "")
+                            if spec_sec:
+                                section_to_task_id[spec_sec] = tid
+                            name = entry.get("name", "")
+                            if name:
+                                section_to_task_id[name] = tid
+                    composition_result["dedup_directives"] = validate_dedup_directives(
+                        raw_directives, manifest_task_ids, section_to_task_id
+                    )
+                else:
+                    composition_result["dedup_directives"] = []
+
                 llm_calls = 1
             except Exception as e:
-                logger.warning(f"CompositionReviewNode: LLM review failed: {e}")
+                logger.warning(f"CompositionReviewNode: structured output failed, falling back to raw parse: {e}")
+                # Fallback: raw ainvoke + regex JSON parsing
+                try:
+                    response: AIMessage = await llm.ainvoke(review_prompt)
+                    raw = response.content if hasattr(response, "content") else str(response)
+                    content_str = str(raw) if not isinstance(raw, str) else raw
+
+                    json_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content_str, re.DOTALL)
+                    if json_match:
+                        parsed = json.loads(json_match.group())
+                        composition_result = {
+                            "overall_score": max(0.0, min(1.0, float(parsed.get("overall_score", 0.5)))),
+                            "summary": parsed.get("summary", ""),
+                            "issues": parsed.get("issues", []),
+                            "needs_re_orchestrate": bool(parsed.get("needs_re_orchestrate", False)),
+                        }
+
+                        raw_directives = parsed.get("dedup_directives", [])
+                        if raw_directives and isinstance(raw_directives, list):
+                            manifest_task_ids = {
+                                e.get("task_id", "")
+                                for e in (manifest.get("entries", []) if manifest else [])
+                                if e.get("task_id")
+                            }
+                            section_to_task_id = {}
+                            for entry in manifest.get("entries", []) if manifest else []:
+                                tid = entry.get("task_id", "")
+                                if tid:
+                                    section_to_task_id[tid] = tid
+                                    spec_sec = entry.get("spec_section", "")
+                                    if spec_sec:
+                                        section_to_task_id[spec_sec] = tid
+                                    name = entry.get("name", "")
+                                    if name:
+                                        section_to_task_id[name] = tid
+                            composition_result["dedup_directives"] = validate_dedup_directives(
+                                raw_directives, manifest_task_ids, section_to_task_id
+                            )
+                        else:
+                            composition_result["dedup_directives"] = []
+
+                    llm_calls = 1
+                except Exception as fallback_err:
+                    logger.warning(f"CompositionReviewNode: LLM review failed: {fallback_err}")
 
         # Derive re_execute_task_ids from critical issues
         re_execute_task_ids: list[str] = []
@@ -783,8 +853,11 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
             f"## Instructions\n\n"
             f"Review the document suite for cross-document redundancy, conflicting terminology, "
             f"missing cross-references, inconsistent formatting, coverage gaps, and failed tasks. "
+            f"For each redundancy issue identified, produce a dedup_directive specifying which "
+            f"section should be the canonical owner and which sections should replace the "
+            f"duplicate content with a cross-reference. "
             f"Return a JSON object with overall_score (0-1), summary, issues list, "
-            f"needs_re_orchestrate (bool), and recommendations."
+            f"needs_re_orchestrate (bool), recommendations, and dedup_directives."
         )
 
 
@@ -903,16 +976,40 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
             assembled_document = ""
             flow_score = 0.5
 
+            # Sort sections by dependency order using topological sort
+            planning: PlanData = state.get("plan", {})
+            task_dag = planning.get("task_dag", {})
+            sorted_keys = self._topological_sort_sections(hydrated_sections, task_dag)
+            sorted_sections: Dict[str, str] = {k: hydrated_sections[k] for k in sorted_keys if k in hydrated_sections}
+
+            # Attempt lightweight LLM executive summary pass
+            executive_summary = ""
+            transitions: list[str] = []
+            if hydrated_sections and workflow_context and sorted_keys:
+                try:
+                    executive_summary, transitions = await self._generate_executive_summary(
+                        sorted_keys, hydrated_sections, spec_name, workflow_context,
+                    )
+                    logger.info("AssembleNode: executive summary generated (%d transitions)", len(transitions))
+                except Exception as e:
+                    logger.warning("AssembleNode: executive summary generation failed, skipping: %s", e)
+                    executive_summary = ""
+                    transitions = []
+
             if hydrated_sections and workflow_context:
                 try:
                     BudgetGuard.check(budget)
                     agent = DocumentAssemblyAgent()
+                    toc = self._generate_toc(sorted_keys) if sorted_keys else ""
                     agent_task: AgentTask = {
                         "description": f"Assemble document: {spec_name}",
                         "task_id": f"assembly_{session_id}_{uuid.uuid4().hex[:8]}",
                         "context": {
-                            "sections": hydrated_sections,
+                            "sections": sorted_sections,
                             "spec_name": spec_name,
+                            "table_of_contents": toc,
+                            "executive_summary": executive_summary,
+                            "transitions": transitions,
                             "user_explanation": context.get("user_explanation", ""),
                             "constraints": context.get("constraints", {}),
                             "research_summary": research.get("findings", {}).get("summary", ""),
@@ -951,18 +1048,16 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                     logger.info("AssembleNode: LLM assembly completed with flow_score=%.2f", flow_score)
                 except Exception as e:
                     logger.warning("AssembleNode: LLM assembly failed, falling back to concatenation: %s", e)
-                    # Fallback: concatenate sections
-                    parts = [f"# {spec_name}\n"]
-                    for section_name, content in hydrated_sections.items():
-                        parts.append(f"## {section_name}\n\n{content}")
-                    assembled_document = "\n\n".join(parts)
+                    # Fallback: concatenate sections in topological order with exec summary + transitions
+                    assembled_document = self._build_fallback_document(
+                        spec_name, sorted_keys, hydrated_sections, executive_summary, transitions,
+                    )
 
             if not assembled_document and hydrated_sections:
-                # Fallback if no workflow_context
-                parts = [f"# {spec_name}\n"]
-                for section_name, content in hydrated_sections.items():
-                    parts.append(f"## {section_name}\n\n{content}")
-                assembled_document = "\n\n".join(parts)
+                # Fallback if no workflow_context — use topological order with exec summary + transitions
+                assembled_document = self._build_fallback_document(
+                    spec_name, sorted_keys, hydrated_sections, executive_summary, transitions,
+                )
 
             spec_document_path = ""
             if artifact_svc:
@@ -1112,6 +1207,124 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                 )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _generate_toc(ordered_keys: list[str]) -> str:
+        """Generate markdown Table of Contents with anchor links.
+
+        Delegates to the standalone utility for easier testing.
+        """
+        from graph_kb_api.flows.v3.utils.toc_generation import generate_toc
+
+        return generate_toc(ordered_keys)
+
+    @staticmethod
+    def _topological_sort_sections(
+        hydrated_sections: dict[str, str],
+        task_dag: dict[str, Any],
+    ) -> list[str]:
+        """Sort section keys by dependency order using Kahn's algorithm.
+
+        Sections with no dependencies (foundations) appear first.
+        Sections not in the DAG at all are appended at the end.
+        Original dict order is used as stable tiebreaker for sections
+        at the same topological level.
+
+        If a cycle is detected (len(result) < len(section_keys) after
+        Kahn's completes), logs a warning and falls back to original
+        dict iteration order.
+        """
+        from graph_kb_api.flows.v3.utils.topological_sort import topological_sort_sections
+
+        return topological_sort_sections(hydrated_sections, task_dag)
+
+    @staticmethod
+    def _build_fallback_document(
+        spec_name: str,
+        sorted_keys: list[str],
+        hydrated_sections: dict[str, str],
+        executive_summary: str = "",
+        transitions: list[str] | None = None,
+    ) -> str:
+        """Build a fallback document with title + exec summary + TOC + sections.
+
+        Used when the full LLM assembly agent fails or when no workflow
+        context is available.  If *executive_summary* or *transitions* are
+        empty the document degrades gracefully to TOC + sorted sections.
+        """
+        toc = AssembleNode._generate_toc(sorted_keys) if sorted_keys else ""
+        parts: list[str] = [f"# {spec_name}\n"]
+        if executive_summary:
+            parts.append(f"{executive_summary}\n")
+        if toc:
+            parts.append(toc)
+        for idx, section_name in enumerate(sorted_keys):
+            if section_name in hydrated_sections:
+                parts.append(f"## {section_name}\n\n{hydrated_sections[section_name]}")
+            # Insert transition sentence between adjacent sections
+            if transitions and idx < len(transitions) and idx < len(sorted_keys) - 1:
+                parts.append(f"_{transitions[idx]}_")
+        return "\n\n".join(parts)
+
+    async def _generate_executive_summary(
+        self,
+        ordered_keys: list[str],
+        hydrated_sections: dict[str, str],
+        spec_name: str,
+        workflow_context: "WorkflowContext",
+    ) -> tuple[str, list[str]]:
+        """Generate executive summary and transition sentences via lightweight LLM call.
+
+        Sends only section titles + first paragraphs (~2K tokens) to the LLM.
+        Returns ``(executive_summary, transition_sentences)`` where
+        ``transition_sentences[i]`` bridges section *i* to section *i+1*.
+        """
+        summaries = self._extract_section_summaries(ordered_keys, hydrated_sections)
+
+        system_prompt = (
+            "You are assembling a specification document. Given section titles and their "
+            "opening paragraphs, produce:\n"
+            "1. An executive summary (3-5 sentences) for the document.\n"
+            "2. One transition sentence between each pair of adjacent sections.\n\n"
+            "Return JSON: {\"executive_summary\": \"...\", \"transitions\": [\"...\", ...]}\n"
+            "The transitions array should have N-1 entries for N sections."
+        )
+
+        user_prompt = f"# {spec_name}\n\n{summaries}"
+
+        llm = workflow_context.require_llm
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        response = await llm.ainvoke(messages)
+        content = response.content if hasattr(response, "content") else str(response)
+        # Strip markdown code fences if present
+        text = str(content).strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        text = text.strip()
+
+        data = json.loads(text)
+        return data["executive_summary"], data.get("transitions", [])
+
+    @staticmethod
+    def _extract_section_summaries(
+        ordered_keys: list[str],
+        hydrated_sections: dict[str, str],
+        max_chars_per_section: int = 300,
+    ) -> str:
+        """Extract title + first paragraph from each section for LLM summary pass.
+
+        Each section's content is truncated to *max_chars_per_section* characters.
+        Returns a string with one entry per section: ``### {key}\\n{text}\\n\\n``.
+        """
+        from graph_kb_api.flows.v3.utils.section_summaries import extract_section_summaries
+
+        return extract_section_summaries(ordered_keys, hydrated_sections, max_chars_per_section)
 
     @staticmethod
     def _strip_frontmatter(content: str) -> str:

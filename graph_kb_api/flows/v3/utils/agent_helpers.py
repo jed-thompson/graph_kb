@@ -10,6 +10,10 @@ import json
 from typing import Any, Dict, Tuple
 
 from graph_kb_api.flows.v3.models.types import AgentTask
+from graph_kb_api.flows.v3.utils.prompt_extensions import (
+    build_already_covered_block,
+    build_scope_contract_block,
+)
 
 
 def compute_confidence(agent_context: Dict[str, Any]) -> Tuple[float, str]:
@@ -147,5 +151,16 @@ def build_prompt(task: AgentTask, agent_context: Dict[str, Any]) -> str:
     rework_instructions = agent_context.get("rework_instructions")
     if rework_instructions:
         parts.append(f"## Rework Instructions\n{rework_instructions}")
+
+    # --- Scope contract and prior summary blocks (near end for recency bias) ---
+    scope_contract = agent_context.get("scope_contract")
+    scope_block = build_scope_contract_block(scope_contract) if scope_contract else ""
+    if scope_block:
+        parts.append(scope_block)
+
+    prior_summary = agent_context.get("prior_sections_summary")
+    already_covered_block = build_already_covered_block(prior_summary) if prior_summary else ""
+    if already_covered_block:
+        parts.append(already_covered_block)
 
     return "\n\n".join(parts) if parts else "Generate the requested section."

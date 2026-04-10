@@ -18,5 +18,13 @@ Output exactly a JSON array containing the resulting section objects. Each objec
 - dependencies: array of section string IDs that must be drafted before this section
 - priority: "high", "medium", or "low"
 - relevant_docs: array of objects with "doc_id" (from Document Sections) and "sections" (array of exact heading strings from that document). Identify strictly relevant supporting documents to inject. Use an empty list [] if none apply.
+- scope_contract: object with three fields:
+  - scope_includes: array of specific topics this section MUST cover in detail
+  - scope_excludes: array of specific topics this section must NOT define (covered by another section — reference only)
+  - cross_cutting_owner: string section ID that owns this cross-cutting concern, or null if not cross-cutting
+- reading_order: integer (1-based) indicating the intended position in the final assembled document.
+  Architecture overviews and foundational decisions should have low numbers (early).
+  Component implementation details follow in logical dependency order.
+  Cross-cutting concerns (test strategy, error mapping, open questions) should have high numbers (late).
 
 Return ONLY the raw JSON array. Do not include markdown formatting or explanations outside of the JSON structure.

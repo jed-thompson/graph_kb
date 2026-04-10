@@ -227,23 +227,18 @@ export function BasePhaseContent({
                         onSubmit={onSubmit}
                     />
                 ) : promptData.type === 'approval' ? (
-                    <>
-                        <PhaseApprovalForm
-                            phase={phase}
-                            title={phaseInfo.title}
-                            description={phaseInfo.description}
-                            summary={promptData.summary}
-                            options={promptData.options}
-                            message={promptData.message}
-                            tasks={promptData.tasks}
-                            onSubmit={onSubmit}
-                            sessionId={sessionId}
-                            onNavigateToPhase={onNavigateToPhase}
-                        />
-                        {thinkingSteps && thinkingSteps.length > 0 && (
-                            <ThinkingStepsPanel steps={thinkingSteps} />
-                        )}
-                    </>
+                    <PhaseApprovalForm
+                        phase={phase}
+                        title={phaseInfo.title}
+                        description={phaseInfo.description}
+                        summary={promptData.summary}
+                        options={promptData.options}
+                        message={promptData.message}
+                        tasks={promptData.tasks}
+                        onSubmit={onSubmit}
+                        sessionId={sessionId}
+                        onNavigateToPhase={onNavigateToPhase}
+                    />
                 ) : (promptData as Record<string, unknown>).type === 'task_context_input' ? (
                     <TaskContextInputForm
                         taskName={(promptData as Record<string, unknown>).task_name as string | undefined}

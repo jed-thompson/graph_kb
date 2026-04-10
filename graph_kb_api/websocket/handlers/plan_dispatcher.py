@@ -1665,6 +1665,18 @@ class PlanDispatcher:
         if session is not None:
             if self._validate_session_owner(session, client_id, session_id):
                 return True
+            # Allow takeover if the previous owner is no longer connected
+            prev_owner = session.get("client_id")
+            if prev_owner and prev_owner not in manager.active_connections:
+                logger.info(
+                    "plan._ensure_session_owner: allowing in-memory takeover of %s by %s (prev owner %s disconnected)",
+                    session_id,
+                    client_id,
+                    prev_owner,
+                )
+                session["client_id"] = client_id
+                manager.register_session(session_id, client_id)
+                return True
             await self._emit_plan_error(
                 client_id,
                 workflow_id,
@@ -2859,6 +2871,56 @@ class PlanDispatcher:
                 workflow_id=workflow_id,
                 session_id=validated.session_id,
             ):
+                # Allow recovery from PHASE_INCOMPLETE errors on resume —
+                # reset workflow_status and restart from the failed phase
+                # instead of permanently blocking the session.
+                error_info = state.get("error", {})
+                error_code = error_info.get("code", "") if isinstance(error_info, dict) else ""
+                if error_code == "PHASE_INCOMPLETE" or (
+                    state.get("workflow_status") == "error"
+                    and not error_code  # generic error with no specific code
+                ):
+                    recovery_phase = self._resolve_current_phase(state)
+                    logger.info(
+                        "Plan resume: recovering from PHASE_INCOMPLETE by restarting phase '%s'",
+                        recovery_phase,
+                        extra={"session_id": validated.session_id},
+                    )
+                    try:
+                        await engine.workflow.aupdate_state(
+                            config,
+                            {"workflow_status": "running"},
+                        )
+                        from graph_kb_api.websocket.plan_events import emit_phase_enter
+                        await emit_phase_enter(
+                            session_id=validated.session_id,
+                            phase=recovery_phase,
+                            expected_steps=1,
+                            client_id=client_id,
+                        )
+                        result = await engine.resume_workflow(
+                            workflow_id=validated.session_id,
+                            user_id=client_id,
+                            input_data=None,
+                            config=config,
+                        )
+                        session["running_task"] = None
+                        await self._persist_runtime_snapshot(
+                            validated.session_id,
+                            session.get("thread_id", f"plan-{validated.session_id}"),
+                            session.get("user_id", client_id),
+                            engine,
+                            config,
+                            result=result,
+                        )
+                    except Exception as e:
+                        session["running_task"] = None
+                        logger.error(f"Plan resume recovery failed: {e}", exc_info=True)
+                        await self._emit_plan_error(
+                            client_id, workflow_id,
+                            f"Failed to recover plan workflow: {e}",
+                            "ENGINE_ERROR",
+                        )
                 return
             await self._persist_runtime_snapshot(
                 validated.session_id,

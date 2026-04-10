@@ -168,7 +168,7 @@ class TaskSelectorNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="task_selector")
         self.phase = "orchestrate"
         self.step_name = "task_selector"
-        self.step_progress = 0.05
+        self.step_progress = 0.0
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         # Lazily initialize document_manifest if not yet created.
@@ -1077,6 +1077,19 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
         return json.dumps(full_result, indent=2, default=str)
 
+    @staticmethod
+    def _build_prior_sections_summary(
+        task_results: list[Dict[str, Any]],
+        max_tokens: int = 1500,
+    ) -> str:
+        """Build compressed bullet summary of completed sections.
+
+        Delegates to the standalone utility for easier testing.
+        """
+        from graph_kb_api.flows.v3.utils.prior_sections_summary import build_prior_sections_summary
+
+        return build_prior_sections_summary(task_results, max_tokens)
+
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
         artifact_svc: ArtifactService | None = configurable.get("artifact_service")
@@ -1123,6 +1136,12 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             )
         else:
             enriched_description = task_description or f"Execute task: {task_name}"
+
+        # Inject prior sections summary into agent_context (Change 2)
+        task_results = orchestrate.get("task_results", [])
+        prior_summary = self._build_prior_sections_summary(task_results)
+        if prior_summary:
+            agent_context = {**agent_context, "prior_sections_summary": prior_summary}
 
         # Build the AgentTask the agent expects
         agent_task: AgentTask = {
@@ -1648,6 +1667,11 @@ class ProgressNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             except Exception as e:
                 logger.warning(f"ProgressNode emit_circuit_breaker failed: {e}")
 
+        # Treat circuit breaker as partial completion — mark orchestrate done
+        # so the workflow continues to assembly with whatever was produced,
+        # rather than halting with an unrecoverable error.
+        phase_complete = all_complete or circuit_breaker_triggered
+
         output: Dict[str, Any] = {
             "orchestrate": {
                 **orchestrate,
@@ -1658,8 +1682,16 @@ class ProgressNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             },
             "artifacts": artifacts_output,
         }
-        if all_complete:
+        if phase_complete:
             output["completed_phases"] = {"orchestrate": True}
+            result_summary = (
+                f"All {total_tasks} tasks complete"
+                if all_complete
+                else (
+                    f"Circuit breaker: {completed_tasks}/{total_tasks} tasks approved, "
+                    f"{consecutive_rejections} rejected. Continuing with partial results."
+                )
+            )
             # Emit phase.complete so frontend can mark orchestrate phase done
             try:
                 from graph_kb_api.websocket.plan_events import emit_phase_complete
@@ -1667,7 +1699,7 @@ class ProgressNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                 await emit_phase_complete(
                     session_id=session_id,
                     phase="orchestrate",
-                    result_summary=f"All {total_tasks} tasks complete",
+                    result_summary=result_summary,
                     duration_s=0.0,
                     client_id=client_id,
                 )
