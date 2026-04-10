@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, cast
 
 from langgraph.types import RunnableConfig, interrupt
 
@@ -27,20 +27,38 @@ from graph_kb_api.flows.v3.services.artifact_service import ArtifactService
 from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
 from graph_kb_api.flows.v3.state import ContextData, PlanData, ResearchData
-from graph_kb_api.flows.v3.state.plan_state import BudgetState, OrchestrateSubgraphState, PlanState
+from graph_kb_api.flows.v3.state.plan_state import BudgetState, ORCHESTRATE_PROGRESS, OrchestrateSubgraphState, PlanState, create_empty_manifest
 from graph_kb_api.flows.v3.state.workflow_state import OrchestrateData
 from graph_kb_api.flows.v3.tools import get_all_tools
-from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator
+from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator, truncate_to_tokens
 from graph_kb_api.storage.blob_storage import BlobStorage
 from graph_kb_api.websocket.plan_events import (
     emit_circuit_breaker,
     emit_manifest_update,
+    emit_phase_complete,
     emit_phase_progress,
+    emit_task_complete,
+    emit_task_critique,
     emit_task_start,
     emit_tasks_dag,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ── Per-transition preserve lists (allowlist) ─────────────────────────
+# Safe-by-default: new fields are pruned unless explicitly preserved.
+# This replaces the old PRUNE_KEYS denylist pattern (Req 11.1, 11.2).
+
+PRESERVE_AFTER_RESEARCH: frozenset[str] = frozenset({
+    "findings", "confidence_score", "approved", "approval_decision",
+    "approval_feedback", "review_feedback", "confidence_evaluation_method",
+    "research_gap_iterations", "structured_data_available",
+})
+
+PRESERVE_AFTER_ORCHESTRATE: frozenset[str] = frozenset({
+    "task_results", "all_complete", "total_tasks",
+})
 
 
 # ── Prune Nodes ───────────────────────────────────────────────────────
@@ -49,44 +67,40 @@ logger = logging.getLogger(__name__)
 class PruneAfterResearchNode(SubgraphAwareNode[PlanState]):
     """Prune node that clears inline research data between subgraphs.
 
-    Preserves ArtifactRef entries, findings summary, and approval flag
-    while clearing web_results, vector_results, graph_results.
+    Uses PRESERVE_AFTER_RESEARCH allowlist — only explicitly preserved keys
+    survive. New fields added to ResearchData are pruned by default unless
+    added to the allowlist (safe-by-default, Req 11.2).
     """
-
-    # Keys to remove from research state — large inline data arrays
-    PRUNE_KEYS = {"web_results", "vector_results", "graph_results"}
 
     def __init__(self) -> None:
         super().__init__(node_name="prune_after_research")
         self.phase = "research"
         self.step_name = "prune_after_research"
-        self.step_progress = 1.0
+        self.step_progress = 1.0  # End of research phase
 
     async def _execute_step(self, state: PlanState, config: RunnableConfig) -> NodeExecutionResult:
         research: ResearchData = state.get("research", {})
-        pruned_research = {k: v for k, v in research.items() if k not in self.PRUNE_KEYS}
+        pruned_research = {k: v for k, v in research.items() if k in PRESERVE_AFTER_RESEARCH}
         return NodeExecutionResult.success(output={"research": pruned_research})
 
 
 class PruneAfterOrchestrateNode(SubgraphAwareNode[PlanState]):
     """Prune node that clears iteration history between subgraphs.
 
-    Preserves final task outputs, ArtifactRef entries, and summary fields
-    while clearing critique_history, iteration_count, current_task_context.
+    Uses PRESERVE_AFTER_ORCHESTRATE allowlist — only explicitly preserved keys
+    survive. New fields added to OrchestrateData are pruned by default unless
+    added to the allowlist (safe-by-default, Req 11.2).
     """
-
-    # Keys to remove from orchestrate state — iteration-related data
-    PRUNE_KEYS = {"critique_history", "iteration_count", "current_task_context", "current_draft", "agent_context"}
 
     def __init__(self) -> None:
         super().__init__(node_name="prune_after_orchestrate")
         self.phase = "orchestrate"
         self.step_name = "prune_after_orchestrate"
-        self.step_progress = 1.0
+        self.step_progress = ORCHESTRATE_PROGRESS["prune_after_orchestrate"]
 
     async def _execute_step(self, state: PlanState, config: RunnableConfig) -> NodeExecutionResult:
-        orchestrate = state.get("orchestrate", {})
-        pruned_orchestrate = {k: v for k, v in orchestrate.items() if k not in self.PRUNE_KEYS}
+        orchestrate: OrchestrateData = state.get("orchestrate", {})
+        pruned_orchestrate = {k: v for k, v in orchestrate.items() if k in PRESERVE_AFTER_ORCHESTRATE}
 
         # Selective task result invalidation for re-orchestration (Step 16)
         re_execute_ids = set(state.get("re_execute_task_ids", []))
@@ -125,7 +139,7 @@ class BudgetCheckNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="budget_check")
         self.phase = "orchestrate"
         self.step_name = "budget_check"
-        self.step_progress = 0.0
+        self.step_progress = ORCHESTRATE_PROGRESS["budget_check"]
 
     async def _execute_step(self, state: PlanState, config: RunnableConfig) -> NodeExecutionResult:
         budget: BudgetState = state.get("budget", {})
@@ -133,23 +147,11 @@ class BudgetCheckNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         # Lazily initialize document_manifest if not yet created (Part II, Step 9).
         output: Dict[str, Any] = {}
         if state.get("document_manifest") is None:
-            from datetime import UTC, datetime
-
-            from graph_kb_api.flows.v3.state.plan_state import DocumentManifest
-
-            context = state.get("context", {})
-            manifest = DocumentManifest(
+            context: ContextData = state.get("context", {})
+            output["document_manifest"] = create_empty_manifest(
                 session_id=state.get("session_id", ""),
                 spec_name=context.get("spec_name", "Untitled"),
-                primary_spec_ref=None,
-                entries=[],
-                composed_index_ref=None,
-                total_documents=0,
-                total_tokens=0,
-                created_at=datetime.now(UTC).isoformat(),
-                finalized_at=None,
             )
-            output["document_manifest"] = manifest
 
         # BudgetGuard.check() raises BudgetExhaustedError — caught by
         # SubgraphAwareNode._execute_async() which triggers a HITL interrupt.
@@ -168,28 +170,17 @@ class TaskSelectorNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="task_selector")
         self.phase = "orchestrate"
         self.step_name = "task_selector"
-        self.step_progress = 0.0
+        self.step_progress = ORCHESTRATE_PROGRESS["task_selector"]
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         # Lazily initialize document_manifest if not yet created.
         # (Previously done in BudgetCheckNode which has been removed.)
         manifest_init: Dict[str, Any] = {}
         if state.get("document_manifest") is None:
-            from datetime import UTC, datetime
-
-            from graph_kb_api.flows.v3.state.plan_state import DocumentManifest
-
-            context = state.get("context", {})
-            manifest_init["document_manifest"] = DocumentManifest(
+            context: ContextData = state.get("context", {})
+            manifest_init["document_manifest"] = create_empty_manifest(
                 session_id=state.get("session_id", ""),
                 spec_name=context.get("spec_name", "Untitled"),
-                primary_spec_ref=None,
-                entries=[],
-                composed_index_ref=None,
-                total_documents=0,
-                total_tokens=0,
-                created_at=datetime.now(UTC).isoformat(),
-                finalized_at=None,
             )
 
         planning: PlanData = state.get("plan", {})
@@ -201,7 +192,7 @@ class TaskSelectorNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         task_results = orchestrate.get("task_results", [])
 
         # Build dependency graph
-        dependencies: Dict[str, list] = {t.get("id"): [] for t in tasks}
+        dependencies: Dict[str, list[str]] = {t.get("id"): [] for t in tasks}
         for src, dst in edges:
             if dst in dependencies:
                 dependencies[dst].append(src)
@@ -284,13 +275,84 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
     """Fetches relevant context for the selected task.
 
     Hydrates ArtifactRefs from ArtifactService to get full content.
+    Supports selective hydration: when a task specifies ``relevant_docs``
+    or ``context_requirements``, only the artifacts matching the computed
+    needed set are loaded.  Falls back to hydrating all ``research.*`` and
+    ``context.*`` artifacts when neither field is present (Req 19.1–19.4).
     """
+
+    # Maps context_requirements entries to artifact key prefixes so that
+    # _compute_needed_artifact_keys can translate task metadata into the
+    # set of artifact keys worth hydrating.
+    _CONTEXT_REQ_TO_ARTIFACT_PREFIXES: Dict[str, list[str]] = {
+        "research_findings": ["research."],
+        "roadmap": ["plan.roadmap"],
+        "task_dag": ["planning.task_dag"],
+        "uploaded_docs": ["context.uploaded_docs"],
+        "deep_analysis": ["context.deep_analysis"],
+        "document_section_index": ["context.document_section_index"],
+    }
 
     def __init__(self) -> None:
         super().__init__(node_name="fetch_context")
         self.phase = "orchestrate"
         self.step_name = "fetch_context"
-        self.step_progress = 0.15
+        self.step_progress = ORCHESTRATE_PROGRESS["fetch_context"]
+
+    @staticmethod
+    def _parse_artifact_content(content: Any) -> Any:
+        """Parse artifact content, trying JSON first then falling back to raw string.
+
+        Artifacts may be stored as JSON (.json) or markdown (.md). Rather than
+        failing on non-JSON content, return the raw string so downstream
+        consumers still get the data.
+        """
+        if isinstance(content, str):
+            try:
+                return json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                return content
+        return content
+
+    @staticmethod
+    def _compute_needed_artifact_keys(
+        relevant_docs: list[dict],
+        context_requirements: list[str],
+        available_keys: set[str],
+    ) -> set[str]:
+        """Compute the set of artifact keys needed by the current task.
+
+        Args:
+            relevant_docs: Task's ``relevant_docs`` list — when non-empty,
+                all ``context.*`` artifacts are included so that document
+                section data is available for scoped loading.
+            context_requirements: Task's ``context_requirements`` list —
+                each entry is mapped to artifact key prefixes via
+                ``_CONTEXT_REQ_TO_ARTIFACT_PREFIXES``.
+            available_keys: The full set of artifact keys in state.
+
+        Returns:
+            Set of artifact keys that should be hydrated.
+        """
+        needed: set[str] = set()
+
+        # Map context_requirements → artifact prefixes
+        for req in context_requirements:
+            prefixes = FetchContextNode._CONTEXT_REQ_TO_ARTIFACT_PREFIXES.get(req)
+            if prefixes:
+                for prefix in prefixes:
+                    for key in available_keys:
+                        if key == prefix or key.startswith(prefix):
+                            needed.add(key)
+
+        # When relevant_docs are present, include all context.* artifacts
+        # so that document section index and uploaded docs are available.
+        if relevant_docs:
+            for key in available_keys:
+                if key.startswith("context."):
+                    needed.add(key)
+
+        return needed
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
@@ -324,19 +386,37 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             task_context["research_summary"] = findings.get("summary", "")
             task_context["key_insights"] = findings.get("key_insights", [])
 
-        # Hydrate artifacts if service available (Pattern B — hydrate on demand)
+        # Selective artifact hydration (Req 19.1–19.4)
         artifacts = state.get("artifacts", {})
         if artifact_svc and artifacts:
-            for key, ref in artifacts.items():
-                if key.startswith("research.") or key.startswith("context."):
-                    try:
-                        content = await artifact_svc.retrieve(ref)
-                        if isinstance(content, str):
-                            task_context[f"artifact_{key}"] = json.loads(content)
-                        else:
-                            task_context[f"artifact_{key}"] = content
-                    except Exception as e:
-                        logger.debug(f"Failed to hydrate artifact {key}: {e}")
+            relevant_docs = current_task.get("relevant_docs", [])
+            context_requirements = current_task.get("context_requirements", [])
+
+            if relevant_docs or context_requirements:
+                # Selective: only hydrate artifacts the task actually needs
+                needed_keys = self._compute_needed_artifact_keys(
+                    relevant_docs, context_requirements, set(artifacts.keys())
+                )
+                for key, ref in artifacts.items():
+                    if key in needed_keys:
+                        try:
+                            content = await artifact_svc.retrieve(ref)
+                            task_context[f"artifact_{key}"] = self._parse_artifact_content(content)
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to hydrate artifact %s: %s", key, e
+                            )
+            else:
+                # Backward-compatible fallback: hydrate all research/context artifacts
+                for key, ref in artifacts.items():
+                    if key.startswith("research.") or key.startswith("context."):
+                        try:
+                            content = await artifact_svc.retrieve(ref)
+                            task_context[f"artifact_{key}"] = self._parse_artifact_content(content)
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to hydrate artifact %s: %s", key, e
+                            )
 
         # Scoped supporting document sections (Step 11, Part I: D7)
         relevant_docs = current_task.get("relevant_docs", [])
@@ -376,14 +456,12 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         Returns:
             List of {doc_id, filename, sections: [{heading, content}]}
         """
-        from graph_kb_api.flows.v3.utils.token_estimation import truncate_to_tokens
-
         if not relevant_docs or not document_section_index:
             return []
 
         storage = blob_storage or BlobStorage.from_env()
         index_by_doc = {d["doc_id"]: d for d in document_section_index}
-        loaded: list[dict] = []
+        loaded: list[dict[str, Any]] = []
         tokens_used = 0
         blob_cache: dict[str, str] = {}  # Cache blob content per doc_id
 
@@ -418,7 +496,7 @@ class FetchContextNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             if not doc_content:
                 continue
 
-            doc_sections: list[dict] = []
+            doc_sections: list[dict[str, Any]] = []
             for heading in section_headings:
                 if tokens_used >= max_tokens:
                     break
@@ -453,38 +531,31 @@ class GapNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="gap")
         self.phase = "orchestrate"
         self.step_name = "gap"
-        self.step_progress = 0.25
+        self.step_progress = ORCHESTRATE_PROGRESS["gap"]
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
+        ctx = self._unpack(state, config)
         orchestrate: OrchestrateData = state.get("orchestrate", {})
         task_context = orchestrate.get("current_task_context", {})
         current_task = orchestrate.get("current_task", {})
-        budget: BudgetState = state.get("budget", {})
-        session_id: str = state.get("session_id", "")
+        budget: BudgetState = ctx.budget
 
         if not current_task:
             return NodeExecutionResult.success(output={"orchestrate": {**orchestrate, "context_gaps": []}})
 
         BudgetGuard.check(budget)
 
-        gaps: list = []
-
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
-
-        if not llm:
-            raise RuntimeError("GapNode requires an LLM but none was provided in config.")
+        gaps: list[dict[str, Any]] = []
 
         from graph_kb_api.flows.v3.agents.gap_analysis_agent import GapAnalysisAgent
 
         agent = GapAnalysisAgent()
-        workflow_context: WorkflowContext | None = configurable.get("context")
 
-        if not workflow_context:
+        if not ctx.workflow_context:
             return NodeExecutionResult.success(output={"orchestrate": {**orchestrate, "context_gaps": []}})
 
         # Build tools from workflow context
-        app_context = workflow_context.app_context
+        app_context = ctx.workflow_context.app_context
         if app_context:
             retrieval_config = app_context.get_retrieval_settings()
             tools = get_all_tools(retrieval_config)
@@ -493,7 +564,7 @@ class GapNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
         agent_task: AgentTask = {
             "description": "Task-level gap analysis",
-            "task_id": f"task_gap_{session_id}_{uuid.uuid4().hex[:8]}",
+            "task_id": f"task_gap_{ctx.session_id}_{uuid.uuid4().hex[:8]}",
             "specification": {
                 "spec_name": task_context.get("spec_name", ""),
                 "spec_description": task_context.get("spec_description", ""),
@@ -515,7 +586,7 @@ class GapNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
         agent_state = {"available_tools": tools}
         result: AgentResult = await agent.execute(
-            task=agent_task, state=agent_state, workflow_context=workflow_context,
+            task=agent_task, state=agent_state, workflow_context=ctx.workflow_context,
         )
 
         # Convert agent gaps to node format
@@ -531,12 +602,7 @@ class GapNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                 }
             )
 
-        llm_calls = 1
-        tokens_used: int = get_token_estimator().count_tokens(str(result))
-
-        logger.info(f"GapNode: LLM semantic analysis found {len(gaps)} gaps for task {current_task.get('id')}")
-
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, str(result))
 
         return NodeExecutionResult.success(
             output={
@@ -563,7 +629,7 @@ class TaskContextInputNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="task_context_input")
         self.phase = "orchestrate"
         self.step_name = "task_context_input"
-        self.step_progress = 0.25
+        self.step_progress = ORCHESTRATE_PROGRESS["task_context_input"]
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         orchestrate: OrchestrateData = state.get("orchestrate", {})
@@ -637,15 +703,12 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="task_research")
         self.phase = "orchestrate"
         self.step_name = "task_research"
-        self.step_progress = 0.30
+        self.step_progress = ORCHESTRATE_PROGRESS["task_research"]
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
 
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        budget: BudgetState = state.get("budget", {})
-        session_id: str = state.get("session_id", "")
-        client_id: str | None = configurable.get("client_id")
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
 
         orchestrate: OrchestrateData = state.get("orchestrate", {})
         research: ResearchData = state.get("research", {})
@@ -672,18 +735,10 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
         BudgetGuard.check(budget)
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="orchestrate",
-                step="task_research",
-                message=f"Researching context for '{current_task.get('name', task_id)}'",
-                progress_pct=0.30,
-                client_id=client_id,
-                task_id=task_id,
-            )
-        except Exception as e:
-            logger.warning(f"TaskResearchNode emit_phase_progress failed: {e}")
+        await self._emit_progress(
+            ctx, "task_research", 0.30,
+            f"Researching context for '{current_task.get('name', task_id)}'",
+        )
 
         task_research_results: Dict[str, Any] = {}
         llm_calls = 0
@@ -692,19 +747,18 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         try:
             from graph_kb_api.flows.v3.agents.research_agent import ResearchAgent
 
-            workflow_context = configurable.get("context")
-            if not workflow_context:
+            if not ctx.workflow_context:
                 raise RuntimeError("TaskResearchNode requires workflow_context")
 
             # Build tools from workflow context
-            app_context = workflow_context.app_context
+            app_context = ctx.workflow_context.app_context
             if app_context:
                 retrieval_config = app_context.get_retrieval_settings()
                 tools = get_all_tools(retrieval_config)
             else:
                 tools = []
 
-            agent = ResearchAgent(client_id=client_id)
+            agent = ResearchAgent(client_id=ctx.client_id)
 
             spec_section = current_task.get("spec_section", "general")
             task_description = current_task.get("description", "")
@@ -746,9 +800,9 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                 },
             }
 
-            agent_state = {"available_tools": tools, "session_id": session_id}
+            agent_state = {"available_tools": tools, "session_id": ctx.session_id}
             result: AgentResult = await agent.execute(
-                task=agent_task, state=agent_state, workflow_context=workflow_context,
+                task=agent_task, state=agent_state, workflow_context=ctx.workflow_context,
             )
 
             # ResearchAgent.execute() returns {"output": json_string, ...}
@@ -781,9 +835,9 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
         # Store via ArtifactService
         artifacts_output: Dict[str, Any] = {}
-        if artifact_svc and task_research_results:
+        if ctx.artifact_service and task_research_results:
             try:
-                ref = await artifact_svc.store(
+                ref = await ctx.artifact_service.store(
                     "orchestrate",
                     f"tasks/{task_id}/research.json",
                     json.dumps(task_research_results, indent=2, default=str),
@@ -793,7 +847,7 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             except Exception as e:
                 logger.warning(f"TaskResearchNode: artifact store failed: {e}")
 
-        new_budget = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, str(task_research_results), llm_calls=llm_calls)
 
         # Emit research summary for frontend TaskContextPanel (Step 11c)
         if task_research_results and task_research_results.get("summary"):
@@ -804,12 +858,12 @@ class TaskResearchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                 research_summary = f"{research_summary}\n\n**Key findings:**\n{bullets}"
             try:
                 await emit_phase_progress(
-                    session_id=session_id,
+                    session_id=ctx.session_id,
                     phase="orchestrate",
                     step="task_research",
                     message=f"Research complete for '{current_task.get('name', task_id)}'",
                     progress_pct=0.50,
-                    client_id=client_id,
+                    client_id=ctx.client_id,
                     task_id=task_id,
                     agent_content=research_summary,
                 )
@@ -846,11 +900,11 @@ class ToolPlanNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="tool_plan")
         self.phase = "orchestrate"
         self.step_name = "tool_plan"
-        self.step_progress = 0.35
+        self.step_progress = ORCHESTRATE_PROGRESS["tool_plan"]
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        orchestrate = state.get("orchestrate", {})
-        planning = state.get("plan", {})
+        orchestrate: OrchestrateData = state.get("orchestrate", {})
+        planning: PlanData = state.get("plan", {})
 
         current_task = orchestrate.get("current_task", {})
         if not current_task:
@@ -898,7 +952,7 @@ class DispatchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="dispatch")
         self.phase = "orchestrate"
         self.step_name = "dispatch"
-        self.step_progress = 0.45
+        self.step_progress = ORCHESTRATE_PROGRESS["dispatch"]
         self._blob_cache: dict[str, str] = {}  # Cache blob content per doc_id
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
@@ -946,7 +1000,7 @@ class DispatchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
             # Load truncated spec section content for frontend panel
             if spec_section and artifact_svc:
-                context = state.get("context", {})
+                context: ContextData = state.get("context", {})
                 doc_index = context.get("document_section_index", [])
                 primary_entries = [d for d in doc_index if d.get("role") == "primary"]
                 if primary_entries:
@@ -973,10 +1027,6 @@ class DispatchNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                     for sec in primary_entries[0].get("sections", []):
                         if sec["heading"] == spec_section and primary_blob:
                             section_text = primary_blob[sec["start_char"] : sec["end_char"]]
-                            from graph_kb_api.flows.v3.utils.token_estimation import (
-                                truncate_to_tokens,
-                            )
-
                             spec_section_content = truncate_to_tokens(section_text, 3000)
                             break
 
@@ -1037,7 +1087,7 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="worker")
         self.phase = "orchestrate"
         self.step_name = "worker"
-        self.step_progress = 0.60
+        self.step_progress = ORCHESTRATE_PROGRESS["worker"]
 
     def _resolve_agent(self, agent_type: str) -> Any:
         """Dynamically import and instantiate the agent for the given type."""
@@ -1273,20 +1323,9 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         manifest_output: Dict[str, Any] = {}
         manifest = state.get("document_manifest")
         if manifest is None and deliverable_ref is not None:
-            from datetime import UTC, datetime
-
-            from graph_kb_api.flows.v3.state.plan_state import DocumentManifest
-
-            manifest = DocumentManifest(
+            manifest = create_empty_manifest(
                 session_id=state.get("session_id", ""),
                 spec_name=state.get("context", {}).get("spec_name", "Untitled"),
-                primary_spec_ref=None,
-                entries=[],
-                composed_index_ref=None,
-                total_documents=0,
-                total_tokens=0,
-                created_at=datetime.now(UTC).isoformat(),
-                finalized_at=None,
             )
 
         if manifest is not None and deliverable_ref is not None:
@@ -1296,6 +1335,7 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             entry_status = "reviewed" if task_status == "done" else ("error" if task_status == "error" else "failed")
             new_entry = DocumentManifestEntry(
                 task_id=task_id,
+                task_name=task_name,
                 spec_section=spec_section or "Unknown",
                 artifact_ref=deliverable_ref,
                 status=entry_status,
@@ -1321,6 +1361,7 @@ class WorkerNode(SubgraphAwareNode[OrchestrateSubgraphState]):
                     session_id=session_id,
                     manifest_entry={
                         "taskId": task_id,
+                        "taskName": task_name,
                         "specSection": spec_section or "Unknown",
                         "status": entry_status,
                         "tokenCount": tokens_used,
@@ -1381,7 +1422,7 @@ class CritiqueNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="critique")
         self.phase = "orchestrate"
         self.step_name = "critique"
-        self.step_progress = 0.80
+        self.step_progress = ORCHESTRATE_PROGRESS["critique"]
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
@@ -1422,7 +1463,7 @@ class CritiqueNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         }
         original_context = orchestrate.get("agent_context", {})
 
-        critique: Optional[CritiqueResult] = None
+        critique: CritiqueResult | None = None
         llm_calls = 0
 
         try:
@@ -1504,8 +1545,6 @@ class CritiqueNode(SubgraphAwareNode[OrchestrateSubgraphState]):
 
         # Emit plan.task.critique event
         try:
-            from graph_kb_api.websocket.plan_events import emit_task_critique
-
             await emit_task_critique(
                 session_id=session_id,
                 task_id=task_id,
@@ -1547,11 +1586,11 @@ class ProgressNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         super().__init__(node_name="progress")
         self.phase = "orchestrate"
         self.step_name = "progress"
-        self.step_progress = 1.0
+        self.step_progress = ORCHESTRATE_PROGRESS["progress"]
 
     async def _execute_step(self, state: OrchestrateSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        orchestrate = state.get("orchestrate", {})
-        planning = state.get("plan", {})
+        orchestrate: OrchestrateData = state.get("orchestrate", {})
+        planning: PlanData = state.get("plan", {})
 
         task_dag = planning.get("task_dag", {})
         all_tasks = task_dag.get("tasks", [])
@@ -1617,8 +1656,6 @@ class ProgressNode(SubgraphAwareNode[OrchestrateSubgraphState]):
         # Emit plan.task.complete event
         if task_id != "unknown":
             try:
-                from graph_kb_api.websocket.plan_events import emit_task_complete
-
                 await emit_task_complete(
                     session_id=session_id,
                     task_id=task_id,
@@ -1694,8 +1731,6 @@ class ProgressNode(SubgraphAwareNode[OrchestrateSubgraphState]):
             )
             # Emit phase.complete so frontend can mark orchestrate phase done
             try:
-                from graph_kb_api.websocket.plan_events import emit_phase_complete
-
                 await emit_phase_complete(
                     session_id=session_id,
                     phase="orchestrate",

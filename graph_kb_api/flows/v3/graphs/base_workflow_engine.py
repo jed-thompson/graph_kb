@@ -7,6 +7,7 @@ and behavior for all workflow engines in the v3 framework.
 
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Literal, Optional
 
@@ -458,11 +459,10 @@ class BaseWorkflowEngine(ABC):
         return state_snapshot.values if state_snapshot else None
 
     def get_config_with_services(self, config: Optional[RunnableConfig] = None) -> RunnableConfig:
-        """Inject workflow services into a LangGraph RunnableConfig.
+        """Inject ALL WorkflowContext attributes into config automatically.
 
-        Ensures ``config["configurable"]`` contains ``artifact_service`` and
-        ``llm`` from the workflow context so that downstream nodes can access
-        them via ``ThreadConfigurable``.
+        Uses ``dataclasses.fields()`` to iterate ``WorkflowContext`` attributes,
+        so adding a new service to ``WorkflowContext`` requires zero changes here.
 
         Args:
             config: Existing config dict to augment, or ``None`` to create one.
@@ -473,8 +473,16 @@ class BaseWorkflowEngine(ABC):
         if config is None:
             config = {}
         configurable = config.setdefault("configurable", {})
-        configurable["artifact_service"] = self.artifact_service
-        configurable["llm"] = self.llm
+        # Auto-inject all WorkflowContext fields
+        for f in dataclasses.fields(self.workflow_context):
+            value = getattr(self.workflow_context, f.name)
+            if value is not None:
+                configurable[f.name] = value
+        # Inject the WorkflowContext *instance* under the "context" key.
+        # Individual fields (llm, artifact_service, etc.) are already injected
+        # above by name, but nodes and _unpack() also need the container itself
+        # for agent dispatch (workflow_context=ctx.workflow_context) and for
+        # accessing services not yet in ThreadConfigurable (e.g. graph_store).
         configurable["context"] = self.workflow_context
         return config
 

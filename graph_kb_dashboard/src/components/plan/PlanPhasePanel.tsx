@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import type { PlanPhaseId } from '@/lib/store/planStore';
+import { usePlanStore } from '@/lib/store/planStore';
 import type { PhaseField, PlanArtifactManifestEntry } from '@shared/websocket-events';
 import { PlanContextProvider, PHASE_TITLES, type PhaseStatus, type ThinkingStep, type GateType, type TaskState } from './PlanContext';
 import { ResearchPhase, ContextPhase, PlanningPhase, OrchestratePhase, AssemblyPhase } from './phases';
@@ -151,6 +152,7 @@ function PhaseRouter({
             return (
                 <ResearchPhase
                     status={status}
+                    phaseInfo={phaseInfo}
                     agentContent={agentContent}
                     thinkingSteps={phaseThinkingSteps}
                     result={result}
@@ -284,8 +286,31 @@ export function PlanPhasePanel({
 
     const handleFormSubmit = useCallback((data: Record<string, unknown>) => {
         setIsSubmitting(true);
+
+        // When the context phase form is submitted, snapshot the document
+        // references into the plan store so the ContextItemsPanel renders
+        // immediately during backend processing (~1-2 min).
+        if (phase === 'context') {
+            const snapshot: Record<string, unknown> = {};
+            if (data.primary_document_id) snapshot.primary_document_id = data.primary_document_id;
+            if (Array.isArray(data.supporting_document_ids) && data.supporting_document_ids.length > 0) {
+                snapshot.supporting_doc_ids = data.supporting_document_ids;
+            }
+            if (Array.isArray(data.reference_urls) && data.reference_urls.length > 0) {
+                snapshot.extracted_urls = (data.reference_urls as unknown[]).map((u: unknown) =>
+                    typeof u === 'string' ? { url: u } : u,
+                );
+            }
+            if (typeof data.user_explanation === 'string' && data.user_explanation) {
+                snapshot.user_explanation = data.user_explanation;
+            }
+            if (Object.keys(snapshot).length > 0) {
+                usePlanStore.getState().setContextItems(snapshot);
+            }
+        }
+
         onSubmit(data);
-    }, [onSubmit]);
+    }, [onSubmit, phase]);
 
     const handleToggleThinking = useCallback(() => {
         setShowThinking(prev => !prev);

@@ -13,6 +13,8 @@ import pytest
 
 from graph_kb_api.flows.v3.models.node_models import NodeExecutionStatus
 from graph_kb_api.flows.v3.nodes.plan_nodes import (
+    PRESERVE_AFTER_ORCHESTRATE,
+    PRESERVE_AFTER_RESEARCH,
     PruneAfterOrchestrateNode,
     PruneAfterResearchNode,
 )
@@ -180,7 +182,7 @@ class TestContextToResearchTransition:
 
     @pytest.mark.asyncio
     async def test_summary_fields_preserved_after_prune(self, prune_node):
-        """Req 18.3: findings, approved, review_feedback, gaps, targets preserved."""
+        """Req 11.1: Allowlisted fields in PRESERVE_AFTER_RESEARCH are preserved."""
         state = _build_post_research_state()
 
         result = await prune_node._execute_step(state, {})
@@ -192,11 +194,9 @@ class TestContextToResearchTransition:
         }
         assert pruned_research["approved"] is True
         assert pruned_research["review_feedback"] == "Research is comprehensive"
-        assert pruned_research["gaps"] == []
-        assert pruned_research["targets"] == {
-            "repos": ["graph-kb"],
-            "urls": ["https://docs.example.com"],
-        }
+        # gaps and targets are NOT in PRESERVE_AFTER_RESEARCH — pruned by allowlist
+        assert "gaps" not in pruned_research
+        assert "targets" not in pruned_research
 
     @pytest.mark.asyncio
     async def test_pruned_state_valid_for_downstream(self, prune_node):
@@ -216,8 +216,10 @@ class TestContextToResearchTransition:
         assert "approved" in pruned_research
 
         # No large inline data should remain
-        for key in PruneAfterResearchNode.PRUNE_KEYS:
-            assert key not in pruned_research
+        for key in pruned_research:
+            assert key in PRESERVE_AFTER_RESEARCH, (
+                f"Non-preserved key '{key}' survived pruning"
+            )
 
     @pytest.mark.asyncio
     async def test_merged_state_has_artifacts_and_pruned_research(self, prune_node):
@@ -278,7 +280,7 @@ class TestOrchestrateToAssemblyTransition:
 
     @pytest.mark.asyncio
     async def test_summary_fields_preserved_after_prune(self, prune_node):
-        """Req 18.3: task_results, all_complete, critique_feedback preserved."""
+        """Req 11.1: Allowlisted fields in PRESERVE_AFTER_ORCHESTRATE are preserved."""
         state = _build_post_orchestrate_state()
 
         result = await prune_node._execute_step(state, {})
@@ -286,9 +288,9 @@ class TestOrchestrateToAssemblyTransition:
 
         assert len(pruned["task_results"]) == 2
         assert pruned["all_complete"] is True
-        assert pruned["critique_feedback"] == "All tasks meet quality bar"
-        assert "t1" in pruned["task_iterations"]
-        assert "t2" in pruned["task_iterations"]
+        # critique_feedback and task_iterations are NOT in PRESERVE_AFTER_ORCHESTRATE — pruned
+        assert "critique_feedback" not in pruned
+        assert "task_iterations" not in pruned
 
     @pytest.mark.asyncio
     async def test_pruned_state_valid_for_assembly(self, prune_node):
@@ -300,9 +302,11 @@ class TestOrchestrateToAssemblyTransition:
 
         # Assembly needs task results to know what was produced
         assert "task_results" in pruned
-        # No iteration noise
-        for key in PruneAfterOrchestrateNode.PRUNE_KEYS:
-            assert key not in pruned
+        # Only allowlisted keys should survive
+        for key in pruned:
+            assert key in PRESERVE_AFTER_ORCHESTRATE, (
+                f"Non-preserved key '{key}' survived pruning"
+            )
 
     @pytest.mark.asyncio
     async def test_merged_state_has_artifacts_and_pruned_orchestrate(self, prune_node):
@@ -319,6 +323,8 @@ class TestOrchestrateToAssemblyTransition:
         assert "critique_history" not in merged["orchestrate"]
         assert merged["orchestrate"]["all_complete"] is True
         assert merged["budget"]["remaining_llm_calls"] == 50
+        # Allowlist: only preserved keys survive
+        assert "critique_feedback" not in merged["orchestrate"]
 
 
 # ---------------------------------------------------------------------------

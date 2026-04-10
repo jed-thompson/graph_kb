@@ -26,6 +26,7 @@ from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
 from graph_kb_api.flows.v3.state import UnifiedSpecState
 from graph_kb_api.flows.v3.utils.agent_helpers import build_prompt, compute_confidence
 from graph_kb_api.utils.enhanced_logger import EnhancedLogger
+from graph_kb_api.core.llm import LLMQuotaExhaustedError
 
 MAX_CRITIQUE_ITERATIONS = 3
 
@@ -104,6 +105,9 @@ class ArchitectAgent(BaseAgent):
                 return str(response.content)
             return str(response)
         except Exception as exc:
+            # Let quota errors propagate without wrapping
+            if isinstance(exc, LLMQuotaExhaustedError):
+                raise
             return f"[Draft generation failed: {exc}]\n\n{user_prompt}"
 
     # ── Orchestration Methods (O1-O9) ─────────────────────────────────────

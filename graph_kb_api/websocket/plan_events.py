@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
-from graph_kb_api.flows.v3.state.plan_state import PHASE_WEIGHTS, DocumentManifest
+from graph_kb_api.flows.v3.state.plan_state import DocumentManifest, PlanPhase
 from graph_kb_api.websocket.events import PhaseId
 
 logger = logging.getLogger(__name__)
@@ -646,11 +646,10 @@ def calculate_overall_progress(
     current_phase: str,
     current_phase_progress: float,
 ) -> float:
-    """Compute overall progress as a weighted sum across subgraphs.
+    """Compute overall progress as completed phases / total phases.
 
-    Uses PHASE_WEIGHTS to assign each phase a proportion of the total
-    progress bar. Completed phases contribute their full weight; the
-    current active phase contributes proportionally.
+    Completed phases contribute 1/N each; the current active phase
+    contributes proportionally within its 1/N slice.
 
     Args:
         completed_phases: Mapping of phase name to completion flag.
@@ -660,8 +659,11 @@ def calculate_overall_progress(
     Returns:
         Overall progress clamped to [0.0, 1.0].
     """
+    all_phases = [p.value for p in PlanPhase]
+    n = len(all_phases) or 1
+    weight = 1.0 / n
     total = 0.0
-    for phase, weight in PHASE_WEIGHTS.items():
+    for phase in all_phases:
         if completed_phases.get(phase):
             total += weight
         elif phase == current_phase and current_phase_progress is not None:

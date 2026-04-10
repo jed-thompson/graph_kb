@@ -3,6 +3,9 @@
 import { BasePhaseContent } from './BasePhaseContent';
 import type { PhaseStatus, ThinkingStep, PlanPhaseInfo, GateType } from '../PlanContext';
 import type { PhaseField } from '@shared/websocket-events';
+import type { Gap, ClarificationQuestion, ArchitectureAnalysis } from '../shared/AnalysisReviewForm';
+import type { ContextItems } from '../shared/ContextItemsPanel';
+import type { TaskItem } from '../PlanContext';
 
 interface ContextPhaseProps {
     status: PhaseStatus;
@@ -11,14 +14,22 @@ interface ContextPhaseProps {
     thinkingSteps: ThinkingStep[];
     result?: Record<string, unknown>;
     promptData?: {
+        session_id?: string;
         type?: GateType;
         fields?: PhaseField[];
         prefilled?: Record<string, unknown>;
         summary?: Record<string, unknown>;
         message?: string;
+        tasks?: TaskItem[];
         options?: Array<{ id: string; label: string }>;
         result?: Record<string, unknown>;
         next_phase?: string;
+        completeness_score?: number;
+        gaps?: Gap[] | Record<string, unknown> | unknown[];
+        clarification_questions?: ClarificationQuestion[] | Record<string, unknown>[];
+        suggested_actions?: string[];
+        architecture_analysis?: ArchitectureAnalysis | Record<string, unknown>;
+        context_items?: ContextItems;
     };
     showThinking: boolean;
     isSubmitting: boolean;
@@ -50,7 +61,7 @@ export function ContextPhase({
             agentContent={agentContent}
             thinkingSteps={thinkingSteps}
             result={result}
-            promptData={promptData}
+            promptData={promptData as Parameters<typeof BasePhaseContent>[0]['promptData']}
             showThinking={showThinking}
             isSubmitting={isSubmitting}
             onToggleThinking={onToggleThinking}

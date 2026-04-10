@@ -41,12 +41,18 @@ async def get_visualization(
     viz_type: VizTypeLiteral,
     symbol_name: Optional[str] = None,
     direction: str = "outgoing",
+    limit: Optional[int] = None,
+    max_depth: Optional[int] = None,
     facade=Depends(get_graph_kb_facade),
 ):
     """Generate a graph visualization for a repository.
 
     Returns nodes, edges, optional interactive HTML, and the viz_type.
     Returns 404 if the repo_id is not indexed.
+
+    Query parameters:
+        limit: Maximum number of nodes to return (overrides per-type defaults).
+        max_depth: Maximum traversal depth for recursive queries.
     """
     vis_service = facade.visualization_service
     if vis_service is None:
@@ -58,7 +64,8 @@ async def get_visualization(
     try:
         enum_type = VisualizationType(viz_type)
         result = vis_service.generate_visualization(
-            repo_id, enum_type, symbol_name=symbol_name, direction=direction
+            repo_id, enum_type, symbol_name=symbol_name, direction=direction,
+            limit=limit, max_depth=max_depth,
         )
     except Exception as e:
         logger.error("Visualization generation failed: %s", e, exc_info=True)
@@ -81,7 +88,10 @@ async def get_visualization(
     # carries HTML + counts).  We call _query_graph which is the same
     # path generate_visualization uses internally.
     try:
-        graph = vis_service._query_graph(repo_id, enum_type, symbol_name=symbol_name, direction=direction)
+        graph = vis_service._query_graph(
+            repo_id, enum_type, symbol_name=symbol_name, direction=direction,
+            limit=limit, max_depth=max_depth,
+        )
     except Exception:
         # If re-querying fails, return the HTML-only response.
         graph = None

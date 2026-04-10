@@ -11,8 +11,8 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from graph_kb_api.flows.v3.graphs.base_workflow_engine import BaseWorkflowEngine
-from graph_kb_api.flows.v3.nodes.plan_nodes import (
+from graph_kb_api.flows.v3.graphs.plan_subgraphs.plan_subgraph_base import PlanSubgraph
+from graph_kb_api.flows.v3.nodes.plan.context_nodes import (
     CollectContextNode,
     DeepAnalysisNode,
     FeedbackReviewNode,
@@ -26,10 +26,10 @@ from graph_kb_api.utils.enhanced_logger import EnhancedLogger
 logger = EnhancedLogger(__name__)
 
 
-class ContextSubgraph(BaseWorkflowEngine):
+class ContextSubgraph(PlanSubgraph):
     """Context collection + AI review subgraph.
 
-    Extends BaseWorkflowEngine to build a LangGraph StateGraph that handles:
+    Extends PlanSubgraph to build a LangGraph StateGraph that handles:
       - Validating user-provided context
       - Collecting context from the codebase
       - AI review of collected context
@@ -40,18 +40,7 @@ class ContextSubgraph(BaseWorkflowEngine):
     """
 
     def __init__(self, workflow_context: WorkflowContext) -> None:
-        super().__init__(
-            workflow_context=workflow_context,
-            max_iterations=1,
-            workflow_name="context_subgraph",
-            use_default_checkpointer=False,
-        )
-
-    # ── BaseWorkflowEngine Implementation ─────────────────────────────
-
-    def _initialize_tools(self) -> list:
-        """No standalone tools — nodes handle their own tooling."""
-        return []
+        super().__init__(workflow_context, "context_subgraph")
 
     def _initialize_nodes(self) -> None:
         """Instantiate context subgraph nodes."""

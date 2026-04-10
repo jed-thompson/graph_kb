@@ -22,7 +22,7 @@ from graph_kb_api.flows.v3.agents.base_agent import AgentCapability, BaseAgent
 from graph_kb_api.flows.v3.agents.personas import get_agent_prompt_manager
 from graph_kb_api.flows.v3.models import AgentResult, AgentTask
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
-from graph_kb_api.flows.v3.services.llm_service import LLMService
+from graph_kb_api.flows.v3.services.llm_service import LLMService, LLMQuotaExhaustedError
 from graph_kb_api.flows.v3.state import UnifiedSpecState
 from graph_kb_api.flows.v3.utils.context_utils import append_document_context_to_prompt
 from graph_kb_api.utils.enhanced_logger import EnhancedLogger
@@ -188,6 +188,13 @@ class RoadmapAgent(BaseAgent):
             await self._emit_progress(state, "roadmap_complete", "Roadmap generation complete", 100)
 
         except Exception as e:
+            # Re-raise quota exhaustion so the node-level handler can emit
+            # a proper error to the UI instead of silently degrading
+            if isinstance(e, LLMQuotaExhaustedError) or (
+                isinstance(e.__cause__, LLMQuotaExhaustedError) if e.__cause__ else False
+            ):
+                raise
+
             logger.error(f"Roadmap agent failed: {e}", exc_info=True)
             roadmap.summary = f"Roadmap generation partially completed. Error: {str(e)}"
 

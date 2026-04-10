@@ -8,6 +8,14 @@ import { listRepositories } from '@/lib/api/repositories';
 import { askCode, askCodeStream } from '@/lib/api/chat';
 import { useWebSocket } from '@/context/WebSocketContext';
 import type { AttachedFile } from '@/context/AttachmentContext';
+
+/** Generate a unique message ID. Uses crypto.randomUUID when available, falls back to timestamp + random suffix. */
+function generateMessageId(prefix?: string): string {
+    const uuid = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    return prefix ? `${prefix}-${uuid}` : uuid;
+}
 import { useChatStore, useActiveSessionMessages, useChatStoreHydrated } from '@/lib/store/chatStore';
 import type { ChatSessionMeta } from '@/lib/store/chatStore';
 import { useResearchStore } from '@/lib/store/researchStore';
@@ -177,7 +185,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
     if (!ingestActive || !sharedWs) return;
 
     // Create a single progress message that we'll keep updating in-place
-    const progressId = `ingest-progress-${Date.now()}`;
+    const progressId = generateMessageId("ingest-progress");
     progressMsgIdRef.current = progressId;
 
     const progressMsg: ChatMessage = {
@@ -418,7 +426,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
       if (!sharedWs || !wsConnected) {
         const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws';
         const errorMessage: ChatMessage = {
-          id: (Date.now() + 1).toString(),
+          id: generateMessageId(),
           role: 'system',
           type: 'error',
           content: `WebSocket not connected. Backend at ${wsUrl} may not be responding.`,
@@ -432,7 +440,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
       setTimeout(() => { planStartPending.current = false; }, 2000);
 
       const startMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
+        id: generateMessageId(),
         role: 'assistant',
         type: 'plan',
         content: `Starting Plan Workflow: ${planName}...`,
@@ -484,7 +492,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
         if (!sharedWs || !wsConnected) {
           const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws';
           const errorMessage: ChatMessage = {
-            id: (Date.now() + 1).toString(),
+            id: generateMessageId(),
             role: 'system',
             type: 'error',
             content: `WebSocket not connected. Backend at ${wsUrl} may not be responding.`,
@@ -495,7 +503,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
         }
 
         const ingestMessage: ChatMessage = {
-          id: (Date.now() + 1).toString(),
+          id: generateMessageId(),
           role: 'system',
           type: 'text',
           content: `Starting ingest for ${gitUrl} (branch: ${branch})...`,
@@ -523,7 +531,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
       if (command === 'wizard') {
         // Redirect to /spec command for new conversational wizard
         const wizardMessage: ChatMessage = {
-          id: (Date.now() + 1).toString(),
+          id: generateMessageId(),
           role: 'system',
           type: 'text',
           content: '🧙 The wizard has moved to /spec. Type /spec to start the Feature Spec Wizard.',
@@ -570,7 +578,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
     });
 
     const resumeMessage: ChatMessage = {
-      id: `plan-resume-${Date.now()}`,
+      id: generateMessageId("plan-resume"),
       role: 'system',
       type: 'text',
       content: '📋 Resuming plan session...',
@@ -587,7 +595,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
 
     const trimmedInput = input.trim();
     const userMessage: ChatMessage = {
-      id: Date.now().toString(),
+      id: generateMessageId(),
       role: 'user',
       content: trimmedInput,
       type: 'text',
@@ -620,7 +628,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
       });
 
       const assistantMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
+        id: generateMessageId(),
         role: 'assistant',
         content: response.answer,
         type: 'text',
@@ -639,7 +647,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
     } catch (error) {
       console.error('Chat error:', error);
       const errorMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
+        id: generateMessageId(),
         role: 'system',
         type: 'error',
         content: `Error: ${error instanceof Error ? error.message : 'Failed to send message'}`,
@@ -660,7 +668,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
 
     const trimmedInput = input.trim();
     const userMessage: ChatMessage = {
-      id: Date.now().toString(),
+      id: generateMessageId(),
       role: 'user',
       content: trimmedInput,
       type: 'text',
@@ -674,7 +682,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
       return;
     }
 
-    const assistantId = (Date.now() + 1).toString();
+    const assistantId = generateMessageId();
 
     // Insert a placeholder assistant message that will be updated as chunks arrive
     const placeholderMessage: ChatMessage = {
@@ -852,7 +860,7 @@ export function ChatProvider({ children, getAttachmentFiles }: { children: React
   }, []);
 
   const addContext = useCallback((context: ContextEntry) => {
-    const convId = Date.now().toString();
+    const convId = generateMessageId();
     setContexts((prev) => {
       const newMap = new Map(prev);
       if (!newMap.has(convId)) {

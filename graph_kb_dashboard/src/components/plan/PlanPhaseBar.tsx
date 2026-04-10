@@ -2,7 +2,7 @@
 
 import { CheckCircle, Circle, Loader2, AlertCircle, ChevronLeft, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { PLAN_PHASES, PHASE_WEIGHTS } from '@/lib/store/planStore';
+import { PLAN_PHASES } from '@/lib/store/planStore';
 import type { PlanPhaseId } from '@/lib/store/planStore';
 
 interface PlanPhaseBarProps {
@@ -96,7 +96,6 @@ export function PlanPhaseBar({
                     const isCurrent = currentPhase === phaseId;
                     const isViewing = viewingPhase === phaseId;
                     const colors = PHASE_COLORS[phaseId];
-                    const weight = Math.round(PHASE_WEIGHTS[phaseId] * 100);
 
                     return (
                         <div key={phaseId} className="flex items-center flex-1 min-w-0">
@@ -119,7 +118,6 @@ export function PlanPhaseBar({
                                 )}>
                                     {PHASE_LABELS[phaseId]}
                                 </span>
-                                <span className="text-[10px] text-muted-foreground flex-shrink-0">{weight}%</span>
                             </button>
 
                             {index < PLAN_PHASES.length - 1 && (

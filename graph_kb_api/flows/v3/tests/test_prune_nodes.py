@@ -1,16 +1,21 @@
-"""Tests for PruneAfterResearchNode and PruneAfterOrchestrateNode."""
+"""Tests for PruneAfterResearchNode and PruneAfterOrchestrateNode.
+
+Updated to validate PRESERVE_KEYS allowlist pattern (Req 11.1, 11.2, 11.5).
+"""
 
 import pytest
 
 from graph_kb_api.flows.v3.models.node_models import NodeExecutionStatus
 from graph_kb_api.flows.v3.nodes.plan_nodes import (
+    PRESERVE_AFTER_ORCHESTRATE,
+    PRESERVE_AFTER_RESEARCH,
     PruneAfterOrchestrateNode,
     PruneAfterResearchNode,
 )
 
 
 class TestPruneAfterResearchNode:
-    """Test PruneAfterResearchNode clears inline data and preserves summaries."""
+    """Test PruneAfterResearchNode uses allowlist to retain only preserved keys."""
 
     @pytest.fixture
     def node(self):
@@ -41,7 +46,7 @@ class TestPruneAfterResearchNode:
 
     @pytest.mark.asyncio
     async def test_clears_graph_results(self, node):
-        state = {"research": {"graph_results": [{"node": "n1"}], "gaps": []}}
+        state = {"research": {"graph_results": [{"node": "n1"}], "approved": False}}
         result = await node._execute_step(state, {})
         assert "graph_results" not in result.output["research"]
 
@@ -59,10 +64,24 @@ class TestPruneAfterResearchNode:
         assert result.output["research"]["findings"] == findings
 
     @pytest.mark.asyncio
-    async def test_preserves_gaps(self, node):
-        state = {"research": {"gaps": [{"topic": "auth"}], "graph_results": []}}
+    async def test_prunes_non_preserved_keys(self, node):
+        """Allowlist pattern: keys not in PRESERVE_AFTER_RESEARCH are pruned."""
+        state = {
+            "research": {
+                "findings": {"summary": "ok"},
+                "approved": True,
+                "gaps": [{"topic": "auth"}],  # Not in PRESERVE set
+                "targets": {"repos": ["graph-kb"]},  # Not in PRESERVE set
+                "subtasks": [{"id": "s1"}],  # Not in PRESERVE set
+            }
+        }
         result = await node._execute_step(state, {})
-        assert result.output["research"]["gaps"] == [{"topic": "auth"}]
+        pruned = result.output["research"]
+        assert "gaps" not in pruned
+        assert "targets" not in pruned
+        assert "subtasks" not in pruned
+        assert pruned["findings"] == {"summary": "ok"}
+        assert pruned["approved"] is True
 
     @pytest.mark.asyncio
     async def test_empty_research_state(self, node):
@@ -84,29 +103,41 @@ class TestPruneAfterResearchNode:
             },
         }
         result = await node._execute_step(state, {})
-        # Output only contains research key — artifacts are untouched
         assert "artifacts" not in result.output
 
     @pytest.mark.asyncio
-    async def test_clears_all_three_keys_at_once(self, node):
+    async def test_preserves_all_allowlisted_keys(self, node):
+        """All keys in PRESERVE_AFTER_RESEARCH survive pruning."""
         state = {
             "research": {
+                "findings": {"summary": "ok"},
+                "confidence_score": 0.85,
+                "approved": True,
+                "approval_decision": "approve",
+                "approval_feedback": "looks good",
+                "review_feedback": "comprehensive",
+                "confidence_evaluation_method": "llm",
+                "research_gap_iterations": 2,
+                "structured_data_available": True,
+                # Non-preserved keys
                 "web_results": [1, 2],
                 "vector_results": [3, 4],
                 "graph_results": [5, 6],
-                "approved": True,
-                "findings": {"summary": "ok"},
-                "review_feedback": "looks good",
+                "gaps": [],
+                "targets": {},
             }
         }
         result = await node._execute_step(state, {})
         pruned = result.output["research"]
+        # All preserved keys present
+        for key in PRESERVE_AFTER_RESEARCH:
+            assert key in pruned, f"Preserved key '{key}' was pruned"
+        # Non-preserved keys absent
         assert "web_results" not in pruned
         assert "vector_results" not in pruned
         assert "graph_results" not in pruned
-        assert pruned["approved"] is True
-        assert pruned["findings"] == {"summary": "ok"}
-        assert pruned["review_feedback"] == "looks good"
+        assert "gaps" not in pruned
+        assert "targets" not in pruned
 
     def test_node_attributes(self, node):
         assert node.phase == "research"
@@ -115,7 +146,7 @@ class TestPruneAfterResearchNode:
 
 
 class TestPruneAfterOrchestrateNode:
-    """Test PruneAfterOrchestrateNode clears iteration data and preserves outputs."""
+    """Test PruneAfterOrchestrateNode uses allowlist to retain only preserved keys."""
 
     @pytest.fixture
     def node(self):
@@ -164,13 +195,26 @@ class TestPruneAfterOrchestrateNode:
         assert result.output["orchestrate"]["all_complete"] is True
 
     @pytest.mark.asyncio
-    async def test_preserves_task_iterations(self, node):
-        iterations = {"t1": [{"iteration": 1, "approved": True}]}
+    async def test_prunes_non_preserved_keys(self, node):
+        """Allowlist pattern: keys not in PRESERVE_AFTER_ORCHESTRATE are pruned."""
         state = {
-            "orchestrate": {"task_iterations": iterations, "current_task_context": {}}
+            "orchestrate": {
+                "task_results": [{"id": "t1"}],
+                "all_complete": True,
+                "total_tasks": 3,
+                "task_iterations": {"t1": [{"iteration": 1}]},  # Not preserved
+                "critique_feedback": "good",  # Not preserved
+                "dag_emitted": True,  # Not preserved
+            }
         }
         result = await node._execute_step(state, {})
-        assert result.output["orchestrate"]["task_iterations"] == iterations
+        pruned = result.output["orchestrate"]
+        assert "task_iterations" not in pruned
+        assert "critique_feedback" not in pruned
+        assert "dag_emitted" not in pruned
+        assert pruned["task_results"] == [{"id": "t1"}]
+        assert pruned["all_complete"] is True
+        assert pruned["total_tasks"] == 3
 
     @pytest.mark.asyncio
     async def test_empty_orchestrate_state(self, node):
@@ -193,25 +237,32 @@ class TestPruneAfterOrchestrateNode:
         assert "artifacts" not in result.output
 
     @pytest.mark.asyncio
-    async def test_clears_all_three_keys_at_once(self, node):
+    async def test_preserves_all_allowlisted_keys(self, node):
+        """All keys in PRESERVE_AFTER_ORCHESTRATE survive pruning."""
         state = {
             "orchestrate": {
+                "task_results": [{"id": "t1"}],
+                "all_complete": True,
+                "total_tasks": 5,
+                # Non-preserved keys
                 "critique_history": [{"round": 1}, {"round": 2}],
                 "iteration_count": 5,
                 "current_task_context": {"task_id": "t3"},
-                "task_results": [{"id": "t1"}],
-                "all_complete": False,
+                "current_draft": "draft text",
+                "agent_context": {"agent": "architect"},
                 "critique_feedback": "needs work",
             }
         }
         result = await node._execute_step(state, {})
         pruned = result.output["orchestrate"]
+        for key in PRESERVE_AFTER_ORCHESTRATE:
+            assert key in pruned, f"Preserved key '{key}' was pruned"
         assert "critique_history" not in pruned
         assert "iteration_count" not in pruned
         assert "current_task_context" not in pruned
-        assert pruned["task_results"] == [{"id": "t1"}]
-        assert pruned["all_complete"] is False
-        assert pruned["critique_feedback"] == "needs work"
+        assert "current_draft" not in pruned
+        assert "agent_context" not in pruned
+        assert "critique_feedback" not in pruned
 
     def test_node_attributes(self, node):
         assert node.phase == "orchestrate"

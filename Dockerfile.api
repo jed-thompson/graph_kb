@@ -33,7 +33,7 @@ ARG EMBEDDING_MODEL=jinaai/jina-embeddings-v3
 RUN python -c "\
 from sentence_transformers import SentenceTransformer; \
 m = SentenceTransformer('${EMBEDDING_MODEL}', trust_remote_code=True); \
-print(f'Model pre-loaded: {m.get_sentence_embedding_dimension()} dims')"
+print(f'Model pre-loaded: {m.get_embedding_dimension()} dims')"
 
 # Copy API code (changes here won't invalidate the model cache layer above)
 COPY graph_kb_api/ ./graph_kb_api/

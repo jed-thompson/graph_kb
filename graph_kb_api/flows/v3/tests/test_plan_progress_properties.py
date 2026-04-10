@@ -1,9 +1,9 @@
 """Property-based tests for progress calculation and emit_phase_progress.
 
-Property 16: Progress Calculation Bounds and Weighted Sum — calculate_overall_progress
+Property 16: Progress Calculation Bounds — calculate_overall_progress
 always returns a value in [0.0, 1.0], equals 1.0 when all phases are completed,
 equals 0.0 when no phases are completed with zero current progress, and computes
-a correct weighted sum using PHASE_WEIGHTS.
+a correct equal-weight sum across phases.
 
 **Validates: Requirements 22.1, 22.2, 22.3, 22.4**
 
@@ -20,7 +20,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from graph_kb_api.flows.v3.state.plan_state import PHASE_WEIGHTS
+from graph_kb_api.flows.v3.state.plan_state import PlanPhase
 from graph_kb_api.websocket.plan_events import (
     calculate_overall_progress,
     emit_phase_progress,
@@ -31,13 +31,14 @@ from graph_kb_api.websocket.plan_events import (
 # Strategies
 # ---------------------------------------------------------------------------
 
-phase_keys_st = st.sampled_from(list(PHASE_WEIGHTS.keys()))
+_ALL_PHASES = [p for p in PlanPhase]
+phase_keys_st = st.sampled_from(_ALL_PHASES)
 
 
 @st.composite
 def completed_phases_dict(draw: st.DrawFn):
-    """Generate a dict mapping PHASE_WEIGHTS keys to booleans."""
-    return {phase: draw(st.booleans()) for phase in PHASE_WEIGHTS}
+    """Generate a dict mapping phase names to booleans."""
+    return {phase: draw(st.booleans()) for phase in _ALL_PHASES}
 
 
 @st.composite
@@ -50,17 +51,17 @@ def progress_inputs(draw: st.DrawFn):
 
 
 # ---------------------------------------------------------------------------
-# Property 16: Progress Calculation Bounds and Weighted Sum
+# Property 16: Progress Calculation Bounds
 # ---------------------------------------------------------------------------
 
 
 class TestProgressCalculationBoundsAndWeightedSum:
-    """Property 16: Progress Calculation Bounds and Weighted Sum
+    """Property 16: Progress Calculation Bounds
 
     calculate_overall_progress always returns a value in [0.0, 1.0],
     equals 1.0 when all phases are completed, equals 0.0 when no phases
     are completed with zero current progress, and computes a correct
-    weighted sum using PHASE_WEIGHTS.
+    equal-weight sum across phases.
 
     **Validates: Requirements 22.1, 22.2, 22.3, 22.4**
     """
@@ -77,7 +78,7 @@ class TestProgressCalculationBoundsAndWeightedSum:
     @settings(max_examples=50, suppress_health_check=[HealthCheck.too_slow])
     def test_all_completed_returns_one(self, current_phase):
         """When all phases are completed, the result should be 1.0."""
-        completed = {phase: True for phase in PHASE_WEIGHTS}
+        completed = {phase: True for phase in _ALL_PHASES}
         result = calculate_overall_progress(completed, current_phase, 0.0)
         assert abs(result - 1.0) < 1e-9, (
             f"Expected 1.0 when all phases completed, got {result}"
@@ -87,7 +88,7 @@ class TestProgressCalculationBoundsAndWeightedSum:
     @settings(max_examples=50, suppress_health_check=[HealthCheck.too_slow])
     def test_none_completed_zero_progress_returns_zero(self, current_phase):
         """When no phases are completed and current_phase_progress is 0.0, result is 0.0."""
-        completed = {phase: False for phase in PHASE_WEIGHTS}
+        completed = {phase: False for phase in _ALL_PHASES}
         result = calculate_overall_progress(completed, current_phase, 0.0)
         assert abs(result) < 1e-9, (
             f"Expected 0.0 when no phases completed and progress is 0.0, got {result}"
@@ -95,12 +96,14 @@ class TestProgressCalculationBoundsAndWeightedSum:
 
     @given(data=progress_inputs())
     @settings(max_examples=200, suppress_health_check=[HealthCheck.too_slow])
-    def test_weighted_sum_correctness(self, data):
-        """The result should be a weighted sum using PHASE_WEIGHTS."""
+    def test_equal_weight_sum_correctness(self, data):
+        """The result should be an equal-weight sum (1/N per phase)."""
         completed, current_phase, current_progress = data
 
+        n = len(_ALL_PHASES)
+        weight = 1.0 / n
         expected = 0.0
-        for phase, weight in PHASE_WEIGHTS.items():
+        for phase in _ALL_PHASES:
             if completed.get(phase):
                 expected += weight
             elif phase == current_phase:
@@ -109,7 +112,7 @@ class TestProgressCalculationBoundsAndWeightedSum:
 
         result = calculate_overall_progress(completed, current_phase, current_progress)
         assert abs(result - expected) < 1e-9, (
-            f"Expected weighted sum {expected}, got {result}"
+            f"Expected equal-weight sum {expected}, got {result}"
         )
 
 

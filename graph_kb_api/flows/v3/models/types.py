@@ -58,12 +58,18 @@ class MyNode(BaseWorkflowNodeV3):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, NotRequired, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, NotRequired, Optional, TypedDict
 
 if TYPE_CHECKING:
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+
     from graph_kb_api.core.llm import LLMService
     from graph_kb_api.flows.v3.services.artifact_service import ArtifactService
+    from graph_kb_api.flows.v3.services.fingerprint_tracker import FingerprintTracker
     from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
+    from graph_kb_api.flows.v3.state.plan_state import ProgressEvent
+    from graph_kb_api.graph_kb.facade import GraphKBFacade
+    from graph_kb_api.storage.blob_storage import BlobStorage
 
 from graph_kb_api.context import AppContext
 from graph_kb_api.graph_kb.processing.embedding_generator import EmbeddingGenerator
@@ -139,6 +145,7 @@ class ThreadConfigurable(TypedDict, total=False):
     - thread_id (required by LangGraph for checkpointing)
     - user_id, session_id, repo_id (our workflow metadata)
     - services (dependency injection for workflow nodes)
+    - WorkflowContext fields (auto-injected by get_config_with_services)
 
     This TypedDict documents our specific usage of the configurable dict,
     but the actual type is just `dict[str, Any]` in RunnableConfig.
@@ -152,16 +159,29 @@ class ThreadConfigurable(TypedDict, total=False):
         services: Service registry for dependency injection (our custom field)
     """
 
+    # LangGraph required
     thread_id: str
+
+    # Workflow metadata
     user_id: str
     session_id: str
     repo_id: NotRequired[str]
-    services: NotRequired[ServiceRegistry]
     client_id: NotRequired[str]
-    context: NotRequired[WorkflowContext]
+
+    # Dependency injection
+    services: NotRequired[ServiceRegistry]
+    context: NotRequired[WorkflowContext]  # backward-compat alias for WorkflowContext
     llm: NotRequired[LLMService]
     artifact_service: NotRequired[ArtifactService]
-    progress_callback: NotRequired[Any]  # Callable[[Dict[str, Any]], Awaitable[None]]
+    progress_callback: NotRequired[Callable[[ProgressEvent], Awaitable[None]]]
+
+    # Auto-injected by get_config_with_services() from WorkflowContext fields
+    app_context: NotRequired[AppContext]
+    blob_storage: NotRequired[BlobStorage]
+    checkpointer: NotRequired[BaseCheckpointSaver]
+    graph_store: NotRequired[GraphKBFacade]
+    vector_store: NotRequired[ChromaVectorStore]
+    fingerprint_tracker: NotRequired[FingerprintTracker]
 
 
 class ThreadConfig(TypedDict):

@@ -14,7 +14,7 @@ const nextConfig = {
     // Allow useSearchParams without Suspense boundary (pre-existing pages)
     missingSuspenseWithCSRBailout: false,
   },
-  transpilePackages: ['recharts', 'mermaid'],
+  transpilePackages: ['recharts', 'mermaid', 'react-syntax-highlighter'],
   env: {
     NEXT_PUBLIC_API_BASE_URL: process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000/api/v1',
     NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/ws',

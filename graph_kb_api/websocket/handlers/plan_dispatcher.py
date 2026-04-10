@@ -12,7 +12,12 @@ from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from graph_kb_api.flows.v3.graphs.plan_engine import PlanEngine
-    from graph_kb_api.flows.v3.state.plan_state import ArtifactManifestEntry
+    from graph_kb_api.flows.v3.state.plan_state import (
+        ArtifactManifestEntry,
+        ArtifactRef,
+        PhaseFingerprint,
+        TransitionEntry,
+    )
 
 from graph_kb_api.context import AppContext, get_app_context
 from graph_kb_api.database.base import get_session
@@ -20,7 +25,15 @@ from graph_kb_api.database.plan_repositories import PlanSessionRepository
 from graph_kb_api.flows.v3.checkpointer import CheckpointerFactory
 from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
-from graph_kb_api.flows.v3.state.plan_state import CASCADE_MAP
+from graph_kb_api.flows.v3.state import ContextData, ResearchData
+from graph_kb_api.flows.v3.state.plan_state import CASCADE_MAP, PHASE_PROGRESS
+from graph_kb_api.flows.v3.utils.artifact_utils import serialize_artifacts
+from graph_kb_api.flows.v3.utils.context_utils import (
+    build_context_items_for_display,
+    build_context_items_summary,
+    resolve_primary_document_id,
+    resolve_supporting_document_ids,
+)
 from graph_kb_api.websocket.events import (
     PhaseId,
     SpecErrorData,
@@ -60,6 +73,24 @@ class PlanSession(TypedDict):
     running_task: Optional[asyncio.Task]
 
 
+class SerializedManifestEntry(TypedDict):
+    """Frontend-facing manifest entry shape (camelCase keys).
+
+    Must stay in sync with ``DocumentManifestEntry`` in
+    ``shared/websocket-events.ts`` and ``shared/plan-types.ts``.
+    """
+
+    taskId: str
+    taskName: str
+    specSection: str
+    downloadUrl: str
+    status: str
+    tokenCount: int
+    filename: str
+    sectionType: str | None
+    errorMessage: str | None
+
+
 # ── PlanDispatcher ─────────────────────────────────────────────────────
 
 
@@ -78,11 +109,9 @@ class PlanDispatcher:
     # ── Helper methods ─────────────────────────────────────────
 
     @staticmethod
-    def _serialize_plan_artifacts(artifacts: Dict[str, Any]) -> List[ArtifactManifestEntry]:
-        """Lazy wrapper for SubgraphAwareNode._serialize_artifacts to avoid circular imports."""
-
-        from graph_kb_api.flows.v3.nodes.subgraph_aware_node import SubgraphAwareNode
-        return SubgraphAwareNode._serialize_artifacts(artifacts)
+    def _serialize_plan_artifacts(artifacts: Dict[str, ArtifactRef]) -> List[ArtifactManifestEntry]:
+        """Delegate to standalone serialize_artifacts utility."""
+        return serialize_artifacts(artifacts)
 
     @staticmethod
     def _format_task_research_summary(task_context: Dict[str, Any] | None) -> str | None:
@@ -281,7 +310,7 @@ class PlanDispatcher:
         if not isinstance(document_manifest, dict):
             return None
 
-        entries_payload: list[Dict[str, Any]] = []
+        entries_payload: list[SerializedManifestEntry] = []
         entries = document_manifest.get("entries")
         if isinstance(entries, list):
             for entry in entries:
@@ -294,18 +323,17 @@ class PlanDispatcher:
                 if isinstance(download_url, str) and download_url:
                     filename = download_url.split("/")[-1]
 
-                entries_payload.append(
-                    {
-                        "taskId": entry.get("task_id", ""),
-                        "specSection": entry.get("spec_section", ""),
-                        "downloadUrl": download_url if isinstance(download_url, str) else "",
-                        "status": entry.get("status", "draft"),
-                        "tokenCount": entry.get("token_count", 0),
-                        "filename": filename,
-                        "sectionType": entry.get("section_type"),
-                        "errorMessage": entry.get("error_message"),
-                    }
-                )
+                entries_payload.append(SerializedManifestEntry(
+                    taskId=entry.get("task_id", ""),
+                    taskName=entry.get("task_name", ""),
+                    specSection=entry.get("spec_section", ""),
+                    downloadUrl=download_url if isinstance(download_url, str) else "",
+                    status=entry.get("status", "draft"),
+                    tokenCount=entry.get("token_count", 0),
+                    filename=filename,
+                    sectionType=entry.get("section_type"),
+                    errorMessage=entry.get("error_message"),
+                ))
 
         composed_index_ref = document_manifest.get("composed_index_ref")
         composed_index_url = composed_index_ref.get("key") if isinstance(composed_index_ref, dict) else ""
@@ -375,33 +403,12 @@ class PlanDispatcher:
         if not isinstance(context, dict):
             return None
 
-        snapshot: Dict[str, Any] = {}
-        for key in ("extracted_urls", "rounds", "user_explanation"):
-            value = context.get(key)
-            if value not in (None, "", [], {}):
-                snapshot[key] = cls._to_jsonable(value)
+        items = build_context_items_for_display(context)
+        if not items:
+            return None
 
-        # Handle both canonical (primary_document_id) and form-field (primary_document)
-        # naming conventions. CollectContextNode outputs form-field keys to state; canonical
-        # normalization only happens inside FeedbackReviewNode's DB write, which may be
-        # overwritten by _persist_runtime_snapshot writing raw ContextData.
-        primary_doc_id = context.get("primary_document_id") or context.get("primary_document") or ""
-        if primary_doc_id:
-            snapshot["primary_document_id"] = cls._to_jsonable(primary_doc_id)
-
-        supporting_ids: list[str] = list(context.get("supporting_doc_ids") or [])
-        form_supporting = context.get("supporting_docs") or []
-        if isinstance(form_supporting, str):
-            form_supporting = [s.strip() for s in form_supporting.split(",") if s.strip()]
-        elif not isinstance(form_supporting, list):
-            form_supporting = []
-        for doc_id in form_supporting:
-            if doc_id and doc_id not in supporting_ids:
-                supporting_ids.append(doc_id)
-        if supporting_ids:
-            snapshot["supporting_doc_ids"] = cls._to_jsonable(supporting_ids)
-
-        return snapshot or None
+        # Ensure all values are JSON-serializable (handles datetime, UUID, etc.)
+        return {k: cls._to_jsonable(v) for k, v in items.items()}
 
     @classmethod
     def _build_phase_results_snapshot(cls, state: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:
@@ -990,6 +997,120 @@ class PlanDispatcher:
         return True
 
     @classmethod
+    def _reconstruct_phase_from_log(
+        cls,
+        merged_state: Dict[str, Any],
+    ) -> tuple[str | None, str | None, float | None]:
+        """Reconstruct current phase, step, and progress from transition_log and fingerprints.
+
+        Returns:
+            (phase, step, progress) tuple.  Any element may be ``None`` if the
+            transition_log is empty or incomplete.
+        """
+        transition_log: list[TransitionEntry] = merged_state.get("transition_log") or []
+        fingerprints: Dict[str, PhaseFingerprint] = merged_state.get("fingerprints") or {}
+
+        if not transition_log:
+            return None, None, None
+
+        # Walk the log in reverse to find the latest entry with a valid subgraph
+        last_entry: TransitionEntry | None = None
+        for entry in reversed(transition_log):
+            if isinstance(entry, dict) and isinstance(entry.get("subgraph"), str):
+                last_entry = entry
+                break
+
+        if last_entry is None:
+            return None, None, None
+
+        phase = last_entry.get("subgraph")
+        step = last_entry.get("from_node")
+
+        # Derive progress from per-phase progress dictionaries when available
+        progress: float | None = None
+        phase_steps = PHASE_PROGRESS.get(phase or "") or {}
+        if step and step in phase_steps:
+            progress = phase_steps[step]
+
+        # Cross-check with fingerprints: if the phase has a fingerprint it was
+        # completed at some point, so advance to the next uncompleted phase.
+        if phase and phase in fingerprints:
+            phase_idx = cls._PHASE_ORDER.index(phase) if phase in cls._PHASE_ORDER else -1
+            if 0 <= phase_idx < len(cls._PHASE_ORDER) - 1:
+                phase = cls._PHASE_ORDER[phase_idx + 1]
+                step = None
+                progress = 0.0
+
+        return phase, step, progress
+
+    @classmethod
+    async def _recover_stale_state(
+        cls,
+        *,
+        session_id: str,
+        thread_id: str,
+        user_id: str,
+        client_id: str,
+        workflow_id: str,
+        engine: PlanEngine,
+        config: RunnableConfig,
+        state: Dict[str, Any] | None,
+        result: Dict[str, Any] | None = None,
+    ) -> bool:
+        """Single recovery entry point for reconnect / post-resume state reconstruction.
+
+        Consolidates the previous 8+ ``_recover_stale_terminal_completion`` call
+        sites into one path.  Uses ``transition_log`` and ``fingerprints`` to
+        reconstruct phase/step/progress, falling back to ``completed_phases`` +
+        ``paused_phase`` when the log is incomplete.
+
+        Returns ``True`` when a terminal completion was recovered and the caller
+        should short-circuit (same contract as the old helper).
+        """
+        merged_state = cls._merge_runtime_state(state, result)
+
+        # --- Phase reconstruction from transition_log + fingerprints ----------
+        log_phase, _log_step, _log_progress = cls._reconstruct_phase_from_log(merged_state)
+
+        if log_phase is None:
+            # Fallback: transition_log is empty or corrupted — use completed_phases
+            # and paused_phase as safe defaults.
+            completed_phases = merged_state.get("completed_phases") or {}
+            paused_phase = merged_state.get("paused_phase")
+
+            fallback_phase: str | None = None
+            if isinstance(paused_phase, str) and paused_phase in cls._PHASE_ORDER:
+                fallback_phase = paused_phase
+            elif completed_phases:
+                # Derive current phase from completed_phases
+                for p in cls._PHASE_ORDER:
+                    if not completed_phases.get(p):
+                        fallback_phase = p
+                        break
+
+            if fallback_phase:
+                logger.warning(
+                    "Reconnect state reconstruction: transition_log empty/incomplete, "
+                    "falling back to completed_phases + paused_phase "
+                    "(resolved fallback_phase=%s)",
+                    fallback_phase,
+                    extra={"session_id": session_id, "workflow_id": workflow_id},
+                )
+
+        # --- Terminal completion recovery (delegates to existing logic) --------
+        return await cls._recover_stale_terminal_completion(
+            session_id=session_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            client_id=client_id,
+            workflow_id=workflow_id,
+            engine=engine,
+            config=config,
+            state=state,
+            result=result,
+        )
+
+    @classmethod
     async def _recover_stale_terminal_completion(
         cls,
         *,
@@ -1150,6 +1271,12 @@ class PlanDispatcher:
                     merged_state,
                     fallback_phase=fallback_phase,
                 )
+                # Build lightweight context summary (excludes bulky fields)
+                context_items = build_context_items_summary(
+                    session_id,
+                    cast(ResearchData, merged_state.get("research", {})) if merged_state else ResearchData(),
+                    cast(ContextData, merged_state.get("context", {})) if merged_state else ContextData(),
+                )
                 await cls._persist_session_to_db(
                     session_id=session_id,
                     thread_id=thread_id,
@@ -1164,7 +1291,7 @@ class PlanDispatcher:
                     completed_phases=normalized_completed,
                     fingerprints=merged_state.get("fingerprints"),
                     budget_state=merged_state.get("budget"),
-                    context_items=merged_state.get("context"),
+                    context_items=context_items,
                 )
                 return
 
@@ -1172,6 +1299,12 @@ class PlanDispatcher:
             normalized_completed = cls._normalize_completed_phases(
                 merged_state,
                 fallback_phase=fallback_phase,
+            )
+            # Build lightweight context summary (excludes bulky fields)
+            context_items = build_context_items_summary(
+                session_id,
+                cast(ResearchData, merged_state.get("research", {})) if merged_state else ResearchData(),
+                cast(ContextData, merged_state.get("context", {})) if merged_state else ContextData(),
             )
             await cls._persist_session_to_db(
                 session_id=session_id,
@@ -1185,7 +1318,7 @@ class PlanDispatcher:
                 completed_phases=normalized_completed,
                 fingerprints=merged_state.get("fingerprints"),
                 budget_state=merged_state.get("budget"),
-                context_items=merged_state.get("context"),
+                context_items=context_items,
             )
         except Exception:
             logger.warning("Failed to persist runtime snapshot for plan session", exc_info=True)
@@ -1954,7 +2087,7 @@ class PlanDispatcher:
                 result=result,
             )
             latest_state = await engine.get_workflow_state(cfg)
-            if await self._recover_stale_terminal_completion(
+            if await self._recover_stale_state(
                 session_id=session_id,
                 thread_id=thread_id,
                 user_id=client_id,
@@ -2315,7 +2448,7 @@ class PlanDispatcher:
                     result=result,
                 )
                 latest_state = await engine.get_workflow_state(config)
-                if await self._recover_stale_terminal_completion(
+                if await self._recover_stale_state(
                     session_id=validated.session_id,
                     thread_id=session.get("thread_id", f"plan-{validated.session_id}"),
                     user_id=session.get("user_id", client_id),
@@ -2502,7 +2635,7 @@ class PlanDispatcher:
             )
 
         try:
-            state = await engine.get_workflow_state(config)
+            state = engine.get_workflow_state(config)
             if state is None:
                 await self._emit_plan_error(
                     client_id,
@@ -2771,7 +2904,7 @@ class PlanDispatcher:
                         result=result,
                     )
                     latest_state = await engine.get_workflow_state(config)
-                    if await self._recover_stale_terminal_completion(
+                    if await self._recover_stale_state(
                         session_id=validated.session_id,
                         thread_id=session.get("thread_id", f"plan-{validated.session_id}"),
                         user_id=session.get("user_id", client_id),
@@ -2834,7 +2967,7 @@ class PlanDispatcher:
             current_phase = self._resolve_current_phase(state)
 
             workflow_status = state.get("workflow_status", "running")
-            if await self._recover_stale_terminal_completion(
+            if await self._recover_stale_state(
                 session_id=validated.session_id,
                 thread_id=session.get("thread_id", f"plan-{validated.session_id}"),
                 user_id=session.get("user_id", client_id),
@@ -3200,7 +3333,7 @@ class PlanDispatcher:
             # If workflow was paused (e.g. due to storage failure), reset status
             # so the workflow can resume from the paused phase (Req 27.2).
             try:
-                state = await engine.get_workflow_state(config)
+                state = engine.get_workflow_state(config)
                 if state and state.get("workflow_status") in ("paused", "error"):
                     await engine.workflow.aupdate_state(config, {"workflow_status": "running"})
                     logger.info(
@@ -3228,7 +3361,7 @@ class PlanDispatcher:
                 result=result,
             )
             latest_state = await engine.get_workflow_state(config)
-            if await self._recover_stale_terminal_completion(
+            if await self._recover_stale_state(
                 session_id=validated.session_id,
                 thread_id=session.get("thread_id", f"plan-{validated.session_id}"),
                 user_id=session.get("user_id", client_id),
@@ -3353,7 +3486,7 @@ class PlanDispatcher:
             current_phase = self._resolve_current_phase(state)
 
             workflow_status = state.get("workflow_status", "running")
-            if await self._recover_stale_terminal_completion(
+            if await self._recover_stale_state(
                 session_id=validated.session_id,
                 thread_id=session.get("thread_id", f"plan-{validated.session_id}"),
                 user_id=session.get("user_id", client_id),
@@ -3543,7 +3676,7 @@ class PlanDispatcher:
                         recovered_interrupt.setdefault("session_id", validated.session_id)
                         await self._emit_phase_prompt(client_id, workflow_id, recovered_interrupt)
                         return
-                    if await self._recover_stale_terminal_completion(
+                    if await self._recover_stale_state(
                         session_id=validated.session_id,
                         thread_id=session.get("thread_id", f"plan-{validated.session_id}"),
                         user_id=session.get("user_id", client_id),

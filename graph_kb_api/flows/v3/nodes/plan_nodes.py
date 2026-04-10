@@ -1,9 +1,24 @@
 """Barrel re-exports for plan workflow nodes.
 
+.. deprecated::
+    This module is deprecated. Import directly from
+    ``graph_kb_api.flows.v3.nodes.plan.<module>`` instead.
+    This file will be removed in a future release.
+
 All nodes moved to the plan/ sub-package. This file preserves backward compatibility
 so existing imports (e.g. ``from graph_kb_api.flows.v3.nodes.plan_nodes import ...``)
 continue to work without changes.
 """
+
+import warnings
+
+warnings.warn(
+    "plan_nodes.py is deprecated. Import directly from "
+    "graph_kb_api.flows.v3.nodes.plan.<module> instead. "
+    "This barrel file will be removed in a future release.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from graph_kb_api.flows.v3.nodes.plan import (  # noqa: F401
     AggregateNode,
@@ -33,6 +48,8 @@ from graph_kb_api.flows.v3.nodes.plan import (  # noqa: F401
     GapNode,
     GenerateNode,
     PlanningApprovalNode,
+    PRESERVE_AFTER_ORCHESTRATE,
+    PRESERVE_AFTER_RESEARCH,
     ProgressNode,
     PruneAfterOrchestrateNode,
     # Orchestrate phase
@@ -76,6 +93,8 @@ __all__ = [
     "AlignNode",
     "PlanningApprovalNode",
     # Orchestrate phase
+    "PRESERVE_AFTER_RESEARCH",
+    "PRESERVE_AFTER_ORCHESTRATE",
     "PruneAfterResearchNode",
     "PruneAfterOrchestrateNode",
     "BudgetCheckNode",

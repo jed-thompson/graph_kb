@@ -17,8 +17,8 @@ from typing import Literal
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from graph_kb_api.flows.v3.graphs.base_workflow_engine import BaseWorkflowEngine
-from graph_kb_api.flows.v3.nodes.plan_nodes import (
+from graph_kb_api.flows.v3.graphs.plan_subgraphs.plan_subgraph_base import PlanSubgraph
+from graph_kb_api.flows.v3.nodes.plan.research_nodes import (
     AggregateNode,
     ConfidenceGateNode,
     DispatchResearchNode,
@@ -33,10 +33,10 @@ from graph_kb_api.utils.enhanced_logger import EnhancedLogger
 logger = EnhancedLogger(__name__)
 
 
-class ResearchSubgraph(BaseWorkflowEngine):
+class ResearchSubgraph(PlanSubgraph):
     """Multi-source research with agent dispatch.
 
-    Extends BaseWorkflowEngine to build a LangGraph StateGraph with a
+    Extends PlanSubgraph to build a LangGraph StateGraph with a
     conditional loop for iterative research refinement:
 
         START → formulate_queries → dispatch_research → aggregate →
@@ -52,18 +52,7 @@ class ResearchSubgraph(BaseWorkflowEngine):
     MAX_RESEARCH_ITERATIONS = 3
 
     def __init__(self, workflow_context: WorkflowContext) -> None:
-        super().__init__(
-            workflow_context=workflow_context,
-            max_iterations=1,
-            workflow_name="research_subgraph",
-            use_default_checkpointer=False,
-        )
-
-    # ── BaseWorkflowEngine Implementation ─────────────────────────────
-
-    def _initialize_tools(self) -> list:
-        """No standalone tools — nodes handle their own tooling."""
-        return []
+        super().__init__(workflow_context, "research_subgraph")
 
     def _initialize_nodes(self) -> None:
         """Instantiate research subgraph nodes."""

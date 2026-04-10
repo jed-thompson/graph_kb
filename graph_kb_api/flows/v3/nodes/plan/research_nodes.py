@@ -9,7 +9,7 @@ import json
 import logging
 import re
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, Literal, cast
+from typing import TYPE_CHECKING, Any, Dict, cast
 
 if TYPE_CHECKING:
     from graph_kb_api.flows.v3.services.artifact_service import ArtifactService
@@ -29,17 +29,19 @@ from graph_kb_api.flows.v3.agents.personas.prompt_manager import get_agent_promp
 from graph_kb_api.flows.v3.models.node_models import NodeExecutionResult
 from graph_kb_api.flows.v3.models.types import AgentTask, ThreadConfigurable
 from graph_kb_api.flows.v3.nodes.subgraph_aware_node import SubgraphAwareNode
+from graph_kb_api.flows.v3.nodes.plan.base_approval_node import BaseApprovalNode
 from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
-from graph_kb_api.flows.v3.services.fingerprint_tracker import FingerprintTracker
 from graph_kb_api.flows.v3.state import ContextData, ResearchData
 from graph_kb_api.flows.v3.state.plan_state import (
     RESEARCH_NODE_PROGRESS,
-    ApprovalInterruptPayload,
     BudgetState,
+    InterruptOption,
     ResearchSubgraphState,
+    WorkflowError,
 )
 from graph_kb_api.flows.v3.state.workflow_state import ResearchSubtask, ReviewData
-from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator
+from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator, truncate_to_tokens
+from graph_kb_api.flows.v3.utils.json_parsing import parse_json_from_llm
 from graph_kb_api.storage.blob_storage import BlobStorage
 from graph_kb_api.websocket.plan_events import emit_phase_progress
 
@@ -61,23 +63,18 @@ class FormulateQueriesNode(SubgraphAwareNode[ResearchSubgraphState]):
         self.step_progress: int | float = RESEARCH_NODE_PROGRESS["formulate_queries"]
 
     async def _execute_step(self, state: ResearchSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
-
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        workflow_context: WorkflowContext | None = configurable.get("context")
-        if not workflow_context:
+        ctx = self._unpack(state, config)
+        if not ctx.workflow_context:
             raise RuntimeError("FormulateQueriesNode requires a WorkflowContext but none was provided in config.")
-        llm: LLMService | None = configurable.get("llm")
-        if not llm:
-            raise RuntimeError("FormulateQueriesNode requires an LLM but none was provided in config.")
+        llm = ctx.require_llm
 
-        budget = state.get("budget", {})
+        budget: BudgetState = ctx.budget
 
         # Budget check before LLM call
         BudgetGuard.check(budget)
 
-        context = state.get("context", {})
-        review = state.get("review", {})
+        context: ContextData = state.get("context", {})
+        review: ReviewData = state.get("review", {})
 
         # Build prompt with context
         context_summary = self._summarize_context(context, review)
@@ -94,8 +91,7 @@ class FormulateQueriesNode(SubgraphAwareNode[ResearchSubgraphState]):
 
             # Decrement budget after LLM call (count response tokens, not prompt)
 
-            tokens_used: int = get_token_estimator().count_tokens(content)
-            new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+            new_budget = self._decrement_budget(budget, content)
 
             return NodeExecutionResult.success(
                 output={
@@ -113,8 +109,6 @@ class FormulateQueriesNode(SubgraphAwareNode[ResearchSubgraphState]):
 
     def _summarize_context(self, context: ContextData, review: ReviewData) -> str:
         """Build a concise context summary for the LLM prompt."""
-        from graph_kb_api.flows.v3.utils.token_estimation import truncate_to_tokens
-
         parts = []
         if context.get("spec_name"):
             parts.append(f"Feature: {context['spec_name']}")
@@ -128,7 +122,7 @@ class FormulateQueriesNode(SubgraphAwareNode[ResearchSubgraphState]):
             parts.append(f"Identified Gaps: {json.dumps(review['gaps'])}")
 
         # Append section index so the LLM sees the spec's structure.
-        section_index: list[dict] = context.get("document_section_index", [])
+        section_index: list[dict[str, Any]] = context.get("document_section_index", [])
         if section_index:
             section_lines = []
             for doc in section_index:
@@ -151,12 +145,10 @@ class FormulateQueriesNode(SubgraphAwareNode[ResearchSubgraphState]):
     def _parse_llm_response(self, content: str) -> Dict[str, Any]:
         """Parse LLM response into structured query data."""
         try:
-            import re
-
-            json_match: re.Match[str] | None = re.search(r"\{[\s\S]*\}", content, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, KeyError) as e:
+            parsed = parse_json_from_llm(content)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError as e:
             logger.debug(f"Failed to parse LLM response: {e}")
         return {"queries": [], "targets": {}, "subtasks": []}
 
@@ -177,11 +169,9 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
 
     async def _execute_step(self, state: ResearchSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         from graph_kb_api.flows.v3.agents.research_agent import ResearchAgent
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         research: ResearchData = state.get("research", {})
         context: ContextData = state.get("context", {})
 
@@ -206,18 +196,14 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
 
         BudgetGuard.check(budget)
 
-        session_id = state.get("session_id", "")
-        client_id = configurable.get("client_id")
-
         # Build the app_context adapter
-        workflow_context = configurable.get("context")
-        if not workflow_context:
+        if not ctx.workflow_context:
             raise RuntimeError("DispatchResearchNode requires workflow_context")
 
         # Build the AgentTask the ResearchAgent expects
         agent_task: AgentTask = {
             "description": "Multi-source research dispatch",
-            "task_id": f"research_{session_id}_{uuid.uuid4().hex[:8]}",
+            "task_id": f"research_{ctx.session_id}_{uuid.uuid4().hex[:8]}",
             "context": {
                 "target_repo_id": context.get("target_repo_id", ""),
                 "supporting_docs": context.get("supporting_docs", []),
@@ -232,26 +218,19 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
             },
         }
 
-        web_results: list = []
-        vector_results: list = []
-        graph_results: list = []
+        web_results: list[Dict[str, Any]] = []
+        vector_results: list[Dict[str, Any]] = []
+        graph_results: list[Dict[str, Any]] = []
         artifacts_output: Dict[str, Any] = {}
         llm_calls = 0
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="research",
-                step="dispatch_research",
-                message=f"Dispatching research across {len(subtasks)} subtasks",
-                progress_pct=0.30,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"DispatchResearchNode emit_phase_progress failed: {e}")
+        await self._emit_progress(
+            ctx, "dispatch_research", 0.30,
+            f"Dispatching research across {len(subtasks)} subtasks",
+        )
 
-        agent = ResearchAgent(client_id=client_id)
-        result: AgentResult = await agent.execute(task=agent_task, state=state, workflow_context=workflow_context)
+        agent = ResearchAgent(client_id=ctx.client_id)
+        result: AgentResult = await agent.execute(task=agent_task, state=state, workflow_context=ctx.workflow_context)
 
         # Extract findings from agent result
         # ResearchAgent.execute() returns {"output": json_string, ...}
@@ -318,25 +297,16 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
 
         llm_calls = result.get("llm_calls_used", 1)
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="research",
-                step="dispatch_research",
-                message=(
-                    f"Research complete — {len(web_results)} web, "
-                    f"{len(vector_results)} doc, {len(graph_results)} graph results"
-                ),
-                progress_pct=0.50,
-                client_id=client_id,
-            )
-        except Exception:
-            pass  # fire-and-forget
+        await self._emit_progress(
+            ctx, "dispatch_research", 0.50,
+            f"Research complete — {len(web_results)} web, "
+            f"{len(vector_results)} doc, {len(graph_results)} graph results",
+        )
 
         # Store large results via ArtifactService
-        if artifact_svc:
+        if ctx.artifact_service:
             if web_results:
-                ref = await artifact_svc.store(
+                ref = await ctx.artifact_service.store(
                     "research",
                     "web_results.json",
                     json.dumps(web_results, indent=2, default=str),
@@ -345,7 +315,7 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
                 artifacts_output["research.web_results"] = ref
 
             if vector_results:
-                ref = await artifact_svc.store(
+                ref = await ctx.artifact_service.store(
                     "research",
                     "vector_results.json",
                     json.dumps(vector_results, indent=2, default=str),
@@ -354,7 +324,7 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
                 artifacts_output["research.vector_results"] = ref
 
             if graph_results:
-                ref = await artifact_svc.store(
+                ref = await ctx.artifact_service.store(
                     "research",
                     "graph_results.json",
                     json.dumps(graph_results, indent=2, default=str),
@@ -363,7 +333,7 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
                 artifacts_output["research.graph_results"] = ref
 
             # Store full findings
-            ref = await artifact_svc.store(
+            ref = await ctx.artifact_service.store(
                 "research",
                 "full_findings.json",
                 json.dumps(findings, indent=2, default=str),
@@ -371,8 +341,7 @@ class DispatchResearchNode(SubgraphAwareNode[ResearchSubgraphState]):
             )
             artifacts_output["research.full_findings"] = ref
 
-        tokens_used: int = get_token_estimator().count_tokens(str(result))
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, str(result), llm_calls=llm_calls)
 
         # Track whether structured data was actually retrieved (vs narrative fallback).
         # When False, the research loop should not iterate — more passes won't help.
@@ -427,13 +396,8 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
         self.step_progress = RESEARCH_NODE_PROGRESS["aggregate"]
 
     async def _execute_step(self, state: ResearchSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
-
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: Any | None = configurable.get("llm")
-        artifact_svc: Any | None = configurable.get("artifact_service")
-        workflow_context: WorkflowContext | None = configurable.get("context")
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         research: ResearchData = state.get("research", {})
 
         # LOG: Research data coming in
@@ -452,7 +416,7 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
         graph_results = research.get("graph_results", [])
 
         # Build aggregation
-        if not llm:
+        if not ctx.llm:
             raise RuntimeError("AggregateNode requires an LLM but none was provided in config.")
 
         # Check for raw findings from dispatch_research (agent may return narrative
@@ -519,15 +483,15 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
 
         context: ContextData = state.get("context", {})
         prompt = self._build_aggregation_prompt(web_results, vector_results, graph_results, context=context)
-        response = await llm.ainvoke(prompt)
+        response = await ctx.llm.ainvoke(prompt)
         raw_content = response.content if hasattr(response, "content") else str(response)
         content: str = str(raw_content) if not isinstance(raw_content, str) else raw_content
         findings_dict, findings_markdown = self._parse_markdown_findings(content)
 
         # Store full aggregation via ArtifactService
         artifacts_output: Dict[str, Any] = {}
-        if artifact_svc and findings_markdown:
-            ref = await artifact_svc.store(
+        if ctx.artifact_service and findings_markdown:
+            ref = await ctx.artifact_service.store(
                 "research",
                 "findings.md",
                 findings_markdown,
@@ -539,7 +503,7 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
         session_id: str | None = state.get("session_id")
         if session_id and findings_markdown:
             try:
-                storage: BlobStorage = workflow_context.blob_storage if workflow_context else BlobStorage.from_env()
+                storage: BlobStorage = ctx.workflow_context.blob_storage if ctx.workflow_context else BlobStorage.from_env()
                 async with get_db_session_ctx() as db_session:
                     doc_repo = DocumentRepository(db_session)
                     assoc_repo = DocumentLinkRepository(db_session)
@@ -583,8 +547,7 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
                 logger.warning("Failed to persist research findings as document: %s", e)
 
         # Decrement budget
-        tokens_used: int = get_token_estimator().count_tokens(findings_markdown)
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, findings_markdown)
 
         return NodeExecutionResult.success(
             output={
@@ -639,14 +602,12 @@ class AggregateNode(SubgraphAwareNode[ResearchSubgraphState]):
 
     def _build_aggregation_prompt(
         self,
-        web_results: list,
-        vector_results: list,
-        graph_results: list,
+        web_results: list[Dict[str, Any]],
+        vector_results: list[Dict[str, Any]],
+        graph_results: list[Dict[str, Any]],
         context: ContextData | None = None,
     ) -> str:
         """Build the aggregation prompt with research results and spec context."""
-        from graph_kb_api.flows.v3.utils.token_estimation import truncate_to_tokens
-
         prompt: str = get_agent_prompt_manager().get_prompt("research_aggregate", subdir="nodes")
         context_parts = [prompt]
 
@@ -694,31 +655,24 @@ class GapCheckNode(SubgraphAwareNode[ResearchSubgraphState]):
         self.step_progress: int | float = RESEARCH_NODE_PROGRESS["gap_check"]
 
     async def _execute_step(self, state: ResearchSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         research: ResearchData = state.get("research", {})
         context: ContextData = state.get("context", {})
 
         BudgetGuard.check(budget)
 
         findings = research.get("findings", {})
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        session_id = state.get("session_id", "")
-        client_id = configurable.get("client_id")
 
         gaps = []
 
-        llm = configurable.get("llm")
-        if not llm:
-            raise RuntimeError("GapCheckNode requires an LLM but none was provided in config.")
-
         agent = GapAnalysisAgent()
-        workflow_context = configurable.get("context")
-        if not workflow_context:
+        if not ctx.workflow_context:
             raise RuntimeError("GapCheckNode requires a workflow_context but none was provided in config.")
 
         agent_task: AgentTask = {
             "description": "Research gap analysis",
-            "task_id": f"gap_check_{session_id}_{uuid.uuid4().hex[:8]}",
+            "task_id": f"gap_check_{ctx.session_id}_{uuid.uuid4().hex[:8]}",
             "specification": {
                 "spec_name": context.get("spec_name", ""),
                 "user_explanation": context.get("user_explanation", ""),
@@ -731,7 +685,7 @@ class GapCheckNode(SubgraphAwareNode[ResearchSubgraphState]):
             },
         }
 
-        result: AgentResult = await agent.execute(task=agent_task, state={}, workflow_context=workflow_context)
+        result: AgentResult = await agent.execute(task=agent_task, state={}, workflow_context=ctx.workflow_context)
 
         # Convert agent gaps to node format
         for gap in result.get("gaps", []):
@@ -785,18 +739,18 @@ class GapCheckNode(SubgraphAwareNode[ResearchSubgraphState]):
         )
         try:
             await emit_phase_progress(
-                session_id=session_id,
+                session_id=ctx.session_id,
                 phase="research",
                 step="gap_check",
                 message=f"Gap analysis iteration {iteration}: {len(gaps)} gaps found",
                 progress_pct=0.70,
-                client_id=client_id,
+                client_id=ctx.client_id,
                 agent_content=gap_message,
             )
         except Exception as e:
             logger.warning(f"GapCheckNode emit_phase_progress failed: {e}")
 
-        new_budget = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, str(result))
 
         return NodeExecutionResult.success(
             output={
@@ -827,14 +781,9 @@ class ConfidenceGateNode(SubgraphAwareNode[ResearchSubgraphState]):
         self.step_progress = RESEARCH_NODE_PROGRESS["confidence_gate"]
 
     async def _execute_step(self, state: ResearchSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
-
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm = configurable.get("llm")
-        budget: BudgetState = state.get("budget", {})
-
-        if not llm:
-            raise RuntimeError("ConfidenceGateNode requires an LLM but none was provided in config.")
+        ctx = self._unpack(state, config)
+        llm = ctx.require_llm
+        budget: BudgetState = ctx.budget
 
         research: ResearchData = state.get("research", {})
         context: ContextData = state.get("context", {})
@@ -847,16 +796,15 @@ class ConfidenceGateNode(SubgraphAwareNode[ResearchSubgraphState]):
         BudgetGuard.check(budget)
 
         confidence, justification = await self._llm_evaluate_confidence(llm, context, findings_dict, gaps, risks)
-        tokens_used: int = get_token_estimator().count_tokens(justification)
 
         logger.info("ConfidenceGateNode: LLM confidence=%.2f", confidence)
 
         # Check thresholds
         confidence_sufficient: bool = confidence >= self.CONFIDENCE_THRESHOLD
         max_iterations_reached = iteration_count >= self.MAX_ITERATIONS
-        can_proceed: Literal[True] | Any = confidence_sufficient or max_iterations_reached
+        can_proceed: bool = confidence_sufficient or max_iterations_reached
 
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, justification)
 
         output: Dict[str, Any] = {
             "research": {
@@ -878,11 +826,11 @@ class ConfidenceGateNode(SubgraphAwareNode[ResearchSubgraphState]):
 
     @staticmethod
     async def _llm_evaluate_confidence(
-        llm: Any,
+        llm: LLMService,
         context: ContextData,
         findings: Dict[str, Any],
-        gaps: list,
-        risks: list,
+        gaps: list[Dict[str, Any]],
+        risks: list[Dict[str, Any]],
     ) -> tuple[float, str]:
         """Use LLM to evaluate research confidence.
 
@@ -942,12 +890,16 @@ class ConfidenceGateNode(SubgraphAwareNode[ResearchSubgraphState]):
         return score, justification
 
 
-class ResearchApprovalNode(SubgraphAwareNode[ResearchSubgraphState]):
+class ResearchApprovalNode(BaseApprovalNode[ResearchSubgraphState]):
     """Approval gate for research phase completion.
 
     Presents research summary to user for approval before proceeding
-    to planning phase. Uses interrupt() for user confirmation.
+    to planning phase. Extends BaseApprovalNode with research-specific hooks.
+
+    Requirements: 6.3, 6.5
     """
+
+    phase_data_key = "research"
 
     def __init__(self) -> None:
         super().__init__(node_name="research_approval")
@@ -955,22 +907,20 @@ class ResearchApprovalNode(SubgraphAwareNode[ResearchSubgraphState]):
         self.step_name = "approval"
         self.step_progress = RESEARCH_NODE_PROGRESS["approval"]
 
-    async def _execute_step(self, state: ResearchSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
+    def _build_summary(self, state: ResearchSubgraphState) -> dict[str, Any]:
         research: ResearchData = state.get("research", {})
         context: ContextData = state.get("context", {})
         findings = research.get("findings", {})
 
-        # Build approval summary with rich findings
         all_gaps = research.get("gaps", [])
-        sources_used: list = findings.get("sources_used", [])
-        key_insights: list = findings.get("key_insights", [])
+        sources_used: list[str] = findings.get("sources_used", [])
+        key_insights: list[str] = findings.get("key_insights", [])
         summary = {
             "spec_name": context.get("spec_name", "Unknown"),
             "confidence_score": research.get("confidence_score", findings.get("confidence", 0.5)),
             "sources_used": sources_used,
             "key_insights": key_insights[:5],
             "gaps_remaining": len(all_gaps),
-            # Enriched fields for frontend display
             "total_gaps_detected": len(all_gaps),
             "all_gaps": [
                 {
@@ -990,77 +940,62 @@ class ResearchApprovalNode(SubgraphAwareNode[ResearchSubgraphState]):
             summary["gaps_remaining"],
             len(sources_used),
         )
+        return summary
 
-        # Request user approval via interrupt
-        context_items: dict[str, Any] = await self._load_context_items(state.get("session_id"), research, context)
-        payload: ApprovalInterruptPayload = {
-            "type": "approval",
-            "phase": "research",
-            "step": "approval",
-            "summary": summary,
-            "message": (
-                f"Research complete with {summary['confidence_score']:.0%} confidence. Approve to proceed to planning?"
-            ),
-            "options": [
-                {"id": "approve", "label": "Approve & Continue"},
-                {"id": "request_more", "label": "Request More Research"},
-                {"id": "reject", "label": "Reject & Restart"},
-            ],
-            "artifacts": self._serialize_artifacts(state["artifacts"]),
-            "context_items": context_items,
-        }
-        approval_response: Dict[str, Any] = interrupt(payload)
+    def _get_approval_options(self) -> list[InterruptOption]:
+        return [
+            {"id": "approve", "label": "Approve & Continue"},
+            {"id": "request_more", "label": "Request More Research"},
+            {"id": "reject", "label": "Reject & Restart"},
+        ]
 
-        # Handle approval response
-        decision = approval_response.get("decision", "approve")
-        feedback = approval_response.get("feedback", "")
+    def _get_approval_message(self, summary: dict[str, Any]) -> str:
+        return (
+            f"Research complete with {summary['confidence_score']:.0%} confidence. "
+            f"Approve to proceed to planning?"
+        )
 
-        output: Dict[str, Any] = {
+    def _process_approve(self, state: ResearchSubgraphState, feedback: str) -> dict[str, Any]:
+        research: ResearchData = state.get("research", {})
+        return {
             "research": {
                 **research,
-                "approved": decision == "approve",
-                "approval_decision": decision,
+                "approved": True,
+                "approval_decision": "approve",
                 "approval_feedback": feedback,
                 "review_feedback": feedback,
-            }
+            },
         }
 
-        if decision == "approve":
-            output["completed_phases"] = {"research": True}
-            # Store fingerprint for dirty-detection on backward navigation
-            fp_hash: str = FingerprintTracker.compute_phase_data_fingerprint("research", output["research"])
-            existing_fps = state.get("fingerprints", {})
-            output["fingerprints"] = FingerprintTracker.update_fingerprint(
-                existing_fps,
-                "research",
-                fp_hash,
-                [],
-            )
-            # Emit plan.phase.complete (GAP 9)
-            try:
-                from graph_kb_api.websocket.plan_events import emit_phase_complete
+    def _process_revise(self, state: ResearchSubgraphState, feedback: str) -> dict[str, Any]:
+        research: ResearchData = state.get("research", {})
+        return {
+            "research": {
+                **research,
+                "approved": False,
+                "approval_decision": "request_more",
+                "approval_feedback": feedback,
+                "review_feedback": feedback,
+                "needs_more_research": True,
+            },
+        }
 
-                session_id = state.get("session_id", "")
-                client_id = cast(ThreadConfigurable, config.get("configurable", {})).get("client_id")
-                await emit_phase_complete(
-                    session_id=session_id,
-                    phase="research",
-                    result_summary=f"Research approved with {summary['confidence_score']:.0%} confidence",
-                    duration_s=0.0,
-                    client_id=client_id,
-                )
-            except Exception:
-                pass  # fire-and-forget
-        elif decision == "request_more":
-            output["research"]["needs_more_research"] = True
-        elif decision == "reject":
-            output["research"]["rejected"] = True
-            output["workflow_status"] = "rejected"
-            output["paused_phase"] = "research"
-            output["error"] = {
-                "message": "Research was rejected by user.",
-                "code": "REJECTED",
-                "phase": "research",
-            }
-
-        return NodeExecutionResult.success(output=output)
+    def _process_reject(self, state: ResearchSubgraphState, feedback: str) -> dict[str, Any]:
+        research: ResearchData = state.get("research", {})
+        return {
+            "research": {
+                **research,
+                "approved": False,
+                "approval_decision": "reject",
+                "approval_feedback": feedback,
+                "review_feedback": feedback,
+                "rejected": True,
+            },
+            "workflow_status": "rejected",
+            "paused_phase": "research",
+            "error": WorkflowError(
+                message="Research was rejected by user.",
+                code="REJECTED",
+                phase="research",
+            ),
+        }

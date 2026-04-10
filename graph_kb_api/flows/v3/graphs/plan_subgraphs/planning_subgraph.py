@@ -15,8 +15,8 @@ from typing import Literal
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from graph_kb_api.flows.v3.graphs.base_workflow_engine import BaseWorkflowEngine
-from graph_kb_api.flows.v3.nodes.plan_nodes import (
+from graph_kb_api.flows.v3.graphs.plan_subgraphs.plan_subgraph_base import PlanSubgraph
+from graph_kb_api.flows.v3.nodes.plan.planning_nodes import (
     AlignNode,
     AssignNode,
     DecomposeNode,
@@ -32,10 +32,10 @@ from graph_kb_api.utils.enhanced_logger import EnhancedLogger
 logger = EnhancedLogger(__name__)
 
 
-class PlanningSubgraph(BaseWorkflowEngine):
+class PlanningSubgraph(PlanSubgraph):
     """Roadmap + decompose + agent/tool assignment.
 
-    Extends BaseWorkflowEngine to build a LangGraph StateGraph that handles:
+    Extends PlanSubgraph to build a LangGraph StateGraph that handles:
       - Generating a high-level roadmap
       - Assessing feasibility
       - Decomposing into a task DAG
@@ -50,18 +50,7 @@ class PlanningSubgraph(BaseWorkflowEngine):
     """
 
     def __init__(self, workflow_context: WorkflowContext) -> None:
-        super().__init__(
-            workflow_context=workflow_context,
-            max_iterations=1,
-            workflow_name="planning_subgraph",
-            use_default_checkpointer=False,
-        )
-
-    # ── BaseWorkflowEngine Implementation ─────────────────────────────
-
-    def _initialize_tools(self) -> list:
-        """No standalone tools — nodes handle their own tooling."""
-        return []
+        super().__init__(workflow_context, "planning_subgraph")
 
     def _initialize_nodes(self) -> None:
         """Instantiate planning subgraph nodes."""

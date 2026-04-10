@@ -8,7 +8,7 @@ each draft.
 
 from typing import Any, Dict, Mapping
 
-from graph_kb_api.core.llm import LLMService
+from graph_kb_api.core.llm import LLMService, LLMQuotaExhaustedError
 from graph_kb_api.flows.v3.agents.base_agent import AgentCapability, BaseAgent
 from graph_kb_api.flows.v3.agents.personas import get_agent_prompt_manager
 from graph_kb_api.flows.v3.models.types import AgentResult, AgentTask, doc_extractor_capability
@@ -86,4 +86,7 @@ class DocExtractorAgent(BaseAgent):
                 return response.content
             return str(response)
         except Exception as exc:
+            # Let quota errors propagate without wrapping
+            if isinstance(exc, LLMQuotaExhaustedError):
+                raise
             return f"[Draft generation failed: {exc}]\n\n{user_prompt}"

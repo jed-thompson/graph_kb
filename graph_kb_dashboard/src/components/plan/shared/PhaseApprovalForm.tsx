@@ -1,24 +1,21 @@
 'use client';
 
 import React, { useState } from 'react';
-import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
-import { Textarea } from '@/components/ui/textarea';
-import { Loader2, ChevronDown, ChevronUp, Upload, X, FileText, MessageSquarePlus, AlertTriangle, Coins, Eye, CheckCircle2, XCircle } from 'lucide-react';
-import type { PlanPhaseId, DocumentManifestEntry } from '@/lib/store/planStore';
-import { useFileUpload, ACCEPTED_EXTENSIONS } from '@/hooks/useFileUpload';
+import { AlertTriangle, Coins, CheckCircle2, XCircle, ChevronDown, ChevronUp } from 'lucide-react';
+import type { PlanPhaseId } from '@/lib/store/planStore';
+import { useFileUpload } from '@/hooks/useFileUpload';
 import { getWebSocket } from '@/lib/api/websocket';
-import { MarkdownRenderer } from '@/components/chat/MarkdownRenderer';
-import { PlanDocumentDownload } from '../PlanDocumentDownload';
 import { ResultValueRenderer } from './ResultValueRenderer';
 import { TaskListRenderer } from './TaskListRenderer';
 import { cleanAIText } from '@/lib/utils/cleanAIText';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import type { TaskItem } from '../PlanContext';
 import type { ItemFeedback } from './ArchitectureFeedbackItem';
+import { ApprovalActions } from './ApprovalActions';
+import { ApprovalFeedbackInput } from './ApprovalFeedbackInput';
+import { AssemblyDocumentPreview } from './AssemblyDocumentPreview';
+import { ValidationSummary } from './ValidationSummary';
 
 /** Summary keys to hide from the generic key-value display. */
 const HIDDEN_SUMMARY_KEYS = new Set([
@@ -197,43 +194,7 @@ export function PhaseApprovalForm({ phase, title, description, summary, options,
 
                 {/* Budget exhaustion usage card */}
                 {isBudgetInterrupt && budgetData && (
-                    <div className="bg-amber-50 dark:bg-amber-950/30 rounded-lg p-4 space-y-3 text-sm border border-amber-200/60 dark:border-amber-900/60">
-                        <div className="flex items-center gap-2">
-                            <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-                            <Badge variant="outline" className="text-amber-700 border-amber-400 dark:text-amber-300 dark:border-amber-600 text-xs">
-                                Budget Exhausted
-                            </Badge>
-                        </div>
-
-                        {budgetData.reason && (
-                            <p className="text-xs text-muted-foreground">{cleanAIText(budgetData.reason)}</p>
-                        )}
-
-                        <div className="space-y-2 pt-1">
-                            <div className="flex items-center justify-between gap-3">
-                                <div className="flex items-center gap-2 min-w-0">
-                                    <Coins className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                                    <span className="text-xs text-muted-foreground">LLM Calls</span>
-                                </div>
-                                <span className="text-xs font-medium tabular-nums">
-                                    {budgetData.max_llm_calls - budgetData.remaining_llm_calls}/{budgetData.max_llm_calls}
-                                    <span className="text-muted-foreground ml-1">(100%)</span>
-                                </span>
-                            </div>
-                            <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
-                                <div className="h-full rounded-full bg-red-500" style={{ width: '100%' }} />
-                            </div>
-
-                            {budgetData.max_tokens > 0 && (
-                                <div className="flex items-center justify-between pt-1">
-                                    <span className="text-xs text-muted-foreground">Tokens</span>
-                                    <span className="text-xs font-medium tabular-nums">
-                                        {(budgetData.tokens_used / 1000).toFixed(1)}k / {(budgetData.max_tokens / 1000).toFixed(0)}k
-                                    </span>
-                                </div>
-                            )}
-                        </div>
-                    </div>
+                    <BudgetExhaustionCard budgetData={budgetData} />
                 )}
 
                 {filteredSummary && Object.keys(filteredSummary).length > 0 && (
@@ -279,351 +240,81 @@ export function PhaseApprovalForm({ phase, title, description, summary, options,
                 {/* Assembly document preview + download */}
                 {assemblyPreview}
 
-                {/* Inline context toggle */}
-                <div className="border-t pt-3">
-                    <button
-                        type="button"
-                        onClick={() => setShowContextInput(!showContextInput)}
-                        className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors w-full"
-                    >
-                        <MessageSquarePlus className="h-4 w-4" />
-                        <span>Provide Additional Context</span>
-                        {showContextInput
-                            ? <ChevronUp className="h-4 w-4 ml-auto" />
-                            : <ChevronDown className="h-4 w-4 ml-auto" />}
-                    </button>
+                {/* Inline context / feedback input */}
+                <ApprovalFeedbackInput
+                    showContextInput={showContextInput}
+                    onToggleContextInput={() => setShowContextInput(!showContextInput)}
+                    contextText={contextText}
+                    onContextTextChange={setContextText}
+                    uploadedFile={uploadedFile}
+                    isUploading={isUploading}
+                    fileInputRef={fileInputRef}
+                    onFileInputChange={handleInputChange}
+                    onRemoveFile={removeFile}
+                />
 
-                    {showContextInput && (
-                        <div className="mt-3 space-y-3 animate-in fade-in slide-in-from-top-1 duration-200">
-                            <Textarea
-                                placeholder="Add context, requirements, or reference material to help the next phase..."
-                                value={contextText}
-                                onChange={(e) => setContextText(e.target.value)}
-                                className="min-h-[80px] resize-y"
-                            />
-                            <input
-                                ref={fileInputRef}
-                                type="file"
-                                accept={ACCEPTED_EXTENSIONS}
-                                onChange={handleInputChange}
-                                className="hidden"
-                            />
-                            {uploadedFile ? (
-                                <div className="border border-border rounded-md p-2 flex items-center gap-2 bg-muted/30">
-                                    <FileText className="h-4 w-4 text-green-500 shrink-0" />
-                                    <span className="text-xs font-medium truncate">{uploadedFile.filename}</span>
-                                    <Button
-                                        variant="ghost"
-                                        size="sm"
-                                        className="h-6 w-6 p-0 ml-auto shrink-0"
-                                        onClick={() => removeFile(uploadedFile.id)}
-                                    >
-                                        <X className="h-3 w-3" />
-                                    </Button>
-                                </div>
-                            ) : (
-                                <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    className="text-xs"
-                                    disabled={isUploading}
-                                    onClick={() => fileInputRef.current?.click()}
-                                >
-                                    {isUploading
-                                        ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
-                                        : <Upload className="h-3.5 w-3.5 mr-1.5" />}
-                                    {isUploading ? 'Uploading...' : 'Attach File'}
-                                </Button>
-                            )}
-                        </div>
-                    )}
-                </div>
-
-                {/* Budget increase inline form */}
-                {isBudgetInterrupt && showBudgetForm ? (
-                    <div className="border-t pt-4 space-y-3 animate-in fade-in slide-in-from-top-1 duration-200">
-                        <p className="text-sm font-medium">Set new budget limits</p>
-                        <div className="flex flex-wrap items-end gap-3">
-                            <div className="flex items-center gap-1.5">
-                                <Label htmlFor="budget-calls" className="text-xs">Max LLM Calls:</Label>
-                                <Input
-                                    id="budget-calls"
-                                    type="number"
-                                    value={newMaxCalls}
-                                    onChange={(e) => setNewMaxCalls(e.target.value)}
-                                    placeholder={String(defaultMaxCalls)}
-                                    className="w-24 h-8 text-xs"
-                                    min={budgetData ? budgetData.max_llm_calls + 1 : 1}
-                                />
-                            </div>
-                            {budgetData && budgetData.max_tokens > 0 && (
-                                <div className="flex items-center gap-1.5">
-                                    <Label htmlFor="budget-tokens" className="text-xs">Max Tokens:</Label>
-                                    <Input
-                                        id="budget-tokens"
-                                        type="number"
-                                        value={newMaxTokens}
-                                        onChange={(e) => setNewMaxTokens(e.target.value)}
-                                        placeholder={String(defaultMaxTokens)}
-                                        className="w-28 h-8 text-xs"
-                                        min={budgetData.max_tokens + 1}
-                                    />
-                                </div>
-                            )}
-                        </div>
-                        <p className="text-xs text-muted-foreground">
-                            Leave blank to use defaults (+50%: {defaultMaxCalls} calls{budgetData && budgetData.max_tokens > 0 ? `, ${defaultMaxTokens} tokens` : ''})
-                        </p>
-                        <div className="flex flex-wrap gap-3">
-                            <Button
-                                onClick={handleBudgetConfirm}
-                                disabled={isSubmitting !== null}
-                            >
-                                {isSubmitting === 'increase_budget' && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                                Confirm & Continue
-                            </Button>
-                            <Button
-                                variant="ghost"
-                                onClick={() => setShowBudgetForm(false)}
-                                disabled={isSubmitting !== null}
-                            >
-                                Cancel
-                            </Button>
-                        </div>
-                    </div>
-                ) : (
-                    <div className="flex flex-wrap gap-3 pt-4 border-t">
-                        {options && options.length > 0 ? options.map(opt => {
-                            const isPrimary = opt.id === 'approve' || opt.label.toLowerCase().includes('approve');
-                            const isBudgetIncrease = isBudgetInterrupt && opt.id === 'increase_budget';
-                            return (
-                                <Button
-                                    key={opt.id}
-                                    onClick={() => {
-                                        if (isBudgetIncrease) {
-                                            setShowBudgetForm(true);
-                                        } else {
-                                            handleOptionSubmit(opt.id);
-                                        }
-                                    }}
-                                    disabled={isSubmitting !== null}
-                                    variant={isPrimary || isBudgetIncrease ? 'default' : 'secondary'}
-                                    className={isPrimary || isBudgetIncrease ? 'min-w-[120px]' : ''}
-                                >
-                                    {isSubmitting === opt.id && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                                    {opt.label}
-                                </Button>
-                            );
-                        }) : (
-                            <Button onClick={() => handleOptionSubmit('approve')} disabled={isSubmitting !== null}>
-                                {isSubmitting === 'approve' && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-                                Approve & Continue
-                            </Button>
-                        )}
-                    </div>
-                )}
+                {/* Approve / reject / revise buttons + budget form */}
+                <ApprovalActions
+                    options={options}
+                    isSubmitting={isSubmitting}
+                    isBudgetInterrupt={isBudgetInterrupt}
+                    budgetData={budgetData}
+                    showBudgetForm={showBudgetForm}
+                    onShowBudgetForm={setShowBudgetForm}
+                    onOptionSubmit={handleOptionSubmit}
+                    onBudgetConfirm={handleBudgetConfirm}
+                    newMaxCalls={newMaxCalls}
+                    onNewMaxCallsChange={setNewMaxCalls}
+                    newMaxTokens={newMaxTokens}
+                    onNewMaxTokensChange={setNewMaxTokens}
+                    defaultMaxCalls={defaultMaxCalls}
+                    defaultMaxTokens={defaultMaxTokens}
+                />
             </Card>
         </div>
     );
 }
 
-// ── Validation Summary ───────────────────────────────────────────────
+// ── Budget Exhaustion Card (private to this module) ──────────────────
 
-interface ValidationSummaryProps {
-    isValid: boolean;
-    errors?: Array<Record<string, unknown>> | string[];
-    warnings?: Array<Record<string, unknown>> | string[];
-    errorsCount: number;
-    warningsCount: number;
-}
-
-function ValidationSummary({ isValid, errors, warnings, errorsCount, warningsCount }: ValidationSummaryProps) {
-    const actualErrorCount = errors?.length ?? errorsCount;
-    const actualWarningCount = warnings?.length ?? warningsCount;
-    const hasErrorDetails = errors && errors.length > 0;
-    const hasWarningDetails = warnings && warnings.length > 0;
-
-    const [errorsExpanded, setErrorsExpanded] = useState(actualErrorCount > 0);
-    const [warningsExpanded, setWarningsExpanded] = useState(false);
-
-    const formatItem = (item: Record<string, unknown> | string): string => {
-        if (typeof item === 'string') return item;
-        return (item.message as string) || (item.description as string) || (item.rule as string) || JSON.stringify(item);
-    };
-
-    const sectionOf = (item: Record<string, unknown> | string): string | null => {
-        if (typeof item === 'string') return null;
-        return (item.section as string) || (item.location as string) || null;
-    };
-
+function BudgetExhaustionCard({ budgetData }: { budgetData: BudgetSummary }) {
     return (
-        <div className="space-y-2">
-            {/* Status badge */}
+        <div className="bg-amber-50 dark:bg-amber-950/30 rounded-lg p-4 space-y-3 text-sm border border-amber-200/60 dark:border-amber-900/60">
             <div className="flex items-center gap-2">
-                {isValid
-                    ? <CheckCircle2 className="h-4 w-4 text-green-500" />
-                    : <XCircle className="h-4 w-4 text-red-500" />}
-                <span className={`text-sm font-medium ${isValid ? 'text-green-700 dark:text-green-400' : 'text-red-700 dark:text-red-400'}`}>
-                    {isValid ? 'Validation passed' : 'Validation issues found'}
-                </span>
+                <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                <Badge variant="outline" className="text-amber-700 border-amber-400 dark:text-amber-300 dark:border-amber-600 text-xs">
+                    Budget Exhausted
+                </Badge>
             </div>
 
-            {/* Errors */}
-            {actualErrorCount > 0 && (
-                <div className="rounded-lg border border-red-200 dark:border-red-900 overflow-hidden">
-                    <button
-                        type="button"
-                        onClick={() => hasErrorDetails && setErrorsExpanded(!errorsExpanded)}
-                        className={`w-full flex items-center gap-2 px-3 py-2 text-xs font-medium bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-400 ${hasErrorDetails ? 'hover:bg-red-100 dark:hover:bg-red-950/50 cursor-pointer' : 'cursor-default'} transition-colors`}
-                    >
-                        <AlertTriangle className="h-3.5 w-3.5" />
-                        <span>{actualErrorCount} {actualErrorCount === 1 ? 'error' : 'errors'}</span>
-                        {hasErrorDetails && (
-                            errorsExpanded
-                                ? <ChevronUp className="h-3.5 w-3.5 ml-auto" />
-                                : <ChevronDown className="h-3.5 w-3.5 ml-auto" />
-                        )}
-                        {!hasErrorDetails && (
-                            <span className="ml-auto text-[10px] text-red-400">re-run to see details</span>
-                        )}
-                    </button>
-                    {errorsExpanded && hasErrorDetails && (
-                        <ul className="px-3 py-2 space-y-1.5 text-xs">
-                            {errors.map((err, i) => (
-                                <li key={i} className="flex gap-2">
-                                    <span className="text-red-400 shrink-0 pt-0.5">•</span>
-                                    <div>
-                                        <span className="text-foreground">{formatItem(err)}</span>
-                                        {sectionOf(err) && (
-                                            <span className="text-muted-foreground ml-1">({sectionOf(err)})</span>
-                                        )}
-                                    </div>
-                                </li>
-                            ))}
-                        </ul>
-                    )}
+            {budgetData.reason && (
+                <p className="text-xs text-muted-foreground">{cleanAIText(budgetData.reason)}</p>
+            )}
+
+            <div className="space-y-2 pt-1">
+                <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 min-w-0">
+                        <Coins className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                        <span className="text-xs text-muted-foreground">LLM Calls</span>
+                    </div>
+                    <span className="text-xs font-medium tabular-nums">
+                        {budgetData.max_llm_calls - budgetData.remaining_llm_calls}/{budgetData.max_llm_calls}
+                        <span className="text-muted-foreground ml-1">(100%)</span>
+                    </span>
                 </div>
-            )}
-
-            {/* Warnings */}
-            {actualWarningCount > 0 && (
-                <div className="rounded-lg border border-amber-200 dark:border-amber-900 overflow-hidden">
-                    <button
-                        type="button"
-                        onClick={() => hasWarningDetails && setWarningsExpanded(!warningsExpanded)}
-                        className={`w-full flex items-center gap-2 px-3 py-2 text-xs font-medium bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 ${hasWarningDetails ? 'hover:bg-amber-100 dark:hover:bg-amber-950/50 cursor-pointer' : 'cursor-default'} transition-colors`}
-                    >
-                        <AlertTriangle className="h-3.5 w-3.5" />
-                        <span>{actualWarningCount} {actualWarningCount === 1 ? 'warning' : 'warnings'}</span>
-                        {hasWarningDetails && (
-                            warningsExpanded
-                                ? <ChevronUp className="h-3.5 w-3.5 ml-auto" />
-                                : <ChevronDown className="h-3.5 w-3.5 ml-auto" />
-                        )}
-                        {!hasWarningDetails && (
-                            <span className="ml-auto text-[10px] text-amber-400">re-run to see details</span>
-                        )}
-                    </button>
-                    {warningsExpanded && hasWarningDetails && (
-                        <ul className="px-3 py-2 space-y-1.5 text-xs">
-                            {warnings.map((warn, i) => (
-                                <li key={i} className="flex gap-2">
-                                    <span className="text-amber-400 shrink-0 pt-0.5">•</span>
-                                    <div>
-                                        <span className="text-foreground">{formatItem(warn)}</span>
-                                        {sectionOf(warn) && (
-                                            <span className="text-muted-foreground ml-1">({sectionOf(warn)})</span>
-                                        )}
-                                    </div>
-                                </li>
-                            ))}
-                        </ul>
-                    )}
+                <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
+                    <div className="h-full rounded-full bg-red-500" style={{ width: '100%' }} />
                 </div>
-            )}
-        </div>
-    );
-}
 
-// ── Assembly Document Preview ────────────────────────────────────────
-
-interface AssemblyDocumentPreviewProps {
-    documentPreview?: string;
-    manifestEntries?: Array<Record<string, unknown>>;
-    specName?: string;
-    sessionId?: string | null;
-}
-
-function AssemblyDocumentPreview({
-    documentPreview,
-    manifestEntries,
-    specName,
-    sessionId,
-}: AssemblyDocumentPreviewProps) {
-    const [previewOpen, setPreviewOpen] = useState(false);
-
-    // Unwrap JSON envelope if the stored preview is a JSON wrapper
-    const resolvedPreview = React.useMemo(() => {
-        if (!documentPreview) return documentPreview;
-        const trimmed = documentPreview.trim();
-        if (!trimmed.startsWith('{')) return documentPreview;
-        try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed && typeof parsed === 'object' && typeof parsed.assembled_document === 'string' && parsed.assembled_document.length > 50) {
-                return parsed.assembled_document as string;
-            }
-        } catch { /* not JSON */ }
-        return documentPreview;
-    }, [documentPreview]);
-
-    // Convert backend manifest entries to frontend DocumentManifestEntry format
-    const downloadEntries: DocumentManifestEntry[] | undefined = manifestEntries?.map(e => ({
-        taskId: (e.task_id as string) || '',
-        specSection: (e.spec_section as string) || '',
-        filename: `${(e.spec_section as string) || (e.task_id as string) || 'section'}.md`,
-        status: (e.status as DocumentManifestEntry['status']) || 'draft',
-        tokenCount: (e.token_count as number) || 0,
-        downloadUrl: (e.download_url as string) || '',
-        errorMessage: e.error_message as string | undefined,
-    }));
-
-    return (
-        <div className="space-y-3 border-t pt-4">
-            {/* Section downloads (always visible) */}
-            {downloadEntries && downloadEntries.length > 0 && (
-                <PlanDocumentDownload
-                    sessionId={sessionId}
-                    manifestEntries={downloadEntries}
-                    specName={specName}
-                    isPreview
-                />
-            )}
-
-            {/* Full document preview — opens as overlay */}
-            {resolvedPreview && (
-                <>
-                    <button
-                        type="button"
-                        onClick={() => setPreviewOpen(true)}
-                        className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-foreground/80 transition-colors w-full border-t pt-3"
-                    >
-                        <Eye className="h-4 w-4" />
-                        <span>Full Document Preview</span>
-                    </button>
-
-                    <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
-                        <DialogContent className="max-w-4xl w-[90vw] h-[85vh] flex flex-col p-0">
-                            <DialogHeader className="px-6 pt-6 pb-3 border-b shrink-0">
-                                <DialogTitle>{specName || 'Document Preview'}</DialogTitle>
-                            </DialogHeader>
-                            <div className="flex-1 overflow-y-auto px-6 py-4">
-                                <MarkdownRenderer content={resolvedPreview} />
-                            </div>
-                        </DialogContent>
-                    </Dialog>
-                </>
-            )}
+                {budgetData.max_tokens > 0 && (
+                    <div className="flex items-center justify-between pt-1">
+                        <span className="text-xs text-muted-foreground">Tokens</span>
+                        <span className="text-xs font-medium tabular-nums">
+                            {(budgetData.tokens_used / 1000).toFixed(1)}k / {(budgetData.max_tokens / 1000).toFixed(0)}k
+                        </span>
+                    </div>
+                )}
+            </div>
         </div>
     );
 }

@@ -4,13 +4,15 @@ import { createContext, useContext, useState, useCallback, useEffect, ReactNode 
 import type { PlanPhaseId } from '@/lib/store/planStore';
 import { usePlanStore } from '@/lib/store/planStore';
 import type { PhaseField, PhaseStatusValue, PlanArtifactManifestEntry } from '@shared/websocket-events';
+import type { TaskState as SharedTaskState, PhaseStatus as SharedPhaseStatus } from '@shared/plan-types';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /** Re-export shared types for plan components */
-export type PhaseStatus = PhaseStatusValue;
+export type PhaseStatus = SharedPhaseStatus;
+export type TaskState = SharedTaskState;
 export type { GateType } from '@/types/workflow';
 import type { GateType } from '@/types/workflow';
 
@@ -27,24 +29,6 @@ export interface TaskItem {
     agent_type: string;
     priority: string;
     dependencies: string[];
-}
-
-export interface TaskState {
-    id: string;
-    name: string;
-    status: 'pending' | 'in_progress' | 'critiquing' | 'complete' | 'failed';
-    priority?: string;
-    dependencies?: string[];
-    events: Array<{ timestamp: number; message: string }>;
-    iterationCount?: number;
-    /** LLM-generated content for this task, captured from agent_content progress events */
-    agentContent?: string;
-    /** Task-specific spec section heading, preserved across resume/reconnect */
-    specSection?: string | null;
-    /** Truncated source-section content shown in the task context panel */
-    specSectionContent?: string | null;
-    /** Task-specific research summary shown in the task context panel */
-    researchSummary?: string | null;
 }
 
 export interface PlanPhaseInfo {

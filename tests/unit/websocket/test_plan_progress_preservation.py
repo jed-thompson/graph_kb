@@ -45,10 +45,11 @@ _prefilled_st = st.dictionaries(
 
 
 class TestConfigServicesPreservation:
-    """Preservation: get_config_with_services always injects artifact_service
-    and llm, and pre-existing keys in configurable are preserved.
+    """Preservation: get_config_with_services auto-injects all non-None
+    WorkflowContext fields, and pre-existing keys in configurable are preserved
+    (unless they share a name with a non-None WorkflowContext field).
 
-    **Validates: Requirements 3.3**
+    **Validates: Requirements 3.3, 14.5**
     """
 
     @given(
@@ -59,10 +60,10 @@ class TestConfigServicesPreservation:
     )
     @settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
     def test_config_always_contains_artifact_service_and_llm(self, pre_existing, thread_id):
-        """For all base configs, result always contains artifact_service and llm,
-        and pre-existing keys survive.
+        """For all base configs, result always contains non-None WorkflowContext fields,
+        and pre-existing keys survive (unless overridden by a non-None field).
 
-        **Validates: Requirements 3.3**
+        **Validates: Requirements 3.3, 14.5**
         """
         mock_artifact = MagicMock(name="artifact_service")
         mock_llm = MagicMock(name="llm")
@@ -74,6 +75,8 @@ class TestConfigServicesPreservation:
             from graph_kb_api.flows.v3.graphs.plan_engine import PlanEngine
             from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
 
+            import dataclasses
+
             workflow_context = WorkflowContext(
                 llm=mock_llm,
                 app_context=None,
@@ -82,6 +85,13 @@ class TestConfigServicesPreservation:
                 checkpointer=MagicMock(),
             )
             engine = PlanEngine(workflow_context)
+
+            # Collect names of non-None WorkflowContext fields (these will be injected)
+            injected_field_names = {
+                f.name
+                for f in dataclasses.fields(workflow_context)
+                if getattr(workflow_context, f.name) is not None
+            }
 
             base_configurable = {"thread_id": thread_id}
             base_configurable.update(pre_existing)
@@ -95,8 +105,9 @@ class TestConfigServicesPreservation:
             assert "llm" in configurable, "llm missing"
             assert configurable["llm"] is mock_llm
             assert configurable["thread_id"] == thread_id, "thread_id overwritten"
+            # Pre-existing keys survive unless they collide with an injected field
             for key, value in pre_existing.items():
-                if key not in ("artifact_service", "llm"):
+                if key not in injected_field_names and key != "context":
                     assert key in configurable, f"Pre-existing key '{key}' removed"
                     assert configurable[key] == value, f"Pre-existing key '{key}' changed"
 

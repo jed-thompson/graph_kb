@@ -234,7 +234,7 @@ class LocalEmbeddingGenerator(EmbeddingGenerator):
 
             # Update device to match what the cache resolved
             self._device = str(self.__model.device)
-            actual_dims = self.__model.get_sentence_embedding_dimension()
+            actual_dims = self.__model.get_embedding_dimension()
 
             # Set batch size based on resolved device
             device_type = self._device.split(":")[0]  # "cuda:0" -> "cuda"

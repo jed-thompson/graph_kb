@@ -32,6 +32,8 @@ from graph_kb_api.flows.v3.nodes.plan.orchestrate_nodes import (  # noqa: F401
     DispatchNode,
     FetchContextNode,
     GapNode,
+    PRESERVE_AFTER_ORCHESTRATE,
+    PRESERVE_AFTER_RESEARCH,
     ProgressNode,
     PruneAfterOrchestrateNode,
     TaskContextInputNode,
@@ -82,6 +84,8 @@ __all__ = [
     "AlignNode",
     "PlanningApprovalNode",
     # Orchestrate phase
+    "PRESERVE_AFTER_RESEARCH",
+    "PRESERVE_AFTER_ORCHESTRATE",
     "PruneAfterResearchNode",
     "PruneAfterOrchestrateNode",
     "BudgetCheckNode",

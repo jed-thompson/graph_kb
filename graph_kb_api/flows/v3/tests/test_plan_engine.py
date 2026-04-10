@@ -117,26 +117,62 @@ class TestBuildInitialState:
 
 
 class TestConfigWithServices:
-    """Test ArtifactService injection into config."""
+    """Test service auto-injection into config."""
 
     def test_injects_artifact_service(self, workflow_context):
-        """ArtifactService is wired into configurable."""
+        """Non-None services are wired into configurable."""
+        # workflow_context has artifact_service=None, so it should NOT be injected
         engine = PlanEngine(workflow_context)
         config = engine.get_config_with_services()
-        assert config["configurable"]["artifact_service"] is None
+        assert "artifact_service" not in config["configurable"]
+        # llm is non-None, so it should be injected
+        assert config["configurable"]["llm"] is workflow_context.llm
 
     def test_preserves_existing_config(self, workflow_context):
         """Existing config values are preserved."""
         engine = PlanEngine(workflow_context)
         config = engine.get_config_with_services({"configurable": {"thread_id": "abc"}})
         assert config["configurable"]["thread_id"] == "abc"
-        assert config["configurable"]["artifact_service"] is None
+        # llm is non-None, so it should be injected
+        assert config["configurable"]["llm"] is workflow_context.llm
 
     def test_handles_none_config(self, workflow_context):
         """None config creates a new dict."""
         engine = PlanEngine(workflow_context)
         config = engine.get_config_with_services(None)
-        assert config["configurable"]["artifact_service"] is None
+        assert "configurable" in config
+        # context alias is always set
+        assert config["configurable"]["context"] is workflow_context
+
+    def test_context_alias_always_present(self, workflow_context):
+        """Backward-compatible 'context' alias is always set."""
+        engine = PlanEngine(workflow_context)
+        config = engine.get_config_with_services()
+        assert config["configurable"]["context"] is workflow_context
+
+    def test_auto_injects_all_non_none_fields(self):
+        """All non-None WorkflowContext fields are injected."""
+        mock_llm = MagicMock()
+        mock_llm.name = "test-llm"
+        mock_artifact = MagicMock()
+        mock_blob = MagicMock()
+        wc = WorkflowContext(
+            llm=mock_llm,
+            app_context=None,
+            artifact_service=mock_artifact,
+            blob_storage=mock_blob,
+            checkpointer=None,
+        )
+        engine = PlanEngine(wc)
+        config = engine.get_config_with_services()
+        configurable = config["configurable"]
+        assert configurable["llm"] is mock_llm
+        assert configurable["artifact_service"] is mock_artifact
+        assert configurable["blob_storage"] is mock_blob
+        # None fields should not be present
+        assert "app_context" not in configurable
+        assert "checkpointer" not in configurable
+        assert "vector_store" not in configurable
 
 
 class TestFinalizeNodeWiring:

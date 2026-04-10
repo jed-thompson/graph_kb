@@ -49,7 +49,7 @@
     "react-force-graph": "^1.48.2",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^6.22.0",
-    "react-syntax-highlighter": "^10.0.1",
+    "react-syntax-highlighter": "^15.6.1",
     "recharts": "^2.10.0",
     "remark-gfm": "^4.0.1",
     "tailwind-merge": "^2.6.1",

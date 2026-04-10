@@ -33,15 +33,17 @@ from graph_kb_api.flows.v3.graphs.plan_subgraphs.research_subgraph import (
     ResearchSubgraph,
 )
 from graph_kb_api.flows.v3.models.types import ThreadConfigurable
-from graph_kb_api.flows.v3.nodes.plan_nodes import (
-    FinalizeNode,
+from graph_kb_api.flows.v3.nodes.plan.assembly_nodes import FinalizeNode
+from graph_kb_api.flows.v3.nodes.plan.orchestrate_nodes import (
     PruneAfterOrchestrateNode,
     PruneAfterResearchNode,
 )
 from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 from graph_kb_api.flows.v3.services.fingerprint_tracker import FingerprintTracker
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
+from graph_kb_api.flows.v3.state import ContextData
 from graph_kb_api.flows.v3.state.plan_state import CASCADE_MAP, PlanPhase, PlanState
+from graph_kb_api.flows.v3.utils.context_utils import normalize_context_names
 from graph_kb_api.utils.enhanced_logger import EnhancedLogger
 
 logger = EnhancedLogger(__name__)
@@ -293,6 +295,9 @@ class PlanEngine(BaseWorkflowEngine):
         Initializes remaining_llm_calls to max_llm_calls, tokens_used to 0,
         and started_at to current ISO timestamp.
 
+        Normalizes context field names to canonical form so downstream nodes
+        never need dual-name fallback logic.
+
         Args:
             seed: Initial state values from the caller.
 
@@ -300,6 +305,11 @@ class PlanEngine(BaseWorkflowEngine):
             Complete initial state dict with budget, artifacts, and tracking fields.
 
         """
+        # Normalize context field names at the workflow boundary
+        raw_context: ContextData | None = seed.get("context")
+        if raw_context is not None:
+            seed["context"] = normalize_context_names(raw_context)
+
         return {
             **seed,
             "budget": BudgetGuard.build_initial(seed),

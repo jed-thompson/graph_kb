@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import GraphKBWebSocket, { getWebSocket } from '@/lib/api/websocket';
-import { findPlanMessageBySession, getPlanPanelMessageId } from '@/lib/planEventUtils';
+import { findPlanMessageBySession, getPlanPanelMessageId, mergeContextItems } from '@/lib/planEventUtils';
 import { hydratePlanStateSnapshot } from './planStateHydration';
 import type {
   LegacyWSMessage,
@@ -358,7 +358,11 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                   phases: existingPhases,
                   agentContent: undefined,
                   thinkingSteps: (existingMsg.metadata?.planPanel as Record<string, unknown>)?.thinkingSteps || [],
-                  planContextItems: data.context_items || existingPlanPanel?.planContextItems || null,
+                  planContextItems: mergeContextItems(
+                    data.context_items as Record<string, unknown> | null | undefined,
+                    existingPlanPanel?.planContextItems as Record<string, unknown> | null | undefined,
+                    usePlanStore.getState().contextItems,
+                  ),
                   planArtifacts: data.artifacts
                     ? mergeArtifacts(getExistingArtifacts(existingPlanPanel), data.artifacts as Array<{ key: string }>)
                     : getExistingArtifacts(existingPlanPanel) || undefined,
@@ -391,7 +395,11 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                   phases,
                   agentContent: undefined,
                   thinkingSteps: [],
-                  planContextItems: data.context_items || null,
+                  planContextItems: mergeContextItems(
+                    data.context_items as Record<string, unknown> | null | undefined,
+                    null,
+                    usePlanStore.getState().contextItems,
+                  ),
                   planArtifacts: (data.artifacts as Array<{ key: string }>) || undefined,
                   workflowStatus: budgetExhausted ? 'budget_exhausted' : 'running',
                   planTasks: (data.plan_tasks as Record<string, unknown>) || undefined,
@@ -439,6 +447,15 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                 ? { status: 'in_progress', data: { context_items: preservedContextItems } }
                 : { status: 'in_progress' };
               const steps = [{ timestamp: Date.now(), phase, message: `Starting ${phase} phase` }];
+
+              // Resolve planContextItems: prefer existing panel-level value,
+              // then fall back to the form data snapshot in the plan store.
+              const resolvedContextItems = mergeContextItems(
+                null,
+                meta.planContextItems as Record<string, unknown> | null | undefined,
+                usePlanStore.getState().contextItems,
+              );
+
               chatState.updateMessage(panelMsgId, {
                 metadata: {
                   ...existingMsg.metadata,
@@ -449,7 +466,7 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                     agentContent: undefined,
                     thinkingSteps: steps,
                     // Explicitly preserve context items and artifacts at panel level
-                    planContextItems: meta.planContextItems ?? null,
+                    planContextItems: resolvedContextItems,
                     planArtifacts: meta.planArtifacts ?? undefined,
                   },
                   planCurrentPhase: phase,
@@ -811,6 +828,9 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
             usePlanStore.getState().setSessionId(null);
             return;
           }
+          const errorMessage = (data.message as string) || 'Plan workflow encountered an error';
+          // Store the error in the plan store so Message.tsx can read it
+          usePlanStore.getState().setError({ message: errorMessage });
           const existingMsg = getExistingPlanMsg();
           if (existingMsg?.metadata?.planPanel) {
             const meta = existingMsg.metadata.planPanel as Record<string, unknown>;
@@ -824,8 +844,9 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
               metadata: {
                 ...existingMsg.metadata,
                 message_type: 'plan_error',
-                planPanel: { ...meta, phases: existingPhases },
+                planPanel: { ...meta, phases: existingPhases, errorMessage },
                 planPhases: existingPhases,
+                planErrorMessage: errorMessage,
                 timestamp: new Date(),
               },
             });
@@ -850,9 +871,11 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                   phases,
                   agentContent: undefined,
                   thinkingSteps: [],
+                  errorMessage,
                 },
                 planCurrentPhase: phase,
                 planPhases: phases,
+                planErrorMessage: errorMessage,
               },
             });
           }
@@ -898,7 +921,11 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                   ...meta,
                   currentPhase: hydratedState.currentPhase || meta.currentPhase,
                   phases: hydratedState.phases,
-                  planContextItems: hydratedState.contextItems,
+                  planContextItems: mergeContextItems(
+                    hydratedState.contextItems,
+                    meta.planContextItems as Record<string, unknown> | null | undefined,
+                    usePlanStore.getState().contextItems,
+                  ),
                   planArtifacts: data.artifacts
                     ? mergeArtifacts(getExistingArtifacts(meta), data.artifacts as Array<{ key: string }>)
                     : getExistingArtifacts(meta) || undefined,
@@ -939,7 +966,11 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
                   phases: hydratedState.phases,
                   agentContent: undefined,
                   thinkingSteps: [],
-                  planContextItems: hydratedState.contextItems,
+                  planContextItems: mergeContextItems(
+                    hydratedState.contextItems,
+                    null,
+                    usePlanStore.getState().contextItems,
+                  ),
                   planArtifacts: artifacts || undefined,
                   planTasks: (data.plan_tasks as Record<string, unknown>) || undefined,
                   budget: budgetData || undefined,
@@ -989,11 +1020,22 @@ export function WebSocketProvider({ children }: { children: React.ReactNode }) {
       // Re-hydrate plan state after reconnect if a session was active.
       // Guard with _hasHydrated so we don't send stale sessionId before
       // the Zustand persist middleware has finished reading from localStorage.
-      const planStore = usePlanStore.getState();
-      if (planStore._hasHydrated && planStore.sessionId) {
-        console.log('[WebSocketContext] Sending plan.reconnect for session', planStore.sessionId);
-        socket.send({ type: 'plan.reconnect', payload: { session_id: planStore.sessionId } } as unknown as Parameters<typeof socket.send>[0]);
-      }
+      // Also wait for the chat store to hydrate so that plan.state responses
+      // can find/create messages in the correct session.
+      const attemptReconnect = () => {
+        const planStore = usePlanStore.getState();
+        const chatStore = useChatStore.getState();
+        if (!planStore._hasHydrated || !chatStore._hasHydrated) {
+          // Stores not ready yet — retry shortly
+          setTimeout(attemptReconnect, 50);
+          return;
+        }
+        if (planStore.sessionId) {
+          console.log('[WebSocketContext] Sending plan.reconnect for session', planStore.sessionId);
+          socket.send({ type: 'plan.reconnect', payload: { session_id: planStore.sessionId } } as unknown as Parameters<typeof socket.send>[0]);
+        }
+      };
+      attemptReconnect();
     });
     
     const unsubDisconnect = socket.on('disconnected', (data: unknown) => {

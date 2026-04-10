@@ -275,6 +275,7 @@ export interface PlanErrorEvent {
 
 export interface DocumentManifestEntry {
   taskId: string;
+  taskName?: string;
   specSection: string;
   downloadUrl: string;
   status: "draft" | "reviewed" | "final" | "failed" | "error" | "missing";

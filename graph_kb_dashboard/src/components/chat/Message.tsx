@@ -7,6 +7,7 @@ import { PlanPhasePanel } from '@/components/plan/PlanPhasePanel';
 import { PlanPhaseBar } from '@/components/plan/PlanPhaseBar';
 import { BudgetIndicator } from '@/components/plan/BudgetIndicator';
 import { usePlanStore } from '@/lib/store/planStore';
+import { PLAN_PHASES } from '@/lib/store/planStore';
 import { CascadeWarningBanner } from '@/components/plan/CascadeWarningBanner';
 import { PlanDocumentDownload } from '@/components/plan/PlanDocumentDownload';
 import type { PlanPanelMetadata } from '@/components/plan/PlanContext';
@@ -547,7 +548,10 @@ export const Message = memo(function Message({ message, isStreaming }: MessagePr
   const renderPlanContent = () => {
     if (isPlanError) {
       const planError = usePlanStore.getState().error;
-      const errorMessage = planError?.message || message.content || 'Plan workflow encountered an error';
+      const errorMessage = planError?.message
+        || (message.metadata?.planErrorMessage as string)
+        || message.content
+        || 'Plan workflow encountered an error';
       return (
         <div className="flex items-start gap-2 text-red-600 dark:text-red-400">
           <XCircle className="h-4 w-4 mt-0.5 flex-shrink-0" />
@@ -697,14 +701,9 @@ export const Message = memo(function Message({ message, isStreaming }: MessagePr
         phaseStatuses[pid] = (planMeta.phases?.[pid]?.status as 'pending' | 'in_progress' | 'complete' | 'error') || 'pending';
       }
 
-      // Calculate overall progress from completed phases using PHASE_WEIGHTS
-      const PHASE_WEIGHTS: Record<string, number> = { context: 0.05, research: 0.15, planning: 0.10, orchestrate: 0.50, assembly: 0.20 };
-      let overallProgress = 0;
-      for (const [phase, weight] of Object.entries(PHASE_WEIGHTS)) {
-        if (phaseStatuses[phase as PlanPhaseId] === 'complete') {
-          overallProgress += weight;
-        }
-      }
+      // Calculate overall progress from completed phases
+      const completedCount = Object.values(phaseStatuses).filter(s => s === 'complete').length;
+      const overallProgress = completedCount / PLAN_PHASES.length;
 
       // Build promptData from phase data if available, preserving approval options or form fields
       const promptData = phaseData?.data as Record<string, unknown> | undefined;

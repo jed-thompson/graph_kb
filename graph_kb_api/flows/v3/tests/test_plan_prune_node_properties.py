@@ -1,9 +1,9 @@
 """Property-based tests for PruneAfterResearchNode and PruneAfterOrchestrateNode.
 
-Property 15: Prune Node Safety — validates that prune nodes preserve non-pruned
-keys, remove target keys, and never modify artifacts.
+Property 15: Prune Node Safety — validates that prune nodes retain only keys in
+the PRESERVE_KEYS allowlist and prune everything else (safe-by-default).
 
-**Validates: Requirements 18.1, 18.2, 18.3**
+**Validates: Requirements 11.1, 11.2, 11.5**
 """
 
 import pytest
@@ -11,6 +11,8 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from graph_kb_api.flows.v3.nodes.plan_nodes import (
+    PRESERVE_AFTER_ORCHESTRATE,
+    PRESERVE_AFTER_RESEARCH,
     PruneAfterOrchestrateNode,
     PruneAfterResearchNode,
 )
@@ -19,7 +21,6 @@ from graph_kb_api.flows.v3.nodes.plan_nodes import (
 # Strategies
 # ---------------------------------------------------------------------------
 
-# Arbitrary JSON-like values for dict entries
 json_values = st.recursive(
     st.none() | st.booleans() | st.integers() | st.text(max_size=50),
     lambda children: (
@@ -29,25 +30,20 @@ json_values = st.recursive(
     max_leaves=10,
 )
 
-RESEARCH_PRUNE_KEYS = {"web_results", "vector_results", "graph_results"}
-ORCHESTRATE_PRUNE_KEYS = {"critique_history", "iteration_count", "current_task_context"}
-
 
 @st.composite
 def research_state_dict(draw: st.DrawFn) -> dict:
-    """Generate a research sub-dict with arbitrary keys plus optional prune targets."""
-    # Always include some arbitrary non-pruned keys
+    """Generate a research sub-dict with arbitrary keys plus optional preserved keys."""
     extra = draw(
         st.dictionaries(
             st.text(min_size=1, max_size=30).filter(
-                lambda k: k not in RESEARCH_PRUNE_KEYS
+                lambda k: k not in PRESERVE_AFTER_RESEARCH
             ),
             json_values,
             max_size=10,
         )
     )
-    # Optionally include prune-target keys
-    for key in RESEARCH_PRUNE_KEYS:
+    for key in PRESERVE_AFTER_RESEARCH:
         if draw(st.booleans()):
             extra[key] = draw(json_values)
     return extra
@@ -55,17 +51,17 @@ def research_state_dict(draw: st.DrawFn) -> dict:
 
 @st.composite
 def orchestrate_state_dict(draw: st.DrawFn) -> dict:
-    """Generate an orchestrate sub-dict with arbitrary keys plus optional prune targets."""
+    """Generate an orchestrate sub-dict with arbitrary keys plus optional preserved keys."""
     extra = draw(
         st.dictionaries(
             st.text(min_size=1, max_size=30).filter(
-                lambda k: k not in ORCHESTRATE_PRUNE_KEYS
+                lambda k: k not in PRESERVE_AFTER_ORCHESTRATE
             ),
             json_values,
             max_size=10,
         )
     )
-    for key in ORCHESTRATE_PRUNE_KEYS:
+    for key in PRESERVE_AFTER_ORCHESTRATE:
         if draw(st.booleans()):
             extra[key] = draw(json_values)
     return extra
@@ -90,16 +86,16 @@ def artifacts_dict(draw: st.DrawFn) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Property 15.1: Prune research preserves non-pruned keys
+# Property 15.1: Prune research retains only preserved keys
 # ---------------------------------------------------------------------------
 
 
-class TestPruneResearchPreservesNonPrunedKeys:
-    """For any research state dict with arbitrary keys, after pruning, all keys
-    NOT in {web_results, vector_results, graph_results} are preserved with
-    identical values.
+class TestPruneResearchRetainsOnlyPreservedKeys:
+    """For any research state dict, after pruning, only keys in
+    PRESERVE_AFTER_RESEARCH survive with their original values.
 
-    **Validates: Requirements 18.1, 18.2, 18.3**
+    Feature: plan-feature-refactoring, Property 15: Prune Node Safety
+    **Validates: Requirements 11.1, 11.2, 11.5**
     """
 
     @given(research=research_state_dict())
@@ -108,31 +104,32 @@ class TestPruneResearchPreservesNonPrunedKeys:
         suppress_health_check=[HealthCheck.too_slow],
     )
     @pytest.mark.asyncio
-    async def test_non_pruned_keys_preserved(self, research: dict):
+    async def test_preserved_keys_retained(self, research: dict):
         node = PruneAfterResearchNode()
         state = {"research": research}
         result = await node._execute_step(state, {})
         pruned = result.output["research"]
 
         for key, value in research.items():
-            if key not in RESEARCH_PRUNE_KEYS:
-                assert key in pruned, f"Non-pruned key '{key}' was removed"
+            if key in PRESERVE_AFTER_RESEARCH:
+                assert key in pruned, f"Preserved key '{key}' was removed"
                 assert pruned[key] == value, (
-                    f"Value for non-pruned key '{key}' changed: "
+                    f"Value for preserved key '{key}' changed: "
                     f"{value!r} -> {pruned[key]!r}"
                 )
 
 
 # ---------------------------------------------------------------------------
-# Property 15.2: Prune research removes target keys
+# Property 15.2: Prune research removes non-preserved keys
 # ---------------------------------------------------------------------------
 
 
-class TestPruneResearchRemovesTargetKeys:
-    """For any research state dict containing web_results/vector_results/graph_results,
+class TestPruneResearchRemovesNonPreservedKeys:
+    """For any research state dict containing keys outside PRESERVE_AFTER_RESEARCH,
     after pruning, those keys are absent.
 
-    **Validates: Requirements 18.1, 18.2, 18.3**
+    Feature: plan-feature-refactoring, Property 15: Prune Node Safety
+    **Validates: Requirements 11.1, 11.2, 11.5**
     """
 
     @given(research=research_state_dict())
@@ -141,26 +138,28 @@ class TestPruneResearchRemovesTargetKeys:
         suppress_health_check=[HealthCheck.too_slow],
     )
     @pytest.mark.asyncio
-    async def test_target_keys_removed(self, research: dict):
+    async def test_non_preserved_keys_removed(self, research: dict):
         node = PruneAfterResearchNode()
         state = {"research": research}
         result = await node._execute_step(state, {})
         pruned = result.output["research"]
 
-        for key in RESEARCH_PRUNE_KEYS:
-            assert key not in pruned, f"Prune target key '{key}' was not removed"
+        for key in pruned:
+            assert key in PRESERVE_AFTER_RESEARCH, (
+                f"Non-preserved key '{key}' survived pruning"
+            )
 
 
 # ---------------------------------------------------------------------------
-# Property 15.3: Prune orchestrate preserves non-pruned keys
+# Property 15.3: Prune orchestrate retains only preserved keys
 # ---------------------------------------------------------------------------
 
 
-class TestPruneOrchestratePreservesNonPrunedKeys:
-    """Same as 15.1 but for orchestrate state and
-    {critique_history, iteration_count, current_task_context}.
+class TestPruneOrchestrateRetainsOnlyPreservedKeys:
+    """Same as 15.1 but for orchestrate state and PRESERVE_AFTER_ORCHESTRATE.
 
-    **Validates: Requirements 18.1, 18.2, 18.3**
+    Feature: plan-feature-refactoring, Property 15: Prune Node Safety
+    **Validates: Requirements 11.1, 11.2, 11.5**
     """
 
     @given(orchestrate=orchestrate_state_dict())
@@ -169,30 +168,31 @@ class TestPruneOrchestratePreservesNonPrunedKeys:
         suppress_health_check=[HealthCheck.too_slow],
     )
     @pytest.mark.asyncio
-    async def test_non_pruned_keys_preserved(self, orchestrate: dict):
+    async def test_preserved_keys_retained(self, orchestrate: dict):
         node = PruneAfterOrchestrateNode()
         state = {"orchestrate": orchestrate}
         result = await node._execute_step(state, {})
         pruned = result.output["orchestrate"]
 
         for key, value in orchestrate.items():
-            if key not in ORCHESTRATE_PRUNE_KEYS:
-                assert key in pruned, f"Non-pruned key '{key}' was removed"
+            if key in PRESERVE_AFTER_ORCHESTRATE:
+                assert key in pruned, f"Preserved key '{key}' was removed"
                 assert pruned[key] == value, (
-                    f"Value for non-pruned key '{key}' changed: "
+                    f"Value for preserved key '{key}' changed: "
                     f"{value!r} -> {pruned[key]!r}"
                 )
 
 
 # ---------------------------------------------------------------------------
-# Property 15.4: Prune orchestrate removes target keys
+# Property 15.4: Prune orchestrate removes non-preserved keys
 # ---------------------------------------------------------------------------
 
 
-class TestPruneOrchestrateRemovesTargetKeys:
+class TestPruneOrchestrateRemovesNonPreservedKeys:
     """Same as 15.2 but for orchestrate.
 
-    **Validates: Requirements 18.1, 18.2, 18.3**
+    Feature: plan-feature-refactoring, Property 15: Prune Node Safety
+    **Validates: Requirements 11.1, 11.2, 11.5**
     """
 
     @given(orchestrate=orchestrate_state_dict())
@@ -201,14 +201,16 @@ class TestPruneOrchestrateRemovesTargetKeys:
         suppress_health_check=[HealthCheck.too_slow],
     )
     @pytest.mark.asyncio
-    async def test_target_keys_removed(self, orchestrate: dict):
+    async def test_non_preserved_keys_removed(self, orchestrate: dict):
         node = PruneAfterOrchestrateNode()
         state = {"orchestrate": orchestrate}
         result = await node._execute_step(state, {})
         pruned = result.output["orchestrate"]
 
-        for key in ORCHESTRATE_PRUNE_KEYS:
-            assert key not in pruned, f"Prune target key '{key}' was not removed"
+        for key in pruned:
+            assert key in PRESERVE_AFTER_ORCHESTRATE, (
+                f"Non-preserved key '{key}' survived pruning"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +220,10 @@ class TestPruneOrchestrateRemovesTargetKeys:
 
 class TestPruneNodesNeverModifyArtifacts:
     """For any state with artifacts dict, the prune node output does not contain
-    an "artifacts" key (artifacts are at top-level state, not inside the pruned
-    sub-dict).
+    an "artifacts" key.
 
-    **Validates: Requirements 18.1, 18.2, 18.3**
+    Feature: plan-feature-refactoring, Property 15: Prune Node Safety
+    **Validates: Requirements 11.1, 11.5**
     """
 
     @given(

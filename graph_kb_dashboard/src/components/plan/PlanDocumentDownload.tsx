@@ -193,10 +193,10 @@ export function PlanDocumentDownload({
         try {
           const content = await fetchArtifactContent(resolvedSessionId, entry.downloadUrl);
           if (content) {
-            parts.push(`## ${entry.specSection || entry.taskId}\n\n${content}`);
+            parts.push(`## ${entry.taskName || entry.specSection || entry.taskId}\n\n${content}`);
           }
         } catch {
-          parts.push(`## ${entry.specSection || entry.taskId}\n\n*[Could not load content]*`);
+          parts.push(`## ${entry.taskName || entry.specSection || entry.taskId}\n\n*[Could not load content]*`);
         }
       }
       downloadBlob(parts.join('\n\n'), `${specName || 'specification'}.md`);
@@ -254,7 +254,7 @@ export function PlanDocumentDownload({
                 >
                   <Download className="w-3 h-3 flex-shrink-0" />
                   <span className="truncate">
-                    {entry.specSection || entry.taskId}
+                    {entry.taskName || entry.specSection || entry.taskId}
                   </span>
                   <span className="text-muted-foreground ml-auto flex-shrink-0">
                     {entry.tokenCount}t

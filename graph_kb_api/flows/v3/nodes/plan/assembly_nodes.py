@@ -31,17 +31,18 @@ from graph_kb_api.flows.v3.agents.validation_agent import ValidationAgent
 from graph_kb_api.flows.v3.models.node_models import NodeExecutionResult
 from graph_kb_api.flows.v3.models.types import AgentTask, ThreadConfigurable
 from graph_kb_api.flows.v3.nodes.subgraph_aware_node import SubgraphAwareNode
+from graph_kb_api.flows.v3.nodes.plan.base_approval_node import BaseApprovalNode
 from graph_kb_api.flows.v3.services.artifact_service import ArtifactService
 from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard, BudgetState
-from graph_kb_api.flows.v3.services.fingerprint_tracker import FingerprintTracker
 from graph_kb_api.flows.v3.state import GenerateData, PlanData
 from graph_kb_api.flows.v3.state.plan_state import (
-    ApprovalInterruptPayload,
+    ASSEMBLY_PROGRESS,
     ArtifactRef,
     AssemblySubgraphState,
     DocumentManifest,
-    PhaseFingerprint,
+    InterruptOption,
     TransitionEntry,
+    WorkflowError,
 )
 from graph_kb_api.flows.v3.state.workflow_state import (
     CompletenessData,
@@ -49,6 +50,7 @@ from graph_kb_api.flows.v3.state.workflow_state import (
     OrchestrateData,
     ResearchData,
 )
+from graph_kb_api.flows.v3.utils.json_parsing import parse_json_from_llm
 from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator, truncate_to_tokens
 from graph_kb_api.flows.v3.utils.dedup_directives import validate_dedup_directives, CompositionReviewResponse
 from graph_kb_api.websocket.plan_events import emit_complete, emit_error, emit_phase_complete, emit_phase_progress
@@ -91,23 +93,11 @@ class CompletenessNode(SubgraphAwareNode[AssemblySubgraphState]):
         super().__init__(node_name="completeness")
         self.phase = "assembly"
         self.step_name = "completeness"
-        self.step_progress = 0.0
+        self.step_progress = ASSEMBLY_PROGRESS["completeness"]
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        session_id: str = state.get("session_id", "")
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        client_id: str | None = configurable.get("client_id")
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="assembly",
-                step="completeness",
-                message="Checking completeness of task outputs...",
-                progress_pct=0.0,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"CompletenessNode emit_phase_progress failed: {e}")
+        ctx = self._unpack(state, config)
+        await self._emit_progress(ctx, "completeness", 0.0, "Checking completeness of task outputs...")
 
         orchestrate: OrchestrateData = state.get("orchestrate", {})
         planning: PlanData = state.get("plan", {})
@@ -126,7 +116,7 @@ class CompletenessNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         # Manifest-aware completeness check (Step 15)
         manifest: DocumentManifest | None = state.get("document_manifest")
-        manifest_issues: list[dict] = []
+        manifest_issues: list[dict[str, Any]] = []
         if manifest:
             entries = manifest.get("entries", [])
             failed_entries = [e for e in entries if e.get("status") in ("failed", "error")]
@@ -191,26 +181,14 @@ class TemplateNode(SubgraphAwareNode[AssemblySubgraphState]):
         super().__init__(node_name="template")
         self.phase = "assembly"
         self.step_name = "template"
-        self.step_progress = 0.15
+        self.step_progress = ASSEMBLY_PROGRESS["template"]
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        session_id: str = state.get("session_id", "")
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        client_id: str | None = configurable.get("client_id")
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="assembly",
-                step="template",
-                message="Deriving document sections from plan...",
-                progress_pct=0.15,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"TemplateNode emit_phase_progress failed: {e}")
+        ctx = self._unpack(state, config)
+        await self._emit_progress(ctx, "template", 0.15, "Deriving document sections from plan...")
 
-        context = state.get("context", {})
-        planning = state.get("plan", {})
+        context: ContextData = state.get("context", {})
+        planning: PlanData = state.get("plan", {})
 
         spec_name = context.get("spec_name", "Feature Specification")
 
@@ -251,25 +229,23 @@ class GenerateNode(SubgraphAwareNode[AssemblySubgraphState]):
         super().__init__(node_name="generate")
         self.phase = "assembly"
         self.step_name = "generate"
-        self.step_progress = 0.35
+        self.step_progress = ASSEMBLY_PROGRESS["generate"]
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
 
         context: ContextData = state.get("context", {})
         research: ResearchData = state.get("research", {})
         orchestrate: OrchestrateData = state.get("orchestrate", {})
         generate_data: GenerateData = state.get("generate", {})
-        completeness = state.get("completeness", {})
+        completeness: CompletenessData = state.get("completeness", {})
 
         manifest: DocumentManifest | None = state.get("document_manifest")
 
         # Polish pass: promote manifest entries to "final" (Step 17)
         if manifest and manifest.get("entries"):
-            return await self._polish_pass(state, config, manifest, completeness, artifact_svc, budget)
+            return await self._polish_pass(state, config, manifest, completeness, ctx.artifact_service, budget)
 
         # Original generation behavior (backward compat / no-manifest path)
         template_vars = generate_data.get("template", {}).get("variables", [])
@@ -277,34 +253,24 @@ class GenerateNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         logger.info(
             f"[GenerateNode] template_vars={template_vars}, "
-            f"llm={'present' if llm else 'MISSING'}, "
+            f"llm={'present' if ctx.llm else 'MISSING'}, "
             f"budget_remaining={budget.get('remaining_llm_calls', '?')}, "
             f"orchestrate_task_results={len(orchestrate.get('task_results', []))}"
         )
 
         BudgetGuard.check(budget)
 
-        session_id = state.get("session_id", "")
-        client_id = configurable.get("client_id")
+        llm = ctx.require_llm
 
         sections: Dict[str, str] = {}
         llm_calls = 0
 
-        if not llm:
-            raise RuntimeError("GenerateNode requires an LLM but none was provided in config.")
-
         for idx, var in enumerate(template_vars):
-            try:
-                await emit_phase_progress(
-                    session_id=session_id,
-                    phase="assembly",
-                    step="generate",
-                    message=f"Generating section '{var}' ({idx + 1}/{len(template_vars)})...",
-                    progress_pct=0.30 + (0.25 * (idx + 1) / len(template_vars)),
-                    client_id=client_id,
-                )
-            except Exception as e:
-                logger.warning("GenerateNode emit_phase_progress failed: %s", e)
+            await self._emit_progress(
+                ctx, "generate",
+                0.30 + (0.25 * (idx + 1) / len(template_vars)),
+                f"Generating section '{var}' ({idx + 1}/{len(template_vars)})...",
+            )
             try:
                 prompt: str = self._build_section_prompt(var, spec_name, context, research, orchestrate)
                 response: AIMessage = await llm.ainvoke(prompt)
@@ -317,8 +283,8 @@ class GenerateNode(SubgraphAwareNode[AssemblySubgraphState]):
                 sections[var] = f"*Section '{var}' generation pending*"
 
         artifacts_output: Dict[str, Any] = {}
-        if artifact_svc and sections:
-            ref = await artifact_svc.store(
+        if ctx.artifact_service and sections:
+            ref = await ctx.artifact_service.store(
                 "generate",
                 "sections.json",
                 json.dumps(sections, indent=2),
@@ -326,8 +292,7 @@ class GenerateNode(SubgraphAwareNode[AssemblySubgraphState]):
             )
             artifacts_output["generate.sections"] = ref
 
-        tokens_used: int = get_token_estimator().count_tokens(json.dumps(sections, default=str)) if sections else 0
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, json.dumps(sections, default=str), llm_calls=llm_calls)
 
         return NodeExecutionResult.success(
             output={
@@ -399,7 +364,25 @@ class GenerateNode(SubgraphAwareNode[AssemblySubgraphState]):
         composition_review = completeness.get("composition_review")
         review_issues = composition_review.get("issues", []) if composition_review else []
 
-        entries: list[dict] = [dict(e) for e in manifest["entries"]]
+        entries: list[dict[str, Any]] = [dict(e) for e in manifest["entries"]]
+
+        # Apply dedup directives: remove entries flagged as duplicates,
+        # keeping only the canonical section for each duplicated topic.
+        dedup_directives = composition_review.get("dedup_directives", []) if composition_review else []
+        if dedup_directives:
+            remove_task_ids: set[str] = set()
+            for directive in dedup_directives:
+                for dup_id in directive.get("duplicate_in", []):
+                    remove_task_ids.add(dup_id)
+            if remove_task_ids:
+                before_count = len(entries)
+                entries = [e for e in entries if e.get("task_id") not in remove_task_ids]
+                logger.info(
+                    "GenerateNode: dedup removed %d duplicate entries (kept %d)",
+                    before_count - len(entries),
+                    len(entries),
+                )
+
         llm_calls = 0
         tokens_used = 0
         polished_count = 0
@@ -499,14 +482,11 @@ class ConsistencyNode(SubgraphAwareNode[AssemblySubgraphState]):
         super().__init__(node_name="consistency")
         self.phase = "assembly"
         self.step_name = "consistency"
-        self.step_progress = 0.55
+        self.step_progress = ASSEMBLY_PROGRESS["consistency"]
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        client_id: str | None = configurable.get("client_id")
-        budget: BudgetState = state.get("budget", {})
-        session_id: str = state.get("session_id", "")
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
 
         manifest: DocumentManifest | None = state.get("document_manifest")
         if manifest:
@@ -521,31 +501,15 @@ class ConsistencyNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         BudgetGuard.check(budget)
 
-        consistency_issues: list = []
+        consistency_issues: list[dict[str, Any]] = []
 
-        llm = configurable.get("llm")
-
-        if not llm:
-            raise RuntimeError("ConsistencyNode requires an LLM but none was provided in config.")
-
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="assembly",
-                step="consistency",
-                message="Running consistency checks across sections...",
-                progress_pct=0.60,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"ConsistencyNode emit_phase_progress failed: {e}")
+        await self._emit_progress(ctx, "consistency", 0.60, "Running consistency checks across sections...")
 
         agent = ConsistencyCheckerAgent()
-        workflow_context = configurable.get("context")
 
         agent_task: AgentTask = {
             "description": "Consistency check across sections",
-            "task_id": f"consistency_{session_id}_{uuid.uuid4().hex[:8]}",
+            "task_id": f"consistency_{ctx.session_id}_{uuid.uuid4().hex[:8]}",
             "context": {
                 "sections": sections,
                 "plan_context": state.get("context", {}),
@@ -553,7 +517,7 @@ class ConsistencyNode(SubgraphAwareNode[AssemblySubgraphState]):
         }
         agent_state = {"completed_sections": sections}
 
-        result: AgentResult = await agent.execute(task=agent_task, state=agent_state, workflow_context=workflow_context)
+        result: AgentResult = await agent.execute(task=agent_task, state=agent_state, workflow_context=ctx.workflow_context)
 
         # Convert agent issues to node format
         for issue in result.get("consistency_issues", []):
@@ -570,13 +534,12 @@ class ConsistencyNode(SubgraphAwareNode[AssemblySubgraphState]):
             )
 
         llm_calls = 1
-        tokens_used: int = get_token_estimator().count_tokens(str(result))
 
         logger.info(f"ConsistencyNode: LLM semantic check found {len(consistency_issues)} issues")
 
         is_consistent: bool = len([i for i in consistency_issues if i.get("severity") == "error"]) == 0
 
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, str(result))
 
         # Get current iteration count for loop guard (read by _route_after_consistency)
         completeness: CompletenessData = state.get("completeness", {})
@@ -591,9 +554,9 @@ class ConsistencyNode(SubgraphAwareNode[AssemblySubgraphState]):
             "iteration": current_iterations + 1,
             "source": "llm_semantic" if llm_calls > 0 else "deterministic",
         }
-        if artifact_svc:
+        if ctx.artifact_service:
             try:
-                ref: ArtifactRef = await artifact_svc.store(
+                ref: ArtifactRef = await ctx.artifact_service.store(
                     "assembly",
                     "consistency_report.json",
                     json.dumps(report, indent=2),
@@ -631,27 +594,13 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
         super().__init__(node_name="composition_review")
         self.phase = "assembly"
         self.step_name = "composition_review"
-        self.step_progress = 0.60
+        self.step_progress = ASSEMBLY_PROGRESS["composition_review"]
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        budget: BudgetState = state.get("budget", {})
-        session_id: str = state.get("session_id", "")
-        client_id: str | None = configurable.get("client_id")
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="assembly",
-                step="composition_review",
-                message="Reviewing document suite composition...",
-                progress_pct=0.60,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"CompositionReviewNode emit_phase_progress failed: {e}")
+        await self._emit_progress(ctx, "composition_review", 0.60, "Reviewing document suite composition...")
 
         manifest: DocumentManifest | None = state.get("document_manifest")
 
@@ -668,7 +617,7 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
         deliverables: list[dict[str, str]] = []  # [{task_id, content}]
         tokens_budgeted = 0
 
-        if artifact_svc:
+        if ctx.artifact_service:
             total_tokens = sum(e.get("token_count", 0) for e in entries)
             for entry in entries:
                 if entry.get("status") in ("failed", "error"):
@@ -684,7 +633,7 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
                     doc_budget = max_review_tokens // max(len(entries), 1)
 
                 try:
-                    content = await artifact_svc.retrieve(ref)
+                    content = await ctx.artifact_service.retrieve(ref)
                     if content and get_token_estimator().count_tokens(content) > doc_budget:
                         # Truncate to token budget using tiktoken
                         content = truncate_to_tokens(content, doc_budget)
@@ -703,12 +652,12 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
         }
         llm_calls = 0
 
-        if llm and deliverables:
+        if ctx.llm and deliverables:
             try:
                 # Use structured output to guarantee field names and types.
                 # with_structured_output uses OpenAI's response_format=json_schema
                 # which enforces the schema at the token generation level.
-                structured_llm = llm.with_structured_output(CompositionReviewResponse)
+                structured_llm = ctx.llm.with_structured_output(CompositionReviewResponse)
                 parsed_response: CompositionReviewResponse = await structured_llm.ainvoke(review_prompt)
 
                 composition_result = {
@@ -748,15 +697,14 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
                 llm_calls = 1
             except Exception as e:
                 logger.warning(f"CompositionReviewNode: structured output failed, falling back to raw parse: {e}")
-                # Fallback: raw ainvoke + regex JSON parsing
+                # Fallback: raw ainvoke + parse_json_from_llm
                 try:
-                    response: AIMessage = await llm.ainvoke(review_prompt)
+                    response: AIMessage = await ctx.llm.ainvoke(review_prompt)
                     raw = response.content if hasattr(response, "content") else str(response)
                     content_str = str(raw) if not isinstance(raw, str) else raw
 
-                    json_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content_str, re.DOTALL)
-                    if json_match:
-                        parsed = json.loads(json_match.group())
+                    parsed = parse_json_from_llm(content_str)
+                    if isinstance(parsed, dict):
                         composition_result = {
                             "overall_score": max(0.0, min(1.0, float(parsed.get("overall_score", 0.5)))),
                             "summary": parsed.get("summary", ""),
@@ -802,8 +750,7 @@ class CompositionReviewNode(SubgraphAwareNode[AssemblySubgraphState]):
             if not re_execute_task_ids:
                 composition_result["needs_re_orchestrate"] = False
 
-        tokens_used = get_token_estimator().count_tokens(json.dumps(composition_result, default=str))
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, json.dumps(composition_result, default=str), llm_calls=llm_calls)
 
         output: dict[str, Any] = {
             "completeness": {
@@ -904,26 +851,13 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
         super().__init__(node_name="assemble")
         self.phase = "assembly"
         self.step_name = "assemble"
-        self.step_progress = 0.70
+        self.step_progress = ASSEMBLY_PROGRESS["assemble"]
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        client_id: str | None = configurable.get("client_id")
-        budget: BudgetState = state.get("budget", {})
-        session_id: str = state.get("session_id", "")
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="assembly",
-                step="assemble",
-                message="Assembling final document from sections...",
-                progress_pct=0.70,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"AssembleNode emit_phase_progress failed: {e}")
+        await self._emit_progress(ctx, "assemble", 0.70, "Assembling final document from sections...")
 
         context: ContextData = state.get("context", {})
         generate_data: GenerateData = state.get("generate", {})
@@ -949,7 +883,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
         if manifest and manifest.get("entries"):
             # Hydrate deliverable sections from blob storage for LLM assembly
             hydrated_sections: Dict[str, str] = {}
-            if artifact_svc:
+            if ctx.artifact_service:
                 seen_sections: set[str] = set()
                 for entry in manifest.get("entries", []):
                     if entry.get("status") in ("failed", "error"):
@@ -963,7 +897,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                         continue
                     seen_sections.add(section_key)
                     try:
-                        content = await artifact_svc.retrieve(ref)
+                        content = await ctx.artifact_service.retrieve(ref)
                         if content:
                             # Strip YAML frontmatter from deliverable content
                             content = self._strip_frontmatter(content)
@@ -972,7 +906,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                         logger.warning("AssembleNode: failed to hydrate %s: %s", entry.get("task_id"), e)
 
             # Run LLM assembly to produce a single cohesive document
-            workflow_context: WorkflowContext | None = configurable.get("context")
+            workflow_context: WorkflowContext | None = ctx.workflow_context
             assembled_document = ""
             flow_score = 0.5
 
@@ -1003,7 +937,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                     toc = self._generate_toc(sorted_keys) if sorted_keys else ""
                     agent_task: AgentTask = {
                         "description": f"Assemble document: {spec_name}",
-                        "task_id": f"assembly_{session_id}_{uuid.uuid4().hex[:8]}",
+                        "task_id": f"assembly_{ctx.session_id}_{uuid.uuid4().hex[:8]}",
                         "context": {
                             "sections": sorted_sections,
                             "spec_name": spec_name,
@@ -1018,12 +952,12 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                     }
                     try:
                         await emit_phase_progress(
-                            session_id=session_id,
+                            session_id=ctx.session_id,
                             phase="assembly",
                             step="assemble",
                             message="Running LLM assembly to produce final document...",
                             progress_pct=0.75,
-                            client_id=client_id,
+                            client_id=ctx.client_id,
                         )
                     except Exception:
                         pass
@@ -1060,10 +994,10 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                 )
 
             spec_document_path = ""
-            if artifact_svc:
+            if ctx.artifact_service:
                 # Store assembled document
                 if assembled_document:
-                    spec_ref = await artifact_svc.store(
+                    spec_ref = await ctx.artifact_service.store(
                         "output",
                         "spec.md",
                         assembled_document,
@@ -1075,7 +1009,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
 
                 # Store index and manifest
                 composed_index = self._build_composed_index(manifest, spec_name, sections)
-                index_ref = await artifact_svc.store(
+                index_ref = await ctx.artifact_service.store(
                     "output",
                     "index.md",
                     composed_index,
@@ -1086,15 +1020,15 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
                 manifest = {**manifest, "composed_index_ref": index_ref}
                 manifest_output = {"document_manifest": manifest}
 
-                await artifact_svc.store(
+                await ctx.artifact_service.store(
                     "output",
                     "manifest.json",
                     json.dumps(manifest, indent=2, default=str),
                     f"Document manifest for {spec_name}",
                 )
 
-            new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
-            await _persist_assembly_completion_to_db(session_id, spec_document_path)
+            new_budget = self._decrement_budget(budget, assembled_document if assembled_document else "", llm_calls=llm_calls)
+            await _persist_assembly_completion_to_db(ctx.session_id, spec_document_path)
             return NodeExecutionResult.success(
                 output={
                     "generate": {**generate_data, "spec_document_path": spec_document_path, "flow_score": flow_score},
@@ -1105,16 +1039,14 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
             )
 
         # Legacy generation path
-        llm = configurable.get("llm")
-        if not llm:
-            raise RuntimeError("AssembleNode requires an LLM but none was provided in config.")
+        llm = ctx.require_llm
 
         agent = DocumentAssemblyAgent()
-        workflow_context = configurable.get("context")
+        workflow_context = ctx.workflow_context
 
         agent_task: AgentTask = {
             "description": f"Assemble document: {spec_name}",
-            "task_id": f"assembly_{session_id}_{uuid.uuid4().hex[:8]}",
+            "task_id": f"assembly_{ctx.session_id}_{uuid.uuid4().hex[:8]}",
             "context": {
                 "sections": sections,
                 "template": template,
@@ -1145,8 +1077,8 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         logger.info(f"AssembleNode: LLM assembly completed with flow_score={flow_score:.2f}")
 
-        if artifact_svc:
-            ref = await artifact_svc.store(
+        if ctx.artifact_service:
+            ref = await ctx.artifact_service.store(
                 "output",
                 "spec.md",
                 document,
@@ -1156,7 +1088,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
             artifacts_output["output.spec"] = ref
             spec_document_path = ref.key if hasattr(ref, "key") else "output/spec.md"
 
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget: BudgetState = self._decrement_budget(budget, document if document else "", llm_calls=1)
 
         output: Dict[str, Any] = {
             "generate": {
@@ -1167,7 +1099,7 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
             "budget": new_budget,
         }
 
-        await _persist_assembly_completion_to_db(session_id, spec_document_path)
+        await _persist_assembly_completion_to_db(ctx.session_id, spec_document_path)
         return NodeExecutionResult.success(output=output)
 
     def _build_composed_index(self, manifest: DocumentManifest, spec_name: str, sections: Dict[str, str]) -> str:
@@ -1300,15 +1232,8 @@ class AssembleNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         response = await llm.ainvoke(messages)
         content = response.content if hasattr(response, "content") else str(response)
-        # Strip markdown code fences if present
-        text = str(content).strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-        if text.endswith("```"):
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
 
-        data = json.loads(text)
+        data = parse_json_from_llm(str(content))
         return data["executive_summary"], data.get("transitions", [])
 
     @staticmethod
@@ -1365,41 +1290,22 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
         super().__init__(node_name="validate")
         self.phase = "assembly"
         self.step_name = "validate"
-        self.step_progress = 0.85
+        self.step_progress = ASSEMBLY_PROGRESS["validate"]
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        client_id: str | None = configurable.get("client_id")
-        budget: BudgetState = state.get("budget", {})
-        session_id: str = state.get("session_id", "")
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
 
         generate: GenerateData = state.get("generate", {})
 
         BudgetGuard.check(budget)
 
-        validation_errors: list = []
-        validation_warnings: list = []
+        validation_errors: list[dict[str, Any]] = []
+        validation_warnings: list[dict[str, Any]] = []
 
-        llm: LLMService | None = configurable.get("llm")
-
-        if not llm:
-            raise RuntimeError("ValidateNode requires an LLM but none was provided in config.")
-
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="assembly",
-                step="validate",
-                message="Validating assembled document...",
-                progress_pct=0.85,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"ValidateNode emit_phase_progress failed: {e}")
+        await self._emit_progress(ctx, "validate", 0.85, "Validating assembled document...")
 
         agent = ValidationAgent()
-        workflow_context: WorkflowContext | None = configurable.get("context")
 
         manifest: DocumentManifest | None = state.get("document_manifest")
 
@@ -1408,13 +1314,13 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
         assembled_doc = generate.get("assembled_document", "")
 
         # Hydrate from manifest if available
-        if manifest and manifest.get("entries") and artifact_svc:
+        if manifest and manifest.get("entries") and ctx.artifact_service:
             document_sections = {}
             assembled_parts = []
             for entry in manifest["entries"]:
                 if entry.get("status") in ("final", "reviewed") and entry.get("artifact_ref"):
                     try:
-                        content = await artifact_svc.retrieve(entry["artifact_ref"])
+                        content = await ctx.artifact_service.retrieve(entry["artifact_ref"])
                         if content:
                             document_sections[entry.get("spec_section", entry["task_id"])] = content
                             assembled_parts.append(f"## {entry.get('spec_section')}\n\n{content}")
@@ -1430,7 +1336,7 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
 
         agent_task: AgentTask = {
             "description": "Validate assembled specification document",
-            "task_id": f"validation_{session_id}_{uuid.uuid4().hex[:8]}",
+            "task_id": f"validation_{ctx.session_id}_{uuid.uuid4().hex[:8]}",
             "context": {
                 "document": document,
                 "requirements": self._extract_requirements(state),
@@ -1438,14 +1344,14 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
         }
 
         tools = []
-        if workflow_context and workflow_context.app_context:
+        if ctx.workflow_context and ctx.workflow_context.app_context:
             from graph_kb_api.flows.v3.tools import get_all_tools
-            tools = get_all_tools(workflow_context.app_context.get_retrieval_settings())
+            tools = get_all_tools(ctx.workflow_context.app_context.get_retrieval_settings())
 
         result: AgentResult = await agent.execute(
             task=agent_task,
             state=cast("UnifiedSpecState", {"available_tools": tools}),
-            workflow_context=workflow_context,
+            workflow_context=ctx.workflow_context,
         )
 
         # Extract validation results
@@ -1461,14 +1367,13 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
                 validation_warnings.append(issue)
 
         llm_calls = 1
-        tokens_used: int = get_token_estimator().count_tokens(str(result))
 
         logger.info(
             f"ValidateNode: LLM validation complete - valid={is_valid}, "
             f"quality={quality_score:.2f}, completeness={completeness_score:.2f}"
         )
 
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget: BudgetState = self._decrement_budget(budget, str(result))
 
         # Store validation report via ArtifactService
         artifacts_output: Dict[str, Any] = {}
@@ -1479,9 +1384,9 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
             "sections_count": len(generate.get("sections", {})),
             "spec_path": generate.get("spec_document_path", ""),
         }
-        if artifact_svc:
+        if ctx.artifact_service:
             try:
-                ref = await artifact_svc.store(
+                ref = await ctx.artifact_service.store(
                     "assembly",
                     "validation_report.json",
                     json.dumps(report, indent=2),
@@ -1551,23 +1456,22 @@ class ValidateNode(SubgraphAwareNode[AssemblySubgraphState]):
         return requirements
 
 
-class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
+class AssemblyApprovalNode(BaseApprovalNode[AssemblySubgraphState]):
     """Approval gate for assembly phase completion.
 
     Presents the final spec document to user for approval.
-    Uses interrupt() for user confirmation.
+    Extends BaseApprovalNode with assembly-specific hooks.
     """
+
+    phase_data_key = "completeness"
 
     def __init__(self) -> None:
         super().__init__(node_name="assembly_approval")
         self.phase = "assembly"
         self.step_name = "approval"
-        self.step_progress = 1.0
+        self.step_progress = ASSEMBLY_PROGRESS["approval"]
 
-    async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-
+    def _build_summary(self, state: AssemblySubgraphState) -> dict[str, Any]:
         context: ContextData = state.get("context", {})
         completeness: CompletenessData = state.get("completeness", {})
         generate: GenerateData = state.get("generate", {})
@@ -1582,11 +1486,6 @@ class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
             sections_generated = len(
                 [e for e in manifest.get("entries", []) if e.get("status") in ("final", "reviewed")]
             )
-
-        # Hydrate document preview for the user to review before approving
-        document_preview = await self._hydrate_document_preview(
-            manifest, generate, artifact_svc, state.get("artifacts", {})
-        )
 
         # Build manifest entries for download links
         manifest_entries: list[dict[str, Any]] = []
@@ -1606,102 +1505,118 @@ class AssemblyApprovalNode(SubgraphAwareNode[AssemblySubgraphState]):
             "spec_name": spec_name,
             "spec_document_path": spec_path,
             "is_valid": validation.get("is_valid", False),
+            "errors": validation.get("errors", []),
+            "warnings": validation.get("warnings", []),
             "errors_count": len(validation.get("errors", [])),
             "warnings_count": len(validation.get("warnings", [])),
             "sections_generated": sections_generated,
         }
-        if document_preview:
-            summary["document_preview"] = document_preview
         if manifest_entries:
             summary["manifest_entries"] = manifest_entries
 
-        context_items = await self._load_context_items(state.get("session_id"), state.get("research", {}), context)
-        payload: ApprovalInterruptPayload = {
-            "type": "approval",
-            "phase": "assembly",
-            "step": "approval",
-            "summary": summary,
-            "message": (
-                f"Specification '{spec_name}' is ready for review. "
-                f"{summary['sections_generated']} sections generated. "
-                f"Review the document below, then approve to finalize."
-            ),
-            "artifacts": self._serialize_artifacts(state["artifacts"]),
-            "options": [
-                {"id": "approve", "label": "Approve & Finalize"},
-                {"id": "revise", "label": "Request Revisions"},
-                {"id": "reject", "label": "Reject"},
-            ],
-            "context_items": context_items,
+        # NOTE: document_preview is added asynchronously in _build_summary_async
+        # and merged into the summary by the overridden _execute_step.
+        return summary
+
+    async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
+        """Override to inject async document_preview into summary before interrupt."""
+        # We need to hydrate the document preview before the base class builds the payload.
+        # The base class calls _build_summary synchronously, so we handle the async part here.
+        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
+        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
+        generate: GenerateData = state.get("generate", {})
+        manifest: DocumentManifest | None = state.get("document_manifest")
+
+        # Hydrate document preview
+        document_preview = await self._hydrate_document_preview(
+            manifest, generate, artifact_svc, state.get("artifacts", {})
+        )
+        # Store preview temporarily so _build_summary can be called by base class
+        self._document_preview = document_preview
+
+        # Now delegate to the base class workflow
+        result = await super()._execute_step(state, config)
+        return result
+
+    def _build_payload_extras(self, state: AssemblySubgraphState, summary: dict[str, Any]) -> dict[str, Any]:
+        # Inject the async document_preview into the summary
+        preview = getattr(self, "_document_preview", "")
+        if preview:
+            summary["document_preview"] = preview
+        return {}
+
+    def _get_approval_options(self) -> list[InterruptOption]:
+        return [
+            {"id": "approve", "label": "Approve & Finalize"},
+            {"id": "revise", "label": "Request Revisions"},
+            {"id": "reject", "label": "Reject"},
+        ]
+
+    def _get_approval_message(self, summary: dict[str, Any]) -> str:
+        return (
+            f"Specification '{summary.get('spec_name', 'Unknown')}' is ready for review. "
+            f"{summary['sections_generated']} sections generated. "
+            f"Review the document below, then approve to finalize."
+        )
+
+    def _process_approve(self, state: AssemblySubgraphState, feedback: str) -> dict[str, Any]:
+        completeness: CompletenessData = state.get("completeness", {})
+        return {
+            "completeness": {
+                **completeness,
+                "approved": True,
+                "approval_decision": "approve",
+                "approval_feedback": feedback,
+            },
         }
-        approval_response: Dict[str, Any] = interrupt(payload)
 
-        decision = approval_response.get("decision", "approve")
-        feedback = approval_response.get("feedback", "")
-
+    def _process_revise(self, state: AssemblySubgraphState, feedback: str) -> dict[str, Any]:
+        completeness: CompletenessData = state.get("completeness", {})
         output: Dict[str, Any] = {
             "completeness": {
                 **completeness,
-                "approved": decision == "approve",
-                "approval_decision": decision,
+                "approved": False,
+                "approval_decision": "revise",
                 "approval_feedback": feedback,
-            }
+                "needs_revision": True,
+            },
         }
+        # Reset manifest entry statuses so GenerateNode and AssembleNode
+        # re-process them on the revise loop instead of skipping.
+        manifest: DocumentManifest | None = state.get("document_manifest")
+        if manifest and manifest.get("entries"):
+            reset_entries = [
+                {**e, "status": "reviewed", "composed_at": None}
+                if e.get("status") == "final"
+                else e
+                for e in manifest["entries"]
+            ]
+            output["document_manifest"] = {**manifest, "entries": reset_entries}
+        # Clear the assembled spec artifact ref so AssembleNode re-runs LLM assembly
+        existing_artifacts: Dict[str, ArtifactRef] = dict(state.get("artifacts", {}))
+        existing_artifacts.pop("output.spec", None)
+        output["artifacts"] = existing_artifacts
+        return output
 
-        if decision == "approve":
-            output["completed_phases"] = {"assembly": True}
-            # Store fingerprint for dirty-detection on backward navigation
-            fp_hash: str = FingerprintTracker.compute_phase_data_fingerprint("assembly", output["completeness"])
-            existing_fps: dict[str, PhaseFingerprint] = state.get("fingerprints", {})
-            output["fingerprints"] = FingerprintTracker.update_fingerprint(
-                existing_fps,
-                "assembly",
-                fp_hash,
-                [],
-            )
-            # Emit plan.phase.complete (GAP 9)
-            try:
-                session_id: str = state.get("session_id", "")
-                configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-                client_id: str | None = configurable.get("client_id")
-                await emit_phase_complete(
-                    session_id=session_id,
-                    phase="assembly",
-                    result_summary=f"Assembly approved for '{spec_name}'",
-                    duration_s=0.0,
-                    client_id=client_id,
-                )
-            except Exception:
-                pass  # fire-and-forget
-        elif decision == "revise":
-            output["completeness"]["needs_revision"] = True
-            # Reset manifest entry statuses so GenerateNode and AssembleNode
-            # re-process them on the revise loop instead of skipping.
-            manifest: DocumentManifest | None = state.get("document_manifest")
-            if manifest and manifest.get("entries"):
-                reset_entries = [
-                    {**e, "status": "reviewed", "composed_at": None}
-                    if e.get("status") == "final"
-                    else e
-                    for e in manifest["entries"]
-                ]
-                output["document_manifest"] = {**manifest, "entries": reset_entries}
-            # Clear the assembled spec artifact ref so AssembleNode re-runs LLM assembly
-            existing_artifacts: Dict[str, ArtifactRef] = dict(state.get("artifacts", {}))
-            existing_artifacts.pop("output.spec", None)
-            output["artifacts"] = existing_artifacts
-        elif decision == "reject":
-            output["completeness"]["rejected"] = True
-            output["workflow_status"] = "rejected"
-            output["error"] = {
-                "message": f"Specification '{spec_name}' was rejected by user.",
-                "code": "REJECTED",
-                "phase": "assembly",
-            }
-            # plan.error is emitted by the dispatcher's _check_and_emit_error
-            # after the workflow halts — no need to emit here (avoids duplicate).
-
-        return NodeExecutionResult.success(output=output)
+    def _process_reject(self, state: AssemblySubgraphState, feedback: str) -> dict[str, Any]:
+        completeness: CompletenessData = state.get("completeness", {})
+        context: ContextData = state.get("context", {})
+        spec_name: str = context.get("spec_name", "Unknown")
+        return {
+            "completeness": {
+                **completeness,
+                "approved": False,
+                "approval_decision": "reject",
+                "approval_feedback": feedback,
+                "rejected": True,
+            },
+            "workflow_status": "rejected",
+            "error": WorkflowError(
+                message=f"Specification '{spec_name}' was rejected by user.",
+                code="REJECTED",
+                phase="assembly",
+            ),
+        }
 
     @staticmethod
     async def _hydrate_document_preview(
@@ -1770,25 +1685,22 @@ class FinalizeNode(SubgraphAwareNode[AssemblySubgraphState]):
         super().__init__(node_name="finalize")
         self.phase = "assembly"
         self.step_name = "finalize"
-        self.step_progress = 1.0
+        self.step_progress = ASSEMBLY_PROGRESS["finalize"]
 
     async def _execute_step(self, state: AssemblySubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        session_id: str = state.get("session_id", "")
+        ctx = self._unpack(state, config)
         generate_state: GenerateData = state.get("generate", {})
         spec_document_url: str = generate_state.get("spec_document_path", "")
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        client_id: str | None = configurable.get("client_id")
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
 
         # Build document manifest payload (Step 19)
         manifest = state.get("document_manifest")
 
         # Flush transition_log to audit/transitions.jsonl blob (GAP 16)
         transition_log: list[TransitionEntry] = state.get("transition_log", [])
-        if artifact_svc and transition_log:
+        if ctx.artifact_service and transition_log:
             try:
                 jsonl_content: str = "\n".join(json.dumps(entry, default=str) for entry in transition_log)
-                await artifact_svc.store(
+                await ctx.artifact_service.store(
                     "audit",
                     "transitions.jsonl",
                     jsonl_content,
@@ -1815,23 +1727,23 @@ class FinalizeNode(SubgraphAwareNode[AssemblySubgraphState]):
                 composed_index_url = manifest["composed_index_ref"].get("key", spec_document_url)
 
             await emit_complete(
-                session_id=session_id,
+                session_id=ctx.session_id,
                 document_manifest=manifest,
                 spec_document_url=composed_index_url,
-                client_id=client_id,
+                client_id=ctx.client_id,
             )
         else:
             # No document was generated - emit error instead
             try:
                 await emit_error(
-                    session_id=session_id,
+                    session_id=ctx.session_id,
                     message=(
                         "Plan workflow completed but no document was generated."
                         " The assembly phase may have failed silently."
                     ),
                     code="NO_DOCUMENT",
                     phase="assembly",
-                    client_id=client_id,
+                    client_id=ctx.client_id,
                 )
             except Exception:
                 pass

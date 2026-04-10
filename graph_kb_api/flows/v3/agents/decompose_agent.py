@@ -24,7 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 
 from graph_kb_api.context import AppContext
-from graph_kb_api.core.llm import LLMService
+from graph_kb_api.core.llm import LLMService, LLMQuotaExhaustedError
 from graph_kb_api.flows.v3.agents.base_agent import AgentCapability, BaseAgent
 from graph_kb_api.flows.v3.agents.personas import get_agent_prompt_manager
 from graph_kb_api.flows.v3.models import (
@@ -149,6 +149,13 @@ class DecomposeAgent(BaseAgent):
             await self._emit_progress(state, "decomposition_complete", "Story decomposition complete", 100)
 
         except Exception as e:
+            # Re-raise quota exhaustion so the node-level handler can emit
+            # a proper error to the UI instead of silently degrading
+            if isinstance(e, LLMQuotaExhaustedError) or (
+                isinstance(e.__cause__, LLMQuotaExhaustedError) if e.__cause__ else False
+            ):
+                raise
+
             logger.error(f"Decompose agent failed: {e}", exc_info=True)
             story_map.summary = f"Decomposition partially completed. Error: {str(e)}"
 

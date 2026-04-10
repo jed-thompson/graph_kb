@@ -19,6 +19,7 @@ from graph_kb_api.flows.v3.agents import AgentResult
 
 if TYPE_CHECKING:
     from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
+    from graph_kb_api.graph_kb.storage.vector_store import ChromaVectorStore
 
 import httpx
 from langgraph.types import RunnableConfig, interrupt
@@ -41,14 +42,23 @@ from graph_kb_api.flows.v3.services.artifact_service import ArtifactService
 from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 from graph_kb_api.flows.v3.state import ContextData
 from graph_kb_api.flows.v3.state.plan_state import (
+    CONTEXT_PROGRESS,
     AnalysisReviewInterruptPayload,
     ArtifactRef,
     BudgetState,
+    ContextItemsSummary,
     ContextSubgraphState,
     FormInterruptPayload,
 )
 from graph_kb_api.flows.v3.state.workflow_state import ContextRound, ReviewData
-from graph_kb_api.flows.v3.utils.context_utils import append_document_context_to_prompt, sanitize_context_for_prompt
+from graph_kb_api.flows.v3.utils.context_utils import (
+    append_document_context_to_prompt,
+    build_context_items_for_display,
+    resolve_primary_document_id,
+    resolve_supporting_document_ids,
+    sanitize_context_for_prompt,
+)
+from graph_kb_api.flows.v3.utils.json_parsing import parse_json_from_llm
 from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator, truncate_to_tokens
 from graph_kb_api.graph_kb.models import RepoMetadata
 from graph_kb_api.storage.blob_storage import BlobStorage
@@ -73,7 +83,7 @@ class ValidateContextNode(SubgraphAwareNode[ContextSubgraphState]):
         super().__init__(node_name="validate_context")
         self.phase = "context"
         self.step_name = "validate_context"
-        self.step_progress = 0.0
+        self.step_progress = CONTEXT_PROGRESS["validate_context"]
 
     async def _execute_step(self, state: ContextSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         context: ContextData = state.get("context", {})
@@ -134,7 +144,7 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
         super().__init__(node_name="collect_context")
         self.phase = "context"
         self.step_name = "collect_context"
-        self.step_progress = 0.25
+        self.step_progress = CONTEXT_PROGRESS["collect_context"]
 
     async def _execute_step(self, state: ContextSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         existing_context: Dict[str, Any] = {**state.get("context", {})}
@@ -189,14 +199,14 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                 placeholder="https://docs.example.com/spec",
             ),
             PhaseField(
-                id="primary_document",
+                id="primary_document_id",
                 label="Primary requirements document",
                 type="file",
                 required=False,
                 placeholder="Paste or describe the primary requirements document",
             ),
             PhaseField(
-                id="supporting_docs",
+                id="supporting_document_ids",
                 label="Supporting documents & references",
                 type="document_list",
                 required=False,
@@ -228,10 +238,10 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
                 "spec_description": existing_context.get("spec_description", ""),
                 "target_repo_id": existing_context.get("target_repo_id", ""),
                 "reference_urls": existing_context.get("reference_urls", []),
-                "primary_document": existing_context.get("primary_document", ""),
+                "primary_document_id": existing_context.get("primary_document_id") or existing_context.get("primary_document") or "",
                 "user_explanation": existing_context.get("user_explanation", ""),
                 "constraints": existing_context.get("constraints", ""),
-                "supporting_docs": existing_context.get("supporting_docs", ""),
+                "supporting_document_ids": existing_context.get("supporting_document_ids") or existing_context.get("supporting_docs") or "",
             },
         }
         user_input: Dict[str, Any] = interrupt(payload)
@@ -384,20 +394,14 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
         artifacts_output: Dict[str, Any] = {}
 
         # Resolve primary document ID.
-        # CollectContextNode form field key is "primary_document";
-        # FeedbackReviewNode normalizes to "primary_document_id" later.
-        primary_id = merged_context.get("primary_document_id") or merged_context.get("primary_document") or ""
+        # Form field IDs use canonical names (primary_document_id,
+        # supporting_document_ids) so no normalization is needed.
+        primary_id = merged_context.get("primary_document_id") or ""
         if primary_id and not isinstance(primary_id, str):
             primary_id = str(primary_id)
 
-        # Resolve supporting doc IDs (form field + URL-scraped references).
-        supporting_ids: List[str] = list(merged_context.get("supporting_doc_ids") or [])
-        form_supporting = merged_context.get("supporting_docs") or []
-        if isinstance(form_supporting, str):
-            form_supporting = [s.strip() for s in form_supporting.split(",") if s.strip()]
-        for doc_id in form_supporting:
-            if doc_id and doc_id not in supporting_ids:
-                supporting_ids.append(doc_id)
+        # Resolve supporting doc IDs.
+        supporting_ids: List[str] = list(merged_context.get("supporting_document_ids") or merged_context.get("supporting_doc_ids") or [])
 
         # Associate library (ChromaDB-only) documents with this plan session so
         # FeedbackReviewNode's DocumentRepository.exists() validation passes for
@@ -615,10 +619,8 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
     @staticmethod
     def _url_to_safe_name(url: str, index: int) -> str:
         """Convert a URL to a safe blob storage name."""
-        import re as _re
-
-        stripped = _re.sub(r"^https?://", "", url).strip("/")
-        safe = _re.sub(r"[^a-zA-Z0-9._-]", "_", stripped)[:80]
+        stripped = re.sub(r"^https?://", "", url).strip("/")
+        safe = re.sub(r"[^a-zA-Z0-9._-]", "_", stripped)[:80]
         return f"reference_{index}_{safe}.txt"
 
     @staticmethod
@@ -644,7 +646,7 @@ class CollectContextNode(SubgraphAwareNode[ContextSubgraphState]):
         if not doc_ids_with_roles or not session_id:
             return
 
-        vector_store: Any = workflow_context.vector_store if workflow_context is not None else None
+        vector_store: ChromaVectorStore | None = workflow_context.vector_store if workflow_context is not None else None
 
         async with get_db_session_ctx() as db_session:
             doc_repo = DocumentRepository(db_session)
@@ -797,35 +799,32 @@ class ReviewNode(SubgraphAwareNode[ContextSubgraphState]):
         super().__init__(node_name="review")
         self.phase = "context"
         self.step_name = "review"
-        self.step_progress = 0.50
+        self.step_progress = CONTEXT_PROGRESS["review"]
 
     async def _execute_step(self, state: ContextSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         context: ContextData = state.get("context", {})
 
         # Budget check before LLM call
         BudgetGuard.check(budget)
 
         # Instantiate and execute the context review agent
-        client_id: str | None = configurable.get("client_id")
-        agent = ContextReviewAgent(client_id=client_id)
-        workflow_context = configurable.get("context")
-        session_id = state.get("session_id", "")
+        agent = ContextReviewAgent(client_id=ctx.client_id)
 
         agent_task: AgentTask = {
             "description": "Context review analysis",
-            "task_id": f"review_{session_id}",
+            "task_id": f"review_{ctx.session_id}",
             "context": cast(Dict[str, Any], context),
         }
 
-        if not workflow_context:
+        if not ctx.workflow_context:
             raise RuntimeError("ReviewNode requires workflow_context but none was provided")
 
         result: AgentResult = await agent.execute(
             task=agent_task,
             state=state,
-            workflow_context=workflow_context,
+            workflow_context=ctx.workflow_context,
         )
 
         # Propagate agent errors so SubgraphAwareNode emits spec.error to UI
@@ -834,8 +833,7 @@ class ReviewNode(SubgraphAwareNode[ContextSubgraphState]):
             raise RuntimeError(f"ContextReviewAgent failed: {agent_error}")
 
         # Decrement budget after LLM call
-        tokens_used: int = get_token_estimator().count_tokens(str(result))
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, str(result))
 
         # Build review state output
         review_output = {
@@ -879,27 +877,18 @@ class DeepAnalysisNode(SubgraphAwareNode[ContextSubgraphState]):
         super().__init__(node_name="deep_analysis")
         self.phase = "context"
         self.step_name = "deep_analysis"
-        self.step_progress = 0.75
+        self.step_progress = CONTEXT_PROGRESS["deep_analysis"]
 
     async def _execute_step(self, state: ContextSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         from graph_kb_api.flows.v3.agents.research_agent import ResearchAgent
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 
         context: ContextData = state.get("context", {})
         review: ReviewData = state.get("review", {})
-        budget: BudgetState = state.get("budget", {})
 
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
 
         BudgetGuard.check(budget)
-
-        # Build the app_context adapter for the agent
-        workflow_context = configurable.get("context")
-
-        session_id = state.get("session_id", "")
-        client_id = configurable.get("client_id")
 
         analysis_report: Dict[str, Any] = {}
 
@@ -908,45 +897,24 @@ class DeepAnalysisNode(SubgraphAwareNode[ContextSubgraphState]):
         repo_id = context.get("target_repo_id", "")
         user_explanation = context.get("user_explanation", "")
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="context",
-                step="deep_analysis",
-                message="Analyzing codebase via graph KB",
-                progress_pct=0.60,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"DeepAnalysisNode emit_phase_progress failed: {e}")
+        await self._emit_progress(ctx, "deep_analysis", 0.60, "Analyzing codebase via graph KB")
 
         try:
-            if not workflow_context:
+            if not ctx.workflow_context:
                 raise RuntimeError("DeepAnalysisNode requires workflow_context for codebase analysis")
-            research_agent = ResearchAgent(client_id=client_id)
+            research_agent = ResearchAgent(client_id=ctx.client_id)
             codebase_results = await research_agent.analyze_codebase(
                 repo_id=repo_id,
                 user_explanation=user_explanation,
-                workflow_context=workflow_context,
+                workflow_context=ctx.workflow_context,
             )
         except Exception as e:
             logger.warning(f"DeepAnalysisNode codebase analysis failed: {e}")
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="context",
-                step="deep_analysis",
-                message="Running LLM-driven architectural analysis",
-                progress_pct=0.70,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"DeepAnalysisNode emit_phase_progress failed: {e}")
+        await self._emit_progress(ctx, "deep_analysis", 0.70, "Running LLM-driven architectural analysis")
 
         # Step 2: LLM-driven deep analysis enriched with codebase data
-        if not llm:
-            raise RuntimeError("DeepAnalysisNode requires an LLM but none was provided")
+        llm = ctx.require_llm
 
         context_json: str = json.dumps(sanitize_context_for_prompt(context), indent=2, default=str)
         review_json: str = json.dumps(review, indent=2, default=str)
@@ -997,10 +965,10 @@ class DeepAnalysisNode(SubgraphAwareNode[ContextSubgraphState]):
         artifacts_output: Dict[str, Any] = {}
         context_output: Dict[str, Any] = {}
 
-        if artifact_svc:
+        if ctx.artifact_service:
             report_json = json.dumps(analysis_report, indent=2, default=str)
             summary = analysis_report.get("summary", "Deep analysis report")
-            ref = await artifact_svc.store(
+            ref = await ctx.artifact_service.store(
                 "context",
                 "deep_analysis.json",
                 report_json,
@@ -1017,8 +985,7 @@ class DeepAnalysisNode(SubgraphAwareNode[ContextSubgraphState]):
                 "deep_analysis_full": analysis_report,
             }
 
-        tokens_used: int = get_token_estimator().count_tokens(content) if content else 0
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, content if content else "")
 
         return NodeExecutionResult.success(
             output={
@@ -1031,12 +998,10 @@ class DeepAnalysisNode(SubgraphAwareNode[ContextSubgraphState]):
     def _parse_analysis_response(self, content: str) -> Dict[str, Any]:
         """Parse LLM response into structured analysis report."""
         try:
-            import re
-
-            json_match: re.Match[str] | None = re.search(r"\{[\s\S]*\}", content, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, KeyError):
+            parsed = parse_json_from_llm(content)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
             pass
         return {
             "architecture_implications": {
@@ -1074,7 +1039,7 @@ class FeedbackReviewNode(SubgraphAwareNode[ContextSubgraphState]):
         super().__init__(node_name="feedback_review")
         self.phase = "context"
         self.step_name = "feedback_review"
-        self.step_progress = 0.90  # Before phase review gate
+        self.step_progress = CONTEXT_PROGRESS["feedback_review"]
 
     @staticmethod
     def _to_camel_case(snake_str: str) -> str:
@@ -1161,43 +1126,7 @@ class FeedbackReviewNode(SubgraphAwareNode[ContextSubgraphState]):
         )
 
         # Build context items summary for frontend display.
-        # Prefer reference_urls_meta (artifact-backed) over raw URL strings.
-        # The CollectContextNode form stores keys under form-field IDs
-        # (reference_urls, primary_document, supporting_docs), while
-        # ContextData canonical names differ (extracted_urls,
-        # primary_document_id, supporting_doc_ids).  Check both to
-        # handle either naming convention.
-        context_items: dict[str, Any] = {}
-
-        # URLs with artifact metadata (preferred)
-        url_meta = context.get("reference_urls_meta")
-        if url_meta:
-            context_items["extracted_urls"] = url_meta
-        else:
-            # Fallback: raw URL strings (no artifact storage)
-            extracted_urls = context.get("extracted_urls") or context.get("reference_urls") or []
-            if isinstance(extracted_urls, str):
-                extracted_urls = [u.strip() for u in extracted_urls.split(",") if u.strip()]
-            if extracted_urls:
-                context_items["extracted_urls"] = [{"url": u} for u in extracted_urls]
-        rounds: list[ContextRound] = context.get("rounds", [])
-        if rounds:
-            context_items["rounds"] = rounds
-        primary_doc_id = context.get("primary_document_id") or context.get("primary_document") or ""
-        if primary_doc_id:
-            context_items["primary_document_id"] = primary_doc_id
-        # Merge reference URL doc IDs with user-uploaded supporting doc IDs.
-        # Both keys can be present; the old `or` short-circuit dropped uploads
-        # when reference URLs also existed.
-        supporting_ids: list[str] = list(context.get("supporting_doc_ids") or [])
-        form_supporting = context.get("supporting_docs") or []
-        if isinstance(form_supporting, str):
-            form_supporting = [s.strip() for s in form_supporting.split(",") if s.strip()]
-        for doc_id in form_supporting:
-            if doc_id and doc_id not in supporting_ids:
-                supporting_ids.append(doc_id)
-        if supporting_ids:
-            context_items["supporting_doc_ids"] = supporting_ids
+        context_items: ContextItemsSummary = build_context_items_for_display(context)
         supporting_doc_ids: list[str] = list(context_items.get("supporting_doc_ids", []))
 
         # Validate both primary_document_id and supporting_doc_ids against DB —

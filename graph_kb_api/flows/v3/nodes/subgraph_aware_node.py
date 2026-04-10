@@ -7,10 +7,12 @@ Subclasses implement _execute_step() instead of _execute_async().
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import abstractmethod
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Dict, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Generic, TypeVar, cast
 
 from langgraph.errors import GraphInterrupt
 from langgraph.types import RunnableConfig, interrupt
@@ -23,14 +25,30 @@ from graph_kb_api.flows.v3.models.types import ThreadConfigurable
 from graph_kb_api.flows.v3.nodes.base_node import BaseWorkflowNodeV3
 from graph_kb_api.flows.v3.services.artifact_service import ArtifactStorageError
 from graph_kb_api.flows.v3.services.budget_guard import BudgetExhaustedError, BudgetGuard
+from graph_kb_api.flows.v3.utils.artifact_utils import (
+    _infer_content_type as infer_content_type,
+    serialize_artifacts,
+)
+from graph_kb_api.flows.v3.utils.context_utils import build_context_items_summary
+from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator
 from graph_kb_api.flows.v3.state import ContextData, ResearchData
 from graph_kb_api.flows.v3.state.plan_state import (
     ApprovalInterruptPayload,
     ArtifactManifestEntry,
     ArtifactRef,
+    BasePlanSubgraphState,
+    BudgetState,
+    ContextItemsSummary,
+    ProgressEvent,
     TransitionEntry,
 )
 from graph_kb_api.websocket.plan_events import emit_budget_warning, emit_error, emit_phase_enter
+
+if TYPE_CHECKING:
+    from graph_kb_api.context import AppContext
+    from graph_kb_api.core.llm import LLMService
+    from graph_kb_api.flows.v3.services.artifact_service import ArtifactService
+    from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +64,50 @@ def _get_quota_error_class() -> type:
     return _LLMQuotaExhaustedError
 
 
-S = TypeVar("S")
+@dataclass(frozen=True, slots=True)
+class NodeContext:
+    """Bundled config/state values extracted once per node execution.
+
+    Replaces 40+ inline extraction blocks across plan nodes.
+    Created via ``SubgraphAwareNode._unpack(state, config)``.
+    """
+
+    services: ServiceRegistry
+    session_id: str
+    budget: BudgetState
+    phase: str
+    config: RunnableConfig
+    configurable: ThreadConfigurable
+    llm: LLMService | None
+    artifact_service: ArtifactService | None
+    workflow_context: WorkflowContext | None
+    client_id: str | None
+    progress_cb: Callable[[ProgressEvent], Awaitable[None]] | None
+    db_session_factory: AppContext | None
+
+    @property
+    def require_llm(self) -> LLMService:
+        """Return LLM or raise if not configured."""
+        if self.llm is None:
+            raise RuntimeError("LLM service not available in NodeContext")
+        return self.llm
+
+    @property
+    def require_artifact_service(self) -> ArtifactService:
+        """Return ArtifactService or raise if not configured."""
+        if self.artifact_service is None:
+            raise RuntimeError("ArtifactService not available in NodeContext")
+        return self.artifact_service
+
+    @property
+    def require_workflow_context(self) -> WorkflowContext:
+        """Return WorkflowContext or raise if not configured."""
+        if self.workflow_context is None:
+            raise RuntimeError("WorkflowContext not available in NodeContext")
+        return self.workflow_context
+
+
+S = TypeVar("S", bound=BasePlanSubgraphState)
 
 
 class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
@@ -117,15 +178,14 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
 
         if progress_cb and not self.skip_auto_progress:
             try:
-                await progress_cb(
-                    {
-                        "session_id": state.get("session_id", ""),
-                        "phase": self.phase,
-                        "step": self.step_name,
-                        "message": f"{self.step_name}...",
-                        "percent": self.step_progress,
-                    }
-                )
+                auto_event: ProgressEvent = {
+                    "session_id": state.get("session_id", ""),
+                    "phase": self.phase,
+                    "step": self.step_name,
+                    "message": f"{self.step_name}...",
+                    "percent": self.step_progress,
+                }
+                await progress_cb(auto_event)
             except Exception:
                 pass  # Fire-and-forget: silently drop on disconnect (Req 29.2)
 
@@ -143,15 +203,14 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
             # Emit budget exhaustion progress event (Req 28.1)
             if progress_cb:
                 try:
-                    await progress_cb(
-                        {
-                            "session_id": state.get("session_id", ""),
-                            "phase": self.phase,
-                            "step": self.step_name,
-                            "message": f"Budget exhausted: {exc}",
-                            "percent": self.step_progress,
-                        }
-                    )
+                    budget_event: ProgressEvent = {
+                        "session_id": state.get("session_id", ""),
+                        "phase": self.phase,
+                        "step": self.step_name,
+                        "message": f"Budget exhausted: {exc}",
+                        "percent": self.step_progress,
+                    }
+                    await progress_cb(budget_event)
                 except Exception:
                     pass  # Fire-and-forget (Req 29.2)
             # Emit budget warning so frontend BudgetIndicator shows warning state
@@ -300,8 +359,13 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
             # Must propagate to LangGraph so the workflow pauses correctly.
             raise
         except Exception as exc:
-            # Catch LLMQuotaExhaustedError without a top-level import (avoids circular deps)
-            if isinstance(exc, _get_quota_error_class()):
+            # Catch LLMQuotaExhaustedError without a top-level import (avoids circular deps).
+            # Also check __cause__ in case an agent wrapped the quota error in RuntimeError.
+            _quota_cls = _get_quota_error_class()
+            _is_quota = isinstance(exc, _quota_cls) or (
+                isinstance(getattr(exc, "__cause__", None), _quota_cls)
+            )
+            if _is_quota:
                 logger.error("LLM quota exhausted during %s/%s: %s", self.phase, self.step_name, exc)
                 try:
                     session_id = state.get("session_id", "")
@@ -407,56 +471,159 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
         raise NotImplementedError("Subclasses must implement _execute_step")
 
     # ------------------------------------------------------------------
+    # Config/state extraction helper
+    # ------------------------------------------------------------------
+
+    def _unpack(self, state: S, config: RunnableConfig) -> NodeContext:
+        """Extract commonly needed values from state and config into NodeContext.
+
+        Replaces 40+ inline extraction blocks across plan nodes.
+        Handles missing optional fields with sensible defaults.
+
+        Args:
+            state: Current subgraph state dict.
+            config: LangGraph RunnableConfig with configurable services.
+
+        Returns:
+            Populated NodeContext instance.
+        """
+        configurable: ThreadConfigurable = cast(
+            ThreadConfigurable, config.get("configurable", {})
+        )
+        services: ServiceRegistry = configurable.get("services", {})
+        workflow_context: WorkflowContext | None = configurable.get("context")
+
+        # Derive db_session_factory from workflow_context.app_context if available
+        db_session_factory: AppContext | None = None
+        if workflow_context is not None:
+            app_ctx: AppContext | None = getattr(workflow_context, "app_context", None)
+            if app_ctx is not None:
+                db_session_factory = app_ctx
+
+        # Extract typed fields from configurable.  The underlying dict is
+        # ``dict[str, Any]`` (LangGraph's RunnableConfig), so ``.get()``
+        # returns ``Any``.  We assign to typed locals so that downstream
+        # code benefits from static analysis even though there is no
+        # runtime enforcement on the dict values themselves.
+        llm: LLMService | None = configurable.get("llm")
+        artifact_service: ArtifactService | None = configurable.get("artifact_service")
+        client_id: str | None = configurable.get("client_id")
+        progress_cb: Callable[[ProgressEvent], Awaitable[None]] | None = configurable.get("progress_callback")
+
+        return NodeContext(
+            services=services,
+            session_id=state.get("session_id", ""),
+            budget=state.get("budget", {}),
+            phase=self.phase,
+            config=config,
+            configurable=configurable,
+            llm=llm,
+            artifact_service=artifact_service,
+            workflow_context=workflow_context,
+            client_id=client_id,
+            progress_cb=progress_cb,
+            db_session_factory=db_session_factory,
+        )
+
+    # ------------------------------------------------------------------
+    # Progress emission helper
+    # ------------------------------------------------------------------
+
+    async def _emit_progress(
+        self,
+        ctx: NodeContext,
+        step_name: str,
+        progress_pct: float,
+        message: str,
+    ) -> None:
+        """Emit a progress event, swallowing errors silently.
+
+        Args:
+            ctx: NodeContext from _unpack().
+            step_name: Step identifier within the phase.
+            progress_pct: Progress percentage (0.0 to 1.0).
+            message: Human-readable progress message.
+        """
+        if not ctx.progress_cb:
+            return
+        try:
+            event: ProgressEvent = {
+                "session_id": ctx.session_id,
+                "phase": self.phase,
+                "step": step_name,
+                "message": message,
+                "percent": progress_pct,
+            }
+            await ctx.progress_cb(event)
+        except Exception:
+            logger.warning("Progress emission failed for %s/%s", self.phase, step_name)
+
+    # ------------------------------------------------------------------
+    # Budget decrement helper
+    # ------------------------------------------------------------------
+
+    def _decrement_budget(
+        self,
+        budget: BudgetState,
+        content: str | dict,
+        llm_calls: int = 1,
+    ) -> BudgetState:
+        """Count tokens in content and decrement budget in one call.
+
+        Args:
+            budget: Current budget state.
+            content: Content to count tokens for (str or dict serialized to JSON).
+            llm_calls: Number of LLM calls to deduct.
+
+        Returns:
+            Updated BudgetState dict.
+        """
+        text = content if isinstance(content, str) else json.dumps(content, default=str)
+        tokens_used = get_token_estimator().count_tokens(text)
+        return BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+
+    # ------------------------------------------------------------------
     # Shared serialization helpers used by multiple plan node classes
     # ------------------------------------------------------------------
 
     @staticmethod
     def _infer_content_type(artifact_name: str) -> str:
         """Infer MIME content type from artifact file extension."""
-        if artifact_name.endswith(".json"):
-            return "application/json"
-        elif artifact_name.endswith(".md"):
-            return "text/markdown"
-        elif artifact_name.endswith(".jsonl"):
-            return "application/jsonl"
-        return "text/plain"
+        return infer_content_type(artifact_name)
 
     @staticmethod
     def _serialize_artifacts(artifacts: dict[str, ArtifactRef]) -> list[ArtifactManifestEntry]:
         """Convert PlanState.artifacts dict to a frontend-friendly manifest list.
 
-        Strips the ``specs/{session_id}/`` prefix from each key so the
-        frontend can pass the short key directly to ``GET /plan/sessions/{id}/artifacts/{key}``.
+        Thin wrapper around ``serialize_artifacts()`` from
+        ``graph_kb_api.flows.v3.utils.artifact_utils`` for backward
+        compatibility during migration.
         """
-        entries: list[ArtifactManifestEntry] = []
-        for name, ref in artifacts.items():
-            short_key = ref["key"]
-            # Strip "specs/{session_id}/" prefix → e.g. "research/full_findings.json"
-            if "/" in short_key:
-                short_key = short_key.split("/", 2)[-1]
-            entry: ArtifactManifestEntry = {
-                "key": short_key,
-                "summary": ref["summary"],
-                "size_bytes": ref["size_bytes"],
-                "created_at": ref["created_at"],
-                "content_type": SubgraphAwareNode._infer_content_type(short_key),
-            }
-            entries.append(entry)
-        return entries
+        return serialize_artifacts(artifacts)
 
     @staticmethod
     async def _load_context_items(
         session_id: str | None,
         research: ResearchData,
         context: ContextData | None = None,
-    ) -> dict[str, Any]:
-        """Load persisted context_items from DB, falling back to empty dict.
+    ) -> ContextItemsSummary:
+        """Load persisted context_items from DB and merge with a lightweight context summary.
 
         Reads context_items that FeedbackReviewNode persisted to the plan session,
-        and merges in any research findings doc IDs from artifacts.
-        Also merges uploaded document IDs from context state when provided.
+        then merges with the lightweight summary produced by
+        ``build_context_items_summary`` (which strips bulky fields and merges
+        research doc IDs).
         """
-        context_items: dict[str, Any] = {}
+        # Build lightweight summary from context state (strips bulky fields,
+        # merges research doc IDs).
+        summary: ContextItemsSummary = build_context_items_summary(
+            session_id,
+            research if research else ResearchData(),
+            context if context else ContextData(),
+        )
+
+        # Load DB-persisted context_items (from FeedbackReviewNode).
+        db_items: ContextItemsSummary = ContextItemsSummary()
         if session_id:
             try:
                 from graph_kb_api.database.plan_repositories import PlanSessionRepository
@@ -465,66 +632,23 @@ class SubgraphAwareNode(BaseWorkflowNodeV3, Generic[S]):
                     repo = PlanSessionRepository(db_session)
                     session: PlanSession | None = await repo.get(session_id)
                     if session and session.context_items:
-                        context_items = dict(session.context_items)
+                        db_items = cast(ContextItemsSummary, dict(session.context_items))
             except Exception as e:
                 logger.warning("Failed to load context_items: %s", e)
 
-        # Normalize DB context_items: _persist_runtime_snapshot may have overwritten
-        # FeedbackReviewNode's canonical DB write with raw ContextData that uses
-        # form-field keys (primary_document, supporting_docs) instead of canonical
-        # keys (primary_document_id, supporting_doc_ids).
-        primary_doc_id_db = (
-            context_items.get("primary_document_id") or context_items.get("primary_document") or ""
-        )
-        if primary_doc_id_db and not context_items.get("primary_document_id"):
-            context_items["primary_document_id"] = primary_doc_id_db
-        supporting_ids_db: list[str] = list(context_items.get("supporting_doc_ids") or [])
-        form_supporting_db = context_items.get("supporting_docs") or []
-        if isinstance(form_supporting_db, str):
-            form_supporting_db = [s.strip() for s in form_supporting_db.split(",") if s.strip()]
-        elif not isinstance(form_supporting_db, list):
-            form_supporting_db = []
-        for doc_id in form_supporting_db:
-            if doc_id and doc_id not in supporting_ids_db:
-                supporting_ids_db.append(doc_id)
-        if supporting_ids_db:
-            context_items["supporting_doc_ids"] = supporting_ids_db
+        # Merge DB items into the summary: DB values fill in gaps but don't
+        # overwrite context-state values (which are more up-to-date).
+        for key in db_items:
+            if key not in summary:
+                summary[key] = db_items[key]  # type: ignore[literal-required]
 
-        # Merge any research doc IDs from research state
-        research_doc_id: str | None = research.get("findings_doc_id")
-        if research_doc_id:
-            supporting = list(context_items.get("supporting_doc_ids", []))
-            if research_doc_id not in supporting:
-                supporting.append(research_doc_id)
-                context_items["supporting_doc_ids"] = supporting
+        # Merge supporting doc IDs from DB that may not be in context state
+        db_supporting: list[str] = list(db_items.get("supporting_doc_ids", []))
+        if db_supporting:
+            existing: list[str] = list(summary.get("supporting_doc_ids", []))
+            for doc_id in db_supporting:
+                if doc_id not in existing:
+                    existing.append(doc_id)
+            summary["supporting_doc_ids"] = existing
 
-        # Merge uploaded document IDs from context state so approval gates
-        # always show the full document set regardless of whether the DB
-        # context_items were persisted before the uploads were associated.
-        # Handle both canonical (primary_document_id) and form-field (primary_document) keys
-        # since CollectContextNode outputs form-field keys to state.
-        if context:
-            ctx_dict = cast(Dict[str, Any], context)
-            primary_doc_id: str = (
-                ctx_dict.get("primary_document_id") or ctx_dict.get("primary_document") or ""
-            )
-            if primary_doc_id and not context_items.get("primary_document_id"):
-                context_items["primary_document_id"] = primary_doc_id
-
-            ctx_supporting: list[str] = list(ctx_dict.get("supporting_doc_ids") or [])
-            form_sup = ctx_dict.get("supporting_docs") or []
-            if isinstance(form_sup, str):
-                form_sup = [s.strip() for s in form_sup.split(",") if s.strip()]
-            elif not isinstance(form_sup, list):
-                form_sup = []
-            for doc_id in form_sup:
-                if doc_id and doc_id not in ctx_supporting:
-                    ctx_supporting.append(doc_id)
-            if ctx_supporting:
-                existing_supporting = list(context_items.get("supporting_doc_ids", []))
-                for doc_id in ctx_supporting:
-                    if doc_id not in existing_supporting:
-                        existing_supporting.append(doc_id)
-                context_items["supporting_doc_ids"] = existing_supporting
-
-        return context_items
+        return summary

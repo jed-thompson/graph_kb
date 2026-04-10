@@ -6,6 +6,7 @@ import { Card } from '@/components/ui/card';
 import { Check, ArrowRight, Loader2, ArrowLeft } from 'lucide-react';
 import type { PlanPhaseId } from '@/lib/store/planStore';
 import type { PhaseField } from '@shared/websocket-events';
+import { PHASE_TITLES } from '../PlanContext';
 import { FieldRenderer } from './FieldRenderer';
 import { ResultValueRenderer } from './ResultValueRenderer';
 import { cleanAIText } from '@/lib/utils/cleanAIText';
@@ -22,15 +23,6 @@ export interface PhaseReviewFormProps {
     /** Plan session ID — forwarded to FieldRenderer for plan-scoped uploads. */
     sessionId?: string | null;
 }
-
-// Phase display names
-const PHASE_DISPLAY_NAMES: Record<string, string> = {
-    context: 'Context',
-    research: 'Research',
-    planning: 'Planning',
-    orchestrate: 'Orchestration',
-    assembly: 'Assembly',
-};
 
 /** Summary keys to hide from the rendered display. */
 const HIDDEN_RESULT_KEYS = new Set(['evaluation_method']);
@@ -71,8 +63,8 @@ export function PhaseReviewForm({
         }
     };
 
-    const phaseDisplayName = PHASE_DISPLAY_NAMES[phase] || phase;
-    const nextPhaseDisplayName = PHASE_DISPLAY_NAMES[nextPhase] || nextPhase;
+    const phaseDisplayName = PHASE_TITLES[phase as PlanPhaseId]?.title || phase;
+    const nextPhaseDisplayName = PHASE_TITLES[nextPhase as PlanPhaseId]?.title || nextPhase;
 
     // Default options if not provided
     const displayOptions = options && options.length > 0

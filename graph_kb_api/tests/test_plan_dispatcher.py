@@ -473,6 +473,242 @@ class TestPlanDispatcherTerminalStateHandling:
         )
 
 
+class TestReconstructPhaseFromLog:
+    """Tests for _reconstruct_phase_from_log helper."""
+
+    def test_empty_transition_log_returns_none(self):
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        phase, step, progress = PlanDispatcher._reconstruct_phase_from_log({})
+        assert phase is None
+        assert step is None
+        assert progress is None
+
+    def test_none_transition_log_returns_none(self):
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        phase, step, progress = PlanDispatcher._reconstruct_phase_from_log(
+            {"transition_log": None}
+        )
+        assert phase is None
+        assert step is None
+        assert progress is None
+
+    def test_valid_transition_log_returns_last_phase(self):
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        state = {
+            "transition_log": [
+                {"timestamp": "t1", "from_node": "node_a", "to_node": "next", "subgraph": "context", "reason": "step_complete", "budget_snapshot": {}},
+                {"timestamp": "t2", "from_node": "node_b", "to_node": "next", "subgraph": "research", "reason": "step_complete", "budget_snapshot": {}},
+            ],
+            "fingerprints": {},
+        }
+        phase, step, progress = PlanDispatcher._reconstruct_phase_from_log(state)
+        assert phase == "research"
+        assert step == "node_b"
+
+    def test_fingerprint_advances_to_next_phase(self):
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        state = {
+            "transition_log": [
+                {"timestamp": "t1", "from_node": "node_a", "to_node": "next", "subgraph": "research", "reason": "step_complete", "budget_snapshot": {}},
+            ],
+            "fingerprints": {
+                "research": {"phase": "research", "input_hash": "abc", "output_refs": [], "completed_at": "t1"},
+            },
+        }
+        phase, step, progress = PlanDispatcher._reconstruct_phase_from_log(state)
+        assert phase == "planning"
+        assert step is None
+        assert progress == 0.0
+
+    def test_last_phase_fingerprint_does_not_advance_past_assembly(self):
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        state = {
+            "transition_log": [
+                {"timestamp": "t1", "from_node": "node_a", "to_node": "next", "subgraph": "assembly", "reason": "step_complete", "budget_snapshot": {}},
+            ],
+            "fingerprints": {
+                "assembly": {"phase": "assembly", "input_hash": "abc", "output_refs": [], "completed_at": "t1"},
+            },
+        }
+        # assembly is the last phase, fingerprint should not advance
+        phase, step, progress = PlanDispatcher._reconstruct_phase_from_log(state)
+        assert phase == "assembly"
+        assert step == "node_a"
+
+    def test_invalid_entries_skipped(self):
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        state = {
+            "transition_log": [
+                {"timestamp": "t1", "from_node": "node_a", "to_node": "next", "subgraph": "context", "reason": "step_complete", "budget_snapshot": {}},
+                "not_a_dict",
+                {"timestamp": "t2", "from_node": "node_b"},  # missing subgraph
+            ],
+            "fingerprints": {},
+        }
+        phase, step, progress = PlanDispatcher._reconstruct_phase_from_log(state)
+        assert phase == "context"
+        assert step == "node_a"
+
+
+class TestRecoverStaleState:
+    """Tests for the consolidated _recover_stale_state method."""
+
+    @pytest.mark.asyncio
+    async def test_recover_stale_state_delegates_to_terminal_completion(self):
+        """_recover_stale_state delegates to _recover_stale_terminal_completion."""
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        mock_engine = MagicMock()
+        mock_engine.workflow = MagicMock()
+        mock_engine.workflow.aupdate_state = AsyncMock()
+
+        state = {
+            "workflow_status": "completed",
+            "completed_phases": {"assembly": True},
+            "document_manifest": {
+                "entries": [],
+                "composed_index_ref": {"key": "output/index.md"},
+            },
+        }
+
+        with (
+            patch.object(PlanDispatcher, "_persist_runtime_snapshot", new=AsyncMock()),
+            patch(f"{DISPATCHER_MOD}.emit_complete", new=AsyncMock()) as mock_emit_complete,
+        ):
+            recovered = await PlanDispatcher._recover_stale_state(
+                session_id="session-1",
+                thread_id="plan-session-1",
+                user_id="client-1",
+                client_id="client-1",
+                workflow_id="wf-1",
+                engine=mock_engine,
+                config={"configurable": {"thread_id": "plan-session-1"}},
+                state=state,
+            )
+
+        assert recovered is True
+        mock_emit_complete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_recover_stale_state_logs_warning_on_empty_transition_log(self):
+        """When transition_log is empty, _recover_stale_state logs a warning and falls back."""
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        mock_engine = MagicMock()
+        mock_engine.workflow = MagicMock()
+        mock_engine.workflow.aupdate_state = AsyncMock()
+
+        state = {
+            "workflow_status": "running",
+            "completed_phases": {"context": True, "research": True},
+            "transition_log": [],
+            "fingerprints": {},
+        }
+
+        with (
+            patch.object(PlanDispatcher, "_recover_stale_terminal_completion", new=AsyncMock(return_value=False)),
+            patch(f"{DISPATCHER_MOD}.logger") as mock_logger,
+        ):
+            recovered = await PlanDispatcher._recover_stale_state(
+                session_id="session-1",
+                thread_id="plan-session-1",
+                user_id="client-1",
+                client_id="client-1",
+                workflow_id="wf-1",
+                engine=mock_engine,
+                config={"configurable": {"thread_id": "plan-session-1"}},
+                state=state,
+            )
+
+        assert recovered is False
+        # Should have logged a warning about falling back
+        mock_logger.warning.assert_called()
+        warning_msg = mock_logger.warning.call_args[0][0]
+        assert "transition_log empty/incomplete" in warning_msg
+
+    @pytest.mark.asyncio
+    async def test_recover_stale_state_uses_paused_phase_fallback(self):
+        """When transition_log is empty but paused_phase is set, uses it as fallback."""
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        mock_engine = MagicMock()
+        mock_engine.workflow = MagicMock()
+        mock_engine.workflow.aupdate_state = AsyncMock()
+
+        state = {
+            "workflow_status": "paused",
+            "completed_phases": {},
+            "paused_phase": "research",
+            "transition_log": [],
+            "fingerprints": {},
+        }
+
+        with (
+            patch.object(PlanDispatcher, "_recover_stale_terminal_completion", new=AsyncMock(return_value=False)),
+            patch(f"{DISPATCHER_MOD}.logger") as mock_logger,
+        ):
+            recovered = await PlanDispatcher._recover_stale_state(
+                session_id="session-1",
+                thread_id="plan-session-1",
+                user_id="client-1",
+                client_id="client-1",
+                workflow_id="wf-1",
+                engine=mock_engine,
+                config={"configurable": {"thread_id": "plan-session-1"}},
+                state=state,
+            )
+
+        assert recovered is False
+        warning_msg = mock_logger.warning.call_args[0][0]
+        assert "transition_log empty/incomplete" in warning_msg
+        # The fallback_phase is passed as a positional format arg
+        assert mock_logger.warning.call_args[0][1] == "research"
+
+    @pytest.mark.asyncio
+    async def test_recover_stale_state_no_warning_when_log_present(self):
+        """When transition_log has valid entries, no fallback warning is logged."""
+        from graph_kb_api.websocket.handlers.plan_dispatcher import PlanDispatcher
+
+        mock_engine = MagicMock()
+        mock_engine.workflow = MagicMock()
+        mock_engine.workflow.aupdate_state = AsyncMock()
+
+        state = {
+            "workflow_status": "running",
+            "completed_phases": {},
+            "transition_log": [
+                {"timestamp": "t1", "from_node": "node_a", "to_node": "next", "subgraph": "context", "reason": "step_complete", "budget_snapshot": {}},
+            ],
+            "fingerprints": {},
+        }
+
+        with (
+            patch.object(PlanDispatcher, "_recover_stale_terminal_completion", new=AsyncMock(return_value=False)),
+            patch(f"{DISPATCHER_MOD}.logger") as mock_logger,
+        ):
+            recovered = await PlanDispatcher._recover_stale_state(
+                session_id="session-1",
+                thread_id="plan-session-1",
+                user_id="client-1",
+                client_id="client-1",
+                workflow_id="wf-1",
+                engine=mock_engine,
+                config={"configurable": {"thread_id": "plan-session-1"}},
+                state=state,
+            )
+
+        assert recovered is False
+        # No warning should be logged when transition_log is present
+        for call in mock_logger.warning.call_args_list:
+            assert "transition_log empty/incomplete" not in call[0][0]
+
+
 class TestPlanDispatcherCreateEngine:
     """Regression tests for plan engine dependency wiring."""
 

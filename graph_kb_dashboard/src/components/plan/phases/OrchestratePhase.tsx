@@ -24,6 +24,7 @@ import { BasePhaseContent } from './BasePhaseContent';
 
 interface ManifestEntry {
     taskId: string;
+    taskName?: string;
     specSection: string;
     status: string;
     tokenCount: number;
@@ -117,7 +118,7 @@ function DocumentManifestPanel({ manifest }: { manifest: DocumentManifestData })
                             <div className="flex items-center gap-2 min-w-0">
                                 <FileText className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
                                 <span className="text-xs text-slate-700 dark:text-slate-300 truncate">
-                                    {entry.specSection || entry.taskId}
+                                    {entry.taskName || entry.specSection || entry.taskId}
                                 </span>
                             </div>
                             <div className="flex items-center gap-2 shrink-0">

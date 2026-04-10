@@ -156,6 +156,11 @@ class LLMService(BaseChatModel):
         formatted_tools = [convert_to_openai_tool(t) for t in tools]
         bind_kwargs: dict[str, Any] = {"tools": formatted_tools, **kwargs}
         if tool_choice is not None:
+            # OpenAI doesn't support 'any' — convert to 'required' which is
+            # the equivalent. BaseChatModel.with_structured_output passes
+            # tool_choice="any" by default.
+            if tool_choice == "any":
+                tool_choice = "required"
             bind_kwargs["tool_choice"] = tool_choice
         return RunnableBinding(bound=self, kwargs=bind_kwargs)
 

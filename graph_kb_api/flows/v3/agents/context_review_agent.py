@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, cast
 
 from langchain_core.messages import AIMessage
 
-from graph_kb_api.core.llm import LLMService
+from graph_kb_api.core.llm import LLMService, LLMQuotaExhaustedError
 from graph_kb_api.flows.v3.agents.base_agent import AgentCapability, BaseAgent
 from graph_kb_api.flows.v3.agents.personas import get_agent_prompt_manager
 from graph_kb_api.flows.v3.models.types import AgentResult, AgentTask
@@ -170,6 +170,13 @@ class ContextReviewAgent(BaseAgent):
             )
 
         except Exception as e:
+            # Re-raise quota exhaustion so the node-level handler can emit
+            # a proper error to the UI instead of silently degrading
+            if isinstance(e, LLMQuotaExhaustedError) or (
+                isinstance(e.__cause__, LLMQuotaExhaustedError) if e.__cause__ else False
+            ):
+                raise
+
             logger.error(f"ContextReviewAgent failed: {e}", exc_info=True)
             return AgentResult(
                 agent_type="context_review",
@@ -344,6 +351,10 @@ class ContextReviewAgent(BaseAgent):
             content: str = str(raw_content) if not isinstance(raw_content, str) else raw_content
             return self._parse_llm_response(content, context)
         except Exception as e:
+            # Let quota errors propagate without wrapping
+            from graph_kb_api.core.llm import LLMQuotaExhaustedError
+            if isinstance(e, LLMQuotaExhaustedError):
+                raise
             logger.error(f"LLM analysis failed: {e}")
             raise RuntimeError(f"ContextReviewAgent LLM call failed: {e}") from e
 

@@ -14,7 +14,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping
 
-from graph_kb_api.core.llm import LLMService
+from graph_kb_api.core.llm import LLMService, LLMQuotaExhaustedError
 from graph_kb_api.flows.v3.agents.personas import get_agent_prompt_manager
 from graph_kb_api.flows.v3.utils.context_utils import append_document_context_to_prompt
 
@@ -203,6 +203,13 @@ class ResearchAgent(BaseAgent):
             await self._emit_progress(state, "research_complete", "Research complete", 100)
 
         except Exception as e:
+            # Re-raise quota exhaustion so the node-level handler can emit
+            # a proper error to the UI instead of silently degrading
+            if isinstance(e, LLMQuotaExhaustedError) or (
+                isinstance(e.__cause__, LLMQuotaExhaustedError) if e.__cause__ else False
+            ):
+                raise
+
             logger.error(f"Research agent failed: {e}", exc_info=True)
             # Return partial findings with error
             findings.summary = f"Research partially completed. Error: {str(e)}"

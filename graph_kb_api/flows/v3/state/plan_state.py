@@ -3,6 +3,7 @@ from __future__ import annotations
 """PlanState schema for the /plan command built on LangGraph."""
 
 import operator
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Union
 
@@ -105,6 +106,7 @@ class DocumentManifestEntry(TypedDict):
     """Tracks a single deliverable document produced by orchestration."""
 
     task_id: str
+    task_name: str  # human-readable section title (e.g. "OntTrac Purchase Label Contract Freeze")
     spec_section: str  # e.g. "5.3 Rates & Transit Times"
     artifact_ref: ArtifactRef
     status: str  # "draft" | "reviewed" | "final" | "failed" | "error"
@@ -127,6 +129,32 @@ class DocumentManifest(TypedDict):
     total_tokens: int
     created_at: str
     finalized_at: str | None
+
+
+def create_empty_manifest(session_id: str, spec_name: str) -> DocumentManifest:
+    """Factory for an empty DocumentManifest with default field values.
+
+    Replaces inline initialization blocks in BudgetCheckNode, TaskSelectorNode,
+    and WorkerNode.
+
+    Args:
+        session_id: Current plan session identifier.
+        spec_name: Name of the specification being processed.
+
+    Returns:
+        A DocumentManifest dict with empty entries and zeroed counters.
+    """
+    return DocumentManifest(
+        session_id=session_id,
+        spec_name=spec_name,
+        primary_spec_ref=None,
+        entries=[],
+        composed_index_ref=None,
+        total_documents=0,
+        total_tokens=0,
+        created_at=datetime.now(UTC).isoformat(),
+        finalized_at=None,
+    )
 
 
 class BudgetState(TypedDict, total=False):
@@ -183,6 +211,48 @@ class ArtifactManifestEntry(TypedDict):
     content_type: str
 
 
+class WorkflowError(TypedDict):
+    """Structured error dict stored in state and emitted via WebSocket."""
+
+    message: str
+    code: str
+    phase: str
+
+
+class ProgressEvent(TypedDict):
+    """Payload shape for progress callback emissions."""
+
+    session_id: str
+    phase: str
+    step: str
+    message: str
+    percent: float
+
+
+class ContextItemsSummary(TypedDict, total=False):
+    """Lightweight context summary for interrupt payloads and DB snapshots.
+
+    Produced by ``build_context_items_summary()`` and ``_load_context_items()``.
+    Contains the non-bulky subset of ContextData fields plus DB-persisted items
+    from FeedbackReviewNode.
+    """
+
+    # From ContextData (non-bulky fields)
+    spec_name: str
+    spec_description: str
+    user_explanation: str
+    constraints: str
+    primary_document_id: str
+    supporting_doc_ids: List[str]
+    target_repo_id: str
+    validated: bool
+
+    # From FeedbackReviewNode DB persistence
+    extracted_urls: List[Dict[str, Any]]  # [{url, document_id?, summary?, size_bytes?}]
+    rounds: List[Dict[str, Any]]  # ContextRound dicts
+    reference_urls_meta: List[Dict[str, Any]]
+
+
 class ApprovalInterruptPayload(TypedDict):
     """Payload for approval-type interrupts (research/planning/assembly/budget).
 
@@ -198,7 +268,7 @@ class ApprovalInterruptPayload(TypedDict):
     message: str
     options: List[InterruptOption]
     artifacts: List[ArtifactManifestEntry]
-    context_items: NotRequired[Dict[str, Any]]
+    context_items: NotRequired[ContextItemsSummary]
     tasks: NotRequired[List[Dict[str, Any]]]
     task_results: NotRequired[List[Dict[str, Any]]]
 
@@ -215,7 +285,7 @@ class AnalysisReviewInterruptPayload(TypedDict):
     suggested_actions: list[dict[str, Any]]
     architecture_analysis: Dict[str, Any]
     message: str
-    context_items: Dict[str, Any]
+    context_items: ContextItemsSummary
     artifacts: List[ArtifactManifestEntry]
 
 
@@ -288,13 +358,37 @@ def _manifest_reducer(
     }
 
 
-class PlanState(TypedDict):
-    """Consolidated state for the /plan command with hybrid storage."""
+class BasePlanSubgraphState(TypedDict):
+    """Shared fields for all plan subgraph states.
+
+    All plan subgraph state classes inherit from this base, declaring only
+    phase-specific fields.  LangGraph's ``StateGraph`` resolves annotations
+    via ``get_type_hints(include_extras=True)`` which traverses the MRO,
+    so reducer annotations on these shared fields are preserved in every
+    subclass.
+    """
 
     artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
     budget: Annotated[BudgetState, _budget_reducer]
     transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
     fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
+    completed_phases: Annotated[Dict[str, bool], _last_write_wins]
+    session_id: NotRequired[str]
+    workflow_status: Annotated[
+        Literal[
+            "idle", "running", "paused", "completed", "error",
+            "budget_exhausted", "rejected",
+        ],
+        _workflow_status_reducer,
+    ]
+    paused_phase: NotRequired[str]
+    navigation: NavigationState
+    messages: Annotated[list, add_messages]
+
+
+class PlanState(BasePlanSubgraphState):
+    """Consolidated state for the /plan command with hybrid storage."""
+
     context: Annotated[ContextData, operator.or_]
     review: Annotated[ReviewData, operator.or_]
     research: Annotated[ResearchData, operator.or_]
@@ -302,7 +396,6 @@ class PlanState(TypedDict):
     orchestrate: Annotated[OrchestrateData, operator.or_]
     completeness: Annotated[CompletenessData, operator.or_]
     generate: Annotated[GenerateData, operator.or_]
-    completed_phases: Annotated[Dict[str, bool], _last_write_wins]
     # Multi-document manifest (top-level so it survives prune nodes
     # and is accessible across orchestrate + assembly subgraphs).
     document_manifest: Annotated[DocumentManifest | None, _manifest_reducer]
@@ -310,107 +403,55 @@ class PlanState(TypedDict):
     needs_re_orchestrate: NotRequired[bool]
     re_execute_task_ids: NotRequired[list[str]]
     re_orchestration_count: NotRequired[int]
-    session_id: NotRequired[str]
-    workflow_status: Annotated[Literal["idle", "running", "paused", "completed", "error", "budget_exhausted", "rejected"], _workflow_status_reducer]
-    error: NotRequired[Dict[str, Any]]
-    paused_phase: NotRequired[str]
-    navigation: NavigationState
-    messages: Annotated[list, add_messages]
+    error: NotRequired[WorkflowError]
 
 
-class ContextSubgraphState(TypedDict):
+class ContextSubgraphState(BasePlanSubgraphState):
     """State for the context subgraph."""
 
-    artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: Annotated[BudgetState, _budget_reducer]
-    transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
-    fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     context: Annotated[ContextData, operator.or_]
     review: Annotated[ReviewData, operator.or_]
-    completed_phases: Annotated[Dict[str, bool], _last_write_wins]
-    session_id: NotRequired[str]
-    workflow_status: Annotated[Literal["idle", "running", "paused", "completed", "error", "budget_exhausted", "rejected"], _workflow_status_reducer]
-    paused_phase: NotRequired[str]
-    navigation: NavigationState
-    messages: Annotated[list, add_messages]
 
 
-class ResearchSubgraphState(TypedDict):
+class ResearchSubgraphState(BasePlanSubgraphState):
     """State for the research subgraph."""
 
-    artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: Annotated[BudgetState, _budget_reducer]
-    transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
-    fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     context: Annotated[ContextData, operator.or_]  # For FormulateQueriesNode, GapCheckNode
     review: Annotated[ReviewData, operator.or_]  # For ReviewNode, DeepAnalysisNode
     research: Annotated[ResearchData, operator.or_]
-    completed_phases: Annotated[Dict[str, bool], _last_write_wins]
-    session_id: NotRequired[str]
-    workflow_status: Annotated[Literal["idle", "running", "paused", "completed", "error", "budget_exhausted", "rejected"], _workflow_status_reducer]
-    paused_phase: NotRequired[str]
-    navigation: NavigationState
-    messages: Annotated[list, add_messages]
 
 
-class PlanningSubgraphState(TypedDict):
+class PlanningSubgraphState(BasePlanSubgraphState):
     """State for the planning subgraph."""
 
-    artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: Annotated[BudgetState, _budget_reducer]
-    transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
-    fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
-    context: Annotated[
-        ContextData, operator.or_
-    ]  # For RoadmapNode, FeasibilityNode, DecomposeNode, AlignNode, AssignNode
+    context: Annotated[ContextData, operator.or_]  # For RoadmapNode, FeasibilityNode, DecomposeNode, AlignNode, AssignNode
     research: Annotated[ResearchData, operator.or_]  # For all planning nodes
     plan: Annotated[PlanData, operator.or_]
-    completed_phases: Annotated[Dict[str, bool], _last_write_wins]
-    session_id: NotRequired[str]
-    workflow_status: Annotated[Literal["idle", "running", "paused", "completed", "error", "budget_exhausted", "rejected"], _workflow_status_reducer]
-    paused_phase: NotRequired[str]
-    navigation: NavigationState
-    messages: Annotated[list, add_messages]
 
 
-class OrchestrateSubgraphState(TypedDict):
+class OrchestrateSubgraphState(BasePlanSubgraphState):
     """State for the orchestrate subgraph."""
 
-    artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: Annotated[BudgetState, _budget_reducer]
-    transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
-    fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     context: Annotated[ContextData, operator.or_]  # For FetchContextNode, TaskResearchNode
     research: Annotated[ResearchData, operator.or_]  # For TaskResearchNode, FetchContextNode
     orchestrate: Annotated[OrchestrateData, operator.or_]
     plan: Annotated[PlanData, operator.or_]
-    completed_phases: Annotated[Dict[str, bool], _last_write_wins]
     # Multi-document manifest — must be present in subgraph state for
     # WorkerNode read-modify-write (LangGraph subgraph states are independent
     # schemas; keys not declared here are silently dropped from node outputs).
     document_manifest: Annotated[DocumentManifest | None, _manifest_reducer]
-    session_id: NotRequired[str]
-    workflow_status: Annotated[Literal["idle", "running", "paused", "completed", "error", "budget_exhausted", "rejected"], _workflow_status_reducer]
-    error: NotRequired[Dict[str, Any]]
-    paused_phase: NotRequired[str]
-    navigation: NavigationState
-    messages: Annotated[list, add_messages]
+    error: NotRequired[WorkflowError]
 
 
-class AssemblySubgraphState(TypedDict):
+class AssemblySubgraphState(BasePlanSubgraphState):
     """State for the assembly subgraph."""
 
-    artifacts: Annotated[Dict[str, ArtifactRef], operator.or_]
-    budget: Annotated[BudgetState, _budget_reducer]
-    transition_log: Annotated[List[TransitionEntry], _capped_list_add(50)]
-    fingerprints: Annotated[Dict[str, PhaseFingerprint], operator.or_]
     orchestrate: Annotated[OrchestrateData, operator.or_]
     plan: Annotated[PlanData, operator.or_]
     context: Annotated[ContextData, operator.or_]
     research: Annotated[ResearchData, operator.or_]
     completeness: Annotated[CompletenessData, operator.or_]
     generate: Annotated[GenerateData, operator.or_]
-    completed_phases: Annotated[Dict[str, bool], _last_write_wins]
     # Multi-document manifest — must be present so GenerateNode, CompositionReviewNode,
     # AssembleNode, and FinalizeNode can read/write manifest entries within this subgraph.
     document_manifest: Annotated[DocumentManifest | None, _manifest_reducer]
@@ -418,11 +459,6 @@ class AssemblySubgraphState(TypedDict):
     needs_re_orchestrate: NotRequired[bool]
     re_execute_task_ids: NotRequired[list[str]]
     re_orchestration_count: NotRequired[int]
-    session_id: NotRequired[str]
-    workflow_status: Annotated[Literal["idle", "running", "paused", "completed", "error", "budget_exhausted", "rejected"], _workflow_status_reducer]
-    paused_phase: NotRequired[str]
-    navigation: NavigationState
-    messages: Annotated[list, add_messages]
 
 
 CASCADE_MAP: Dict[PlanPhase, List[PlanPhase]] = {
@@ -433,15 +469,32 @@ CASCADE_MAP: Dict[PlanPhase, List[PlanPhase]] = {
     PlanPhase.ASSEMBLY: [],
 }
 
-PHASE_WEIGHTS: Dict[PlanPhase, float] = {
-    PlanPhase.CONTEXT: 0.05,
-    PlanPhase.RESEARCH: 0.15,
-    PlanPhase.PLANNING: 0.10,
-    PlanPhase.ORCHESTRATE: 0.50,
-    PlanPhase.ASSEMBLY: 0.20,
+PHASE_DISPLAY_NAMES: Dict[PlanPhase, str] = {
+    PlanPhase.CONTEXT: "Context Collection",
+    PlanPhase.RESEARCH: "Research",
+    PlanPhase.PLANNING: "Planning",
+    PlanPhase.ORCHESTRATE: "Execution",
+    PlanPhase.ASSEMBLY: "Assembly",
 }
 
-RESEARCH_NODE_PROGRESS: Dict[str, float] = {
+# ---------------------------------------------------------------------------
+# Per-phase progress step dictionaries (Req 16)
+#
+# Each dict maps step names to a progress fraction within that phase.
+# Values are monotonically non-decreasing in insertion order, start at 0.0,
+# and end in [0.95, 1.0].
+# ---------------------------------------------------------------------------
+
+CONTEXT_PROGRESS: Dict[str, float] = {
+    "validate_context": 0.0,
+    "collect_context": 0.25,
+    "review": 0.50,
+    "deep_analysis": 0.75,
+    "feedback_review": 0.90,
+    "complete": 1.0,
+}
+
+RESEARCH_PROGRESS: Dict[str, float] = {
     "formulate_queries": 0.0,
     "dispatch_research": 0.50,
     "aggregate": 0.65,
@@ -450,6 +503,50 @@ RESEARCH_NODE_PROGRESS: Dict[str, float] = {
     "approval": 1.00,
 }
 
-assert abs(sum(PHASE_WEIGHTS.values()) - 1.0) < 1e-9, (
-    f"PHASE_WEIGHTS must sum to 1.0, got {sum(PHASE_WEIGHTS.values())}"
-)
+# Backward-compatible alias — existing code imports this name.
+RESEARCH_NODE_PROGRESS = RESEARCH_PROGRESS
+
+PLANNING_PROGRESS: Dict[str, float] = {
+    "roadmap": 0.0,
+    "feasibility": 0.15,
+    "decompose": 0.30,
+    "validate_dag": 0.50,
+    "assign": 0.65,
+    "align": 0.80,
+    "approval": 1.0,
+}
+
+ORCHESTRATE_PROGRESS: Dict[str, float] = {
+    "budget_check": 0.0,
+    "task_selector": 0.0,
+    "fetch_context": 0.15,
+    "gap": 0.25,
+    "task_context_input": 0.25,
+    "task_research": 0.30,
+    "tool_plan": 0.35,
+    "dispatch": 0.45,
+    "worker": 0.60,
+    "critique": 0.80,
+    "prune_after_orchestrate": 1.0,
+    "progress": 1.0,
+}
+
+ASSEMBLY_PROGRESS: Dict[str, float] = {
+    "completeness": 0.0,
+    "template": 0.15,
+    "generate": 0.35,
+    "consistency": 0.55,
+    "composition_review": 0.60,
+    "assemble": 0.70,
+    "validate": 0.85,
+    "approval": 1.0,
+    "finalize": 1.0,
+}
+
+PHASE_PROGRESS: Dict[str, Dict[str, float]] = {
+    "context": CONTEXT_PROGRESS,
+    "research": RESEARCH_PROGRESS,
+    "planning": PLANNING_PROGRESS,
+    "orchestrate": ORCHESTRATE_PROGRESS,
+    "assembly": ASSEMBLY_PROGRESS,
+}

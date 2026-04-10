@@ -4,11 +4,12 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import dynamic from 'next/dynamic';
 import {
   Network, GitBranch, Layers, TrendingUp, RefreshCw,
-  Workflow, Flame, Link2, Globe,
+  Workflow, Flame, Link2, Globe, SlidersHorizontal,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { Slider } from '@/components/ui/slider';
 import NodeDetails from '@/components/visualization/NodeDetails';
 import { GraphNode, GraphEdge, VisualizationType } from '@/lib/types/api';
 import { apiClient } from '@/lib/api/client';
@@ -33,6 +34,17 @@ const VIZ_TYPES: { type: VisualizationType; label: string; icon: React.ReactNode
   { type: 'hotspots', label: 'Hotspots', icon: <Flame className="h-4 w-4" /> },
 ];
 
+/** Default node limit and max traversal depth per visualization type. */
+const VIZ_DEFAULTS: Record<VisualizationType, { limit: number; maxDepth: number }> = {
+  architecture: { limit: 500, maxDepth: 15 },
+  calls:        { limit: 5000, maxDepth: 15 },
+  dependencies: { limit: 2000, maxDepth: 3 },
+  full:         { limit: 500, maxDepth: 15 },
+  comprehensive:{ limit: 1000, maxDepth: 15 },
+  call_chain:   { limit: 500, maxDepth: 15 },
+  hotspots:     { limit: 50, maxDepth: 15 },
+};
+
 export default function VisualizePage() {
   const [repositories, setRepositories] = useState<string[]>([]);
   const [selectedRepo, setSelectedRepo] = useState<string>('');
@@ -46,6 +58,9 @@ export default function VisualizePage() {
   const [symbolInput, setSymbolInput] = useState<string>('');
   const [suggestions, setSuggestions] = useState<Array<{ name: string; kind: string; file_path: string }>>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [nodeLimit, setNodeLimit] = useState(VIZ_DEFAULTS.architecture.limit);
+  const [maxDepth, setMaxDepth] = useState(VIZ_DEFAULTS.architecture.maxDepth);
+  const [showControls, setShowControls] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -58,6 +73,13 @@ export default function VisualizePage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRepo, vizType]);
+
+  // Reset slider defaults when viz type changes
+  useEffect(() => {
+    const defaults = VIZ_DEFAULTS[vizType];
+    setNodeLimit(defaults.limit);
+    setMaxDepth(defaults.maxDepth);
+  }, [vizType]);
 
   useEffect(() => {
     if (!symbolInput.trim() || !selectedRepo || vizType !== 'call_chain') {
@@ -104,6 +126,8 @@ export default function VisualizePage() {
     try {
       const response = await getVisualization(selectedRepo, vizType, {
         symbolName: vizType === 'call_chain' ? symbolInput : undefined,
+        limit: nodeLimit,
+        maxDepth: maxDepth,
       });
       setNodes(
         response.nodes.map((n, i) => ({
@@ -227,7 +251,106 @@ export default function VisualizePage() {
         <Button variant="outline" size="sm" onClick={loadVisualization} aria-label="Refresh">
           <RefreshCw className="h-4 w-4" />
         </Button>
+
+        <Button
+          variant={showControls ? 'default' : 'outline'}
+          size="sm"
+          onClick={() => setShowControls(!showControls)}
+          aria-label="Toggle graph controls"
+        >
+          <SlidersHorizontal className="h-4 w-4" />
+          <span className="ml-2">Controls</span>
+        </Button>
       </div>
+
+      {showControls && (
+        <Card>
+          <CardContent className="py-4 space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-medium" htmlFor="node-limit-slider">
+                    Node Limit
+                  </label>
+                  <input
+                    type="number"
+                    id="node-limit-input"
+                    value={nodeLimit}
+                    onChange={(e) => {
+                      const v = Math.max(1, Math.min(10000, Number(e.target.value) || 1));
+                      setNodeLimit(v);
+                    }}
+                    className="w-20 px-2 py-1 text-sm border rounded-md bg-background text-right"
+                    min={1}
+                    max={10000}
+                    aria-label="Node limit value"
+                  />
+                </div>
+                <Slider
+                  id="node-limit-slider"
+                  min={10}
+                  max={10000}
+                  step={10}
+                  value={[nodeLimit]}
+                  onValueChange={([v]) => setNodeLimit(v)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Max nodes returned by the query (default: {VIZ_DEFAULTS[vizType].limit})
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-medium" htmlFor="depth-slider">
+                    Traversal Depth
+                  </label>
+                  <input
+                    type="number"
+                    id="depth-input"
+                    value={maxDepth}
+                    onChange={(e) => {
+                      const v = Math.max(1, Math.min(30, Number(e.target.value) || 1));
+                      setMaxDepth(v);
+                    }}
+                    className="w-16 px-2 py-1 text-sm border rounded-md bg-background text-right"
+                    min={1}
+                    max={30}
+                    aria-label="Traversal depth value"
+                  />
+                </div>
+                <Slider
+                  id="depth-slider"
+                  min={1}
+                  max={30}
+                  step={1}
+                  value={[maxDepth]}
+                  onValueChange={([v]) => setMaxDepth(v)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  How many hops to traverse (default: {VIZ_DEFAULTS[vizType].maxDepth})
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Button size="sm" onClick={loadVisualization}>
+                Apply
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  const defaults = VIZ_DEFAULTS[vizType];
+                  setNodeLimit(defaults.limit);
+                  setMaxDepth(defaults.maxDepth);
+                }}
+              >
+                Reset to Defaults
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Card className="min-h-[600px]">
         <CardContent className="p-0 relative">

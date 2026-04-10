@@ -20,21 +20,24 @@ from graph_kb_api.flows.v3.agents.personas.prompt_manager import get_agent_promp
 from graph_kb_api.flows.v3.models.node_models import NodeExecutionResult
 from graph_kb_api.flows.v3.models.types import ThreadConfigurable
 from graph_kb_api.flows.v3.nodes.subgraph_aware_node import SubgraphAwareNode
+from graph_kb_api.flows.v3.nodes.plan.base_approval_node import BaseApprovalNode
 from graph_kb_api.flows.v3.services.artifact_service import ArtifactService
-from graph_kb_api.flows.v3.services.fingerprint_tracker import FingerprintTracker
+from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 from graph_kb_api.flows.v3.services.workflow_context import WorkflowContext
 from graph_kb_api.flows.v3.state import ContextData, PlanData, ResearchData
 from graph_kb_api.flows.v3.state.plan_state import (
-    ApprovalInterruptPayload,
+    PLANNING_PROGRESS,
     ArtifactRef,
     BudgetState,
-    PhaseFingerprint,
+    InterruptOption,
     PlanningSubgraphState,
+    WorkflowError,
 )
 from graph_kb_api.flows.v3.state.workflow_state import UnifiedSpecState
 from graph_kb_api.flows.v3.utils.context_utils import append_document_context_to_prompt, sanitize_context_for_prompt
+from graph_kb_api.flows.v3.utils.json_parsing import parse_json_from_llm
 from graph_kb_api.flows.v3.utils.token_estimation import get_token_estimator, truncate_to_tokens
-from graph_kb_api.websocket.plan_events import emit_phase_complete, emit_phase_progress
+from graph_kb_api.websocket.plan_events import emit_phase_progress
 
 logger = logging.getLogger(__name__)
 
@@ -50,45 +53,26 @@ class RoadmapNode(SubgraphAwareNode[PlanningSubgraphState]):
         super().__init__(node_name="roadmap")
         self.phase = "planning"
         self.step_name = "roadmap"
-        self.step_progress = 0.0
+        self.step_progress = PLANNING_PROGRESS["roadmap"]
 
     async def _execute_step(self, state: PlanningSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
-
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         research: ResearchData = state.get("research", {})
         context: ContextData = state.get("context", {})
 
         BudgetGuard.check(budget)
 
-        session_id: str = state.get("session_id", "")
-        client_id: str | None = configurable.get("client_id")
-
         roadmap: Dict[str, Any] = {}
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="planning",
-                step="roadmap",
-                message="Generating implementation roadmap",
-                progress_pct=0.0,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"RoadmapNode emit_phase_progress failed: {e}")
+        await self._emit_progress(ctx, "roadmap", 0.0, "Generating implementation roadmap")
 
-        if not llm:
-            raise RuntimeError("RoadmapNode requires an LLM but none was provided in config.")
+        llm = ctx.require_llm
 
-        workflow_context: WorkflowContext | None = configurable.get("context")
         tools = []
-        if workflow_context and workflow_context.app_context:
+        if ctx.workflow_context and ctx.workflow_context.app_context:
             from graph_kb_api.flows.v3.tools import get_all_tools
-            tools = get_all_tools(workflow_context.app_context.get_retrieval_settings())
+            tools = get_all_tools(ctx.workflow_context.app_context.get_retrieval_settings())
 
         prompt: str = self._build_roadmap_prompt(context, research)
         llm_with_tools = llm.bind_tools(tools) if tools else llm
@@ -98,8 +82,8 @@ class RoadmapNode(SubgraphAwareNode[PlanningSubgraphState]):
         roadmap = self._parse_roadmap(content)
 
         artifacts_output: Dict[str, Any] = {}
-        if artifact_svc and roadmap:
-            ref: ArtifactRef = await artifact_svc.store(
+        if ctx.artifact_service and roadmap:
+            ref: ArtifactRef = await ctx.artifact_service.store(
                 "plan",
                 "roadmap.json",
                 json.dumps(roadmap, indent=2),
@@ -107,8 +91,7 @@ class RoadmapNode(SubgraphAwareNode[PlanningSubgraphState]):
             )
             artifacts_output["plan.roadmap"] = ref
 
-        tokens_used: int = get_token_estimator().count_tokens(json.dumps(roadmap, default=str)) if roadmap else 0
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, json.dumps(roadmap, default=str))
 
         return NodeExecutionResult.success(
             output={
@@ -130,10 +113,10 @@ class RoadmapNode(SubgraphAwareNode[PlanningSubgraphState]):
 
     def _parse_roadmap(self, content: str) -> Dict[str, Any]:
         try:
-            json_match = re.search(r"\{[\s\S]*\}", content, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, KeyError):
+            parsed = parse_json_from_llm(content)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
             pass
         return {"roadmap": {"phases": [], "critical_path": []}}
 
@@ -149,14 +132,11 @@ class FeasibilityNode(SubgraphAwareNode[PlanningSubgraphState]):
         super().__init__(node_name="feasibility")
         self.phase = "planning"
         self.step_name = "feasibility"
-        self.step_progress = 0.15
+        self.step_progress = PLANNING_PROGRESS["feasibility"]
 
     async def _execute_step(self, state: PlanningSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
-
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         planning: PlanData = state.get("plan", {})
         context: ContextData = state.get("context", {})
 
@@ -164,14 +144,12 @@ class FeasibilityNode(SubgraphAwareNode[PlanningSubgraphState]):
 
         feasibility: Dict[str, Any] = {}
 
-        if not llm:
-            raise RuntimeError("FeasibilityNode requires an LLM but none was provided in config.")
+        llm = ctx.require_llm
 
-        workflow_context: WorkflowContext | None = configurable.get("context")
         tools = []
-        if workflow_context and workflow_context.app_context:
+        if ctx.workflow_context and ctx.workflow_context.app_context:
             from graph_kb_api.flows.v3.tools import get_all_tools
-            tools = get_all_tools(workflow_context.app_context.get_retrieval_settings())
+            tools = get_all_tools(ctx.workflow_context.app_context.get_retrieval_settings())
 
         prompt: str = self._build_feasibility_prompt(context, planning, research=state.get("research", {}))
         llm_with_tools = llm.bind_tools(tools) if tools else llm
@@ -180,10 +158,7 @@ class FeasibilityNode(SubgraphAwareNode[PlanningSubgraphState]):
         content: str = str(raw_content) if not isinstance(raw_content, str) else raw_content
         feasibility: dict[str, Any] = self._parse_feasibility(content)
 
-        tokens_used: int = (
-            get_token_estimator().count_tokens(json.dumps(feasibility, default=str)) if feasibility else 0
-        )
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, json.dumps(feasibility, default=str))
 
         return NodeExecutionResult.success(
             output={
@@ -220,10 +195,10 @@ class FeasibilityNode(SubgraphAwareNode[PlanningSubgraphState]):
 
     def _parse_feasibility(self, content: str) -> Dict[str, Any]:
         try:
-            json_match = re.search(r"\{[\s\S]*\}", content, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, KeyError):
+            parsed = parse_json_from_llm(content)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
             pass
         return {"feasibility": {"overall_score": 0.7, "go_no_go": "go"}}
 
@@ -240,31 +215,26 @@ class DecomposeNode(SubgraphAwareNode[PlanningSubgraphState]):
         super().__init__(node_name="decompose")
         self.phase = "planning"
         self.step_name = "decompose"
-        self.step_progress = 0.30
+        self.step_progress = PLANNING_PROGRESS["decompose"]
 
     async def _execute_step(self, state: PlanningSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         from graph_kb_api.flows.v3.agents.decompose_agent import DecomposeAgent
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        artifact_svc: ArtifactService | None = configurable.get("artifact_service")
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         planning: PlanData = state.get("plan", {})
         context: ContextData = state.get("context", {})
         research: ResearchData = state.get("research", {})
 
         BudgetGuard.check(budget)
 
-        session_id: str = state.get("session_id", "")
-        client_id: str | None = configurable.get("client_id")
-        workflow_context: WorkflowContext | None = configurable.get("context")
-        if not workflow_context:
+        if not ctx.workflow_context:
             raise RuntimeError("DecomposeNode requires a WorkflowContext but none was provided in config.")
 
         # Build agent task with research findings and document content included
         agent_task: AgentTask = {
             "description": "Decompose spec into agent-persona-aligned section tasks",
-            "task_id": f"decompose_{session_id}_{uuid.uuid4().hex[:8]}",
+            "task_id": f"decompose_{ctx.session_id}_{uuid.uuid4().hex[:8]}",
             "context": {
                 "roadmap": planning.get("roadmap", {}),
                 "user_explanation": context.get("user_explanation", ""),
@@ -279,21 +249,11 @@ class DecomposeNode(SubgraphAwareNode[PlanningSubgraphState]):
 
         task_dag: Dict[str, Any] = {}
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="planning",
-                step="decompose",
-                message="Decomposing spec into agent-persona-aligned sections",
-                progress_pct=0.30,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"DecomposeNode emit_phase_progress failed: {e}")
+        await self._emit_progress(ctx, "decompose", 0.30, "Decomposing spec into agent-persona-aligned sections")
 
-        agent = DecomposeAgent(client_id=client_id)
+        agent = DecomposeAgent(client_id=ctx.client_id)
         result: AgentResult = await agent.execute_spec_decomposition(
-            task=agent_task, state=state, workflow_context=workflow_context
+            task=agent_task, state=state, workflow_context=ctx.workflow_context
         )
 
         # Parse the JSON output from the agent
@@ -355,22 +315,15 @@ class DecomposeNode(SubgraphAwareNode[PlanningSubgraphState]):
             "total_tasks": len(tasks),
         }
 
-        try:
-            await emit_phase_progress(
-                session_id=session_id,
-                phase="planning",
-                step="decompose",
-                message=f"Spec decomposed — {len(task_dag.get('tasks', []))} section tasks created",
-                progress_pct=0.40,
-                client_id=client_id,
-            )
-        except Exception as e:
-            logger.warning(f"DecomposeNode emit_phase_progress failed: {e}")
+        await self._emit_progress(
+            ctx, "decompose", 0.40,
+            f"Spec decomposed — {len(task_dag.get('tasks', []))} section tasks created",
+        )
 
         # Store via ArtifactService
         artifacts_output: Dict[str, Any] = {}
-        if artifact_svc and task_dag:
-            ref = await artifact_svc.store(
+        if ctx.artifact_service and task_dag:
+            ref = await ctx.artifact_service.store(
                 "plan",
                 "task_dag.json",
                 json.dumps(task_dag, indent=2, default=str),
@@ -379,8 +332,7 @@ class DecomposeNode(SubgraphAwareNode[PlanningSubgraphState]):
             artifacts_output["planning.task_dag"] = ref
 
         # Agent makes 1 LLM call for spec section identification
-        tokens_used: int = get_token_estimator().count_tokens(json.dumps(task_dag, default=str)) if task_dag else 0
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, json.dumps(task_dag, default=str))
 
         return NodeExecutionResult.success(
             output={
@@ -402,14 +354,14 @@ class ValidateDagNode(SubgraphAwareNode[PlanningSubgraphState]):
         super().__init__(node_name="validate_dag")
         self.phase = "planning"
         self.step_name = "validate_dag"
-        self.step_progress = 0.50
+        self.step_progress = PLANNING_PROGRESS["validate_dag"]
 
     async def _execute_step(self, state: PlanningSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        planning = state.get("plan", {})
+        planning: PlanData = state.get("plan", {})
         task_dag = planning.get("task_dag", {})
 
-        validation_errors = []
-        validation_warnings = []
+        validation_errors: list[dict[str, Any]] = []
+        validation_warnings: list[dict[str, Any]] = []
 
         tasks = task_dag.get("tasks", [])
         dag_edges = task_dag.get("dag_edges", [])
@@ -477,13 +429,13 @@ class ValidateDagNode(SubgraphAwareNode[PlanningSubgraphState]):
             }
         )
 
-    def _has_cycles(self, tasks: list, edges: list) -> bool:
+    def _has_cycles(self, tasks: list[Dict[str, Any]], edges: list[list[str]]) -> bool:
         """Check if the DAG has cycles using DFS."""
         if not tasks or not edges:
             return False
 
         # Build adjacency list
-        adj: Dict[str, list] = {t.get("id"): [] for t in tasks}
+        adj: Dict[str, list[str]] = {t.get("id"): [] for t in tasks}
         for src, dst in edges:
             if src in adj:
                 adj[src].append(dst)
@@ -522,15 +474,13 @@ class AssignNode(SubgraphAwareNode[PlanningSubgraphState]):
         super().__init__(node_name="assign")
         self.phase = "planning"
         self.step_name = "assign"
-        self.step_progress = 0.65
+        self.step_progress = PLANNING_PROGRESS["assign"]
 
     async def _execute_step(self, state: PlanningSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
         from graph_kb_api.flows.v3.agents.tool_planner_agent import ToolPlannerAgent
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
 
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         planning: PlanData = state.get("plan", {})
 
         BudgetGuard.check(budget)
@@ -563,15 +513,14 @@ class AssignNode(SubgraphAwareNode[PlanningSubgraphState]):
         # Call ToolPlannerAgent (deterministic — no LLM needed)
         tool_planner = ToolPlannerAgent()
         agent_state: UnifiedSpecState = cast("UnifiedSpecState", {"todo_list": todo_list})
-        workflow_context: WorkflowContext | None = configurable.get("context")
-        if not workflow_context:
+        if not ctx.workflow_context:
             raise RuntimeError("AssignNode requires a WorkflowContext but none was provided in config.")
 
         try:
             result: AgentResult = await tool_planner.execute(
                 task={},
                 state=agent_state,
-                workflow_context=workflow_context,
+                workflow_context=ctx.workflow_context,
             )
             tool_assignments = result.get("task_tool_assignments", {})
         except Exception as e:
@@ -596,10 +545,10 @@ class AssignNode(SubgraphAwareNode[PlanningSubgraphState]):
 
         # If we also have an LLM, refine assignments with an LLM pass
         llm_calls = 0
-        if llm and assignments:
+        if ctx.llm and assignments:
             try:
                 prompt: str = self._build_refine_prompt(assignments)
-                response: AIMessage = await llm.ainvoke(prompt)
+                response: AIMessage = await ctx.llm.ainvoke(prompt)
                 raw_content = response.content if hasattr(response, "content") else str(response)
                 content: str = str(raw_content) if not isinstance(raw_content, str) else raw_content
                 refined = self._parse_assignments(content)
@@ -609,10 +558,7 @@ class AssignNode(SubgraphAwareNode[PlanningSubgraphState]):
             except Exception as e:
                 logger.debug(f"AssignNode LLM refinement skipped: {e}")
 
-        tokens_used: int = (
-            get_token_estimator().count_tokens(json.dumps(assignments, default=str)) if assignments else 0
-        )
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=llm_calls, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, json.dumps(assignments, default=str), llm_calls=llm_calls)
 
         return NodeExecutionResult.success(
             output={
@@ -638,7 +584,7 @@ class AssignNode(SubgraphAwareNode[PlanningSubgraphState]):
         }
         return mapping.get(raw_type, "architect")
 
-    def _build_refine_prompt(self, assignments: list) -> str:
+    def _build_refine_prompt(self, assignments: list[Dict[str, Any]]) -> str:
         assignments_json = json.dumps(assignments, indent=2, default=str)
         return f"""You are a task assignment specialist. Review and refine these agent/tool assignments.
 Ensure each task has the most appropriate agent type and tools.
@@ -665,10 +611,10 @@ Return JSON with this structure:
 
     def _parse_assignments(self, content: str) -> Dict[str, Any]:
         try:
-            json_match = re.search(r"\{[\s\S]*\}", content, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, KeyError):
+            parsed = parse_json_from_llm(content)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
             pass
         return {"assignments": []}
 
@@ -684,14 +630,11 @@ class AlignNode(SubgraphAwareNode[PlanningSubgraphState]):
         super().__init__(node_name="align")
         self.phase = "planning"
         self.step_name = "align"
-        self.step_progress = 0.80
+        self.step_progress = PLANNING_PROGRESS["align"]
 
     async def _execute_step(self, state: PlanningSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        from graph_kb_api.flows.v3.services.budget_guard import BudgetGuard
-
-        configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-        llm: LLMService | None = configurable.get("llm")
-        budget: BudgetState = state.get("budget", {})
+        ctx = self._unpack(state, config)
+        budget: BudgetState = ctx.budget
         planning: PlanData = state.get("plan", {})
         context: ContextData = state.get("context", {})
 
@@ -699,8 +642,7 @@ class AlignNode(SubgraphAwareNode[PlanningSubgraphState]):
 
         alignment: Dict[str, Any] = {}
 
-        if not llm:
-            raise RuntimeError("AlignNode requires an LLM but none was provided in config.")
+        llm = ctx.require_llm
 
         prompt: str = self._build_align_prompt(context, planning)
         response: AIMessage = await llm.ainvoke(prompt)
@@ -708,8 +650,7 @@ class AlignNode(SubgraphAwareNode[PlanningSubgraphState]):
         content: str = str(raw_content) if not isinstance(raw_content, str) else raw_content
         alignment: dict[str, Any] = self._parse_alignment(content)
 
-        tokens_used: int = get_token_estimator().count_tokens(json.dumps(alignment, default=str)) if alignment else 0
-        new_budget: BudgetState = BudgetGuard.decrement(budget, llm_calls=1, tokens_used=tokens_used)
+        new_budget = self._decrement_budget(budget, json.dumps(alignment, default=str))
 
         return NodeExecutionResult.success(
             output={
@@ -762,11 +703,10 @@ Return JSON with this structure:
 
     def _parse_alignment(self, content: str) -> Dict[str, Any]:
         try:
-            json_match = re.search(r"\{[\s\S]*\}", content, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group())
-                return result.get("alignment", {})
-        except (json.JSONDecodeError, KeyError):
+            parsed = parse_json_from_llm(content)
+            if isinstance(parsed, dict):
+                return parsed.get("alignment", parsed)
+        except ValueError:
             pass
         return {
             "is_aligned": True,
@@ -777,22 +717,24 @@ Return JSON with this structure:
         }
 
 
-class PlanningApprovalNode(SubgraphAwareNode[PlanningSubgraphState]):
+class PlanningApprovalNode(BaseApprovalNode[PlanningSubgraphState]):
     """Approval gate for planning phase completion.
 
     Presents the complete plan to user for approval before proceeding
-    to orchestration. Uses interrupt() for user confirmation.
+    to orchestration. Extends BaseApprovalNode with planning-specific hooks.
     """
+
+    phase_data_key = "plan"
 
     def __init__(self) -> None:
         super().__init__(node_name="planning_approval")
         self.phase = "planning"
         self.step_name = "approval"
-        self.step_progress = 1.0
+        self.step_progress = PLANNING_PROGRESS["approval"]
 
-    async def _execute_step(self, state: PlanningSubgraphState, config: RunnableConfig) -> NodeExecutionResult:
-        planning = state.get("plan", {})
-        context = state.get("context", {})
+    def _build_summary(self, state: PlanningSubgraphState) -> dict[str, Any]:
+        planning: PlanData = state.get("plan", {})
+        context: ContextData = state.get("context", {})
 
         roadmap = planning.get("roadmap", {})
         feasibility = planning.get("feasibility", {})
@@ -801,7 +743,7 @@ class PlanningApprovalNode(SubgraphAwareNode[PlanningSubgraphState]):
 
         tasks = task_dag.get("tasks", [])
 
-        summary = {
+        return {
             "spec_name": context.get("spec_name", "Unknown"),
             "phases_count": len(roadmap.get("phases", [])),
             "tasks_count": len(tasks),
@@ -810,12 +752,11 @@ class PlanningApprovalNode(SubgraphAwareNode[PlanningSubgraphState]):
             "go_no_go": feasibility.get("go_no_go", "go"),
         }
 
-        context_items = await self._load_context_items(state.get("session_id"), state.get("research", {}), context)
-        payload: ApprovalInterruptPayload = {
-            "type": "approval",
-            "phase": "planning",
-            "step": "approval",
-            "summary": summary,
+    def _build_payload_extras(self, state: PlanningSubgraphState, summary: dict[str, Any]) -> dict[str, Any]:
+        planning: PlanData = state.get("plan", {})
+        task_dag = planning.get("task_dag", {})
+        tasks = task_dag.get("tasks", [])
+        return {
             "tasks": [
                 {
                     "id": t.get("id", ""),
@@ -827,67 +768,59 @@ class PlanningApprovalNode(SubgraphAwareNode[PlanningSubgraphState]):
                 }
                 for t in tasks
             ],
-            "message": (
-                f"Planning complete with {summary['tasks_count']} tasks. "
-                f"Feasibility: {summary['feasibility_score']:.0%}. Approve to start execution?"
-            ),
-            "artifacts": self._serialize_artifacts(state["artifacts"]),
-            "options": [
-                {"id": "approve", "label": "Approve & Start Execution"},
-                {"id": "revise", "label": "Request Revisions"},
-                {"id": "reject", "label": "Reject & Restart"},
-            ],
-            "context_items": context_items,
         }
-        approval_response: Dict[str, Any] = interrupt(payload)
 
-        decision = approval_response.get("decision", "approve")
-        feedback = approval_response.get("feedback", "")
+    def _get_approval_options(self) -> list[InterruptOption]:
+        return [
+            {"id": "approve", "label": "Approve & Start Execution"},
+            {"id": "revise", "label": "Request Revisions"},
+            {"id": "reject", "label": "Reject & Restart"},
+        ]
 
-        output: Dict[str, Any] = {
+    def _get_approval_message(self, summary: dict[str, Any]) -> str:
+        return (
+            f"Planning complete with {summary['tasks_count']} tasks. "
+            f"Feasibility: {summary['feasibility_score']:.0%}. Approve to start execution?"
+        )
+
+    def _process_approve(self, state: PlanningSubgraphState, feedback: str) -> dict[str, Any]:
+        planning: PlanData = state.get("plan", {})
+        return {
             "plan": {
                 **planning,
-                "approved": decision == "approve",
-                "approval_decision": decision,
+                "approved": True,
+                "approval_decision": "approve",
                 "approval_feedback": feedback,
-            }
+            },
         }
 
-        if decision == "approve":
-            output["completed_phases"] = {"planning": True}
-            # Store fingerprint for dirty-detection on backward navigation
-            fp_hash: str = FingerprintTracker.compute_phase_data_fingerprint("planning", output["plan"])
-            existing_fps: dict[str, PhaseFingerprint] = state.get("fingerprints", {})
-            output["fingerprints"] = FingerprintTracker.update_fingerprint(
-                existing_fps,
-                "planning",
-                fp_hash,
-                [],
-            )
-            # Emit plan.phase.complete (GAP 9)
-            try:
-                session_id: str = state.get("session_id", "")
-                configurable: ThreadConfigurable = cast(ThreadConfigurable, config.get("configurable", {}))
-                client_id: str | None = configurable.get("client_id")
-                await emit_phase_complete(
-                    session_id=session_id,
-                    phase="planning",
-                    result_summary=f"Planning approved with {summary['tasks_count']} tasks",
-                    duration_s=0.0,
-                    client_id=client_id,
-                )
-            except Exception:
-                pass  # fire-and-forget
-        elif decision == "revise":
-            output["plan"]["needs_revision"] = True
-        elif decision == "reject":
-            output["plan"]["rejected"] = True
-            output["workflow_status"] = "rejected"
-            output["paused_phase"] = "planning"
-            output["error"] = {
-                "message": "Planning was rejected by user.",
-                "code": "REJECTED",
-                "phase": "planning",
-            }
+    def _process_revise(self, state: PlanningSubgraphState, feedback: str) -> dict[str, Any]:
+        planning: PlanData = state.get("plan", {})
+        return {
+            "plan": {
+                **planning,
+                "approved": False,
+                "approval_decision": "revise",
+                "approval_feedback": feedback,
+                "needs_revision": True,
+            },
+        }
 
-        return NodeExecutionResult.success(output=output)
+    def _process_reject(self, state: PlanningSubgraphState, feedback: str) -> dict[str, Any]:
+        planning: PlanData = state.get("plan", {})
+        return {
+            "plan": {
+                **planning,
+                "approved": False,
+                "approval_decision": "reject",
+                "approval_feedback": feedback,
+                "rejected": True,
+            },
+            "workflow_status": "rejected",
+            "paused_phase": "planning",
+            "error": WorkflowError(
+                message="Planning was rejected by user.",
+                code="REJECTED",
+                phase="planning",
+            ),
+        }
